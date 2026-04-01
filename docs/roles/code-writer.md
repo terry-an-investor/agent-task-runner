@@ -36,7 +36,8 @@ Rules:
 
 ## Commit Discipline
 
-- Commit after meaningful validated changes.
+- **All changes must be committed.** No uncommitted work left behind.
+- Commit after each meaningful validated change.
 - Do not claim completion without a commit SHA.
 - If blocked, report blocker in `notes` with failed checks in `tests`.
 
