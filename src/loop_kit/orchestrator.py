@@ -49,6 +49,7 @@ MAX_DISPATCH_RETRY_DELAY_SEC = 60
 DEFAULT_DISPATCH_BACKEND = "native"
 DISPATCH_STREAM_POLL_SEC = 0.1
 _FEED_TASK_ID: str | None = None
+_LOGS_DIR_ENSURED = False
 
 
 def hello() -> str:
@@ -232,13 +233,19 @@ def _set_feed_task_id(task_id: str | None) -> None:
     global _FEED_TASK_ID
     _FEED_TASK_ID = task_id
 
+def _ensure_logs_dir() -> None:
+    global _LOGS_DIR_ENSURED
+    if not _LOGS_DIR_ENSURED:
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        _LOGS_DIR_ENSURED = True
+
 def _feed_event(event: str, *, level: str = "info", data: dict | None = None) -> None:
-    payload_data = dict(data or {})
-    if _FEED_TASK_ID and payload_data.get("task_id") not in (None, _FEED_TASK_ID):
+    if _FEED_TASK_ID and data and data.get("task_id") not in (None, _FEED_TASK_ID):
         return
+    payload_data = dict(data or {})
     if _FEED_TASK_ID and "task_id" not in payload_data:
         payload_data["task_id"] = _FEED_TASK_ID
-    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    _ensure_logs_dir()
     payload = {
         "ts": _ts(),
         "level": level,
@@ -248,21 +255,14 @@ def _feed_event(event: str, *, level: str = "info", data: dict | None = None) ->
     with open(_feed_log_path(), "a", encoding="utf-8") as f:
         f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
-def _log(msg: str, *, level: str = "info", **extra: object) -> None:
+def _log(msg: str) -> None:
     ts = _ts()
-    # Console: human-readable
     line = f"[{ts}] {msg}"
     print(line, flush=True)
-    # Log file: structured JSON
-    LOGS_DIR.mkdir(parents=True, exist_ok=True)
-    entry: dict[str, object] = {
-        "ts": ts,
-        "level": level,
-        "msg": msg,
-    }
+    _ensure_logs_dir()
+    entry: dict[str, object] = {"ts": ts, "msg": msg}
     if _FEED_TASK_ID:
         entry["task_id"] = _FEED_TASK_ID
-    entry.update(extra)
     with open(LOGS_DIR / "orchestrator.log", "a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     _feed_event("log", data={"message": msg})
@@ -404,29 +404,31 @@ def _summarize_paths(paths: list[str], max_items: int = 3) -> str:
     return f"{head} (+{remaining} more)"
 
 
+def _strip_outer_quotes(text: str) -> str:
+    stripped = text.strip()
+    if len(stripped) >= 2 and stripped[0] == stripped[-1] and stripped[0] in ("'", '"'):
+        return stripped[1:-1].strip()
+    return stripped
+
+
+def _strip_powershell_wrapper(command_text: str) -> str:
+    stripped = command_text.strip()
+    lowered = stripped.lower()
+    marker = " -command "
+    marker_index = lowered.find(marker)
+    if marker_index <= 0:
+        return _strip_outer_quotes(stripped)
+    launcher = _strip_outer_quotes(stripped[:marker_index].strip())
+    launcher_name = launcher.replace("\\", "/").split("/")[-1].lower()
+    if launcher_name not in {"pwsh", "pwsh.exe", "powershell", "powershell.exe"}:
+        return _strip_outer_quotes(stripped)
+    inner = _strip_outer_quotes(stripped[marker_index + len(marker) :].strip())
+    return inner or _strip_outer_quotes(stripped)
+
+
 def _codex_event_summary(role: str, backend: str, line: str) -> str | None:
     if backend != "codex":
         return None
-
-    def _strip_outer_quotes(text: str) -> str:
-        stripped = text.strip()
-        if len(stripped) >= 2 and stripped[0] == stripped[-1] and stripped[0] in ("'", '"'):
-            return stripped[1:-1].strip()
-        return stripped
-
-    def _strip_powershell_wrapper(command_text: str) -> str:
-        stripped = command_text.strip()
-        lowered = stripped.lower()
-        marker = " -command "
-        marker_index = lowered.find(marker)
-        if marker_index <= 0:
-            return _strip_outer_quotes(stripped)
-        launcher = _strip_outer_quotes(stripped[:marker_index].strip())
-        launcher_name = launcher.replace("\\", "/").split("/")[-1].lower()
-        if launcher_name not in {"pwsh", "pwsh.exe", "powershell", "powershell.exe"}:
-            return _strip_outer_quotes(stripped)
-        inner = _strip_outer_quotes(stripped[marker_index + len(marker) :].strip())
-        return inner or _strip_outer_quotes(stripped)
 
     def _clean_path_text(path_text: str) -> str:
         cleaned = path_text.strip().strip("\"'")
@@ -543,39 +545,6 @@ def _codex_event_summary(role: str, backend: str, line: str) -> str | None:
 
 
 def _stream_dispatch_stdout_line(role: str, backend: str, raw_line: str, *, verbose: bool) -> None:
-    def _strip_outer_quotes(text: str) -> str:
-        stripped = text.strip()
-        if len(stripped) >= 2 and stripped[0] == stripped[-1] and stripped[0] in ("'", '"'):
-            return stripped[1:-1].strip()
-        return stripped
-
-    def _strip_powershell_wrapper(command_text: str) -> str:
-        stripped = command_text.strip()
-        lowered = stripped.lower()
-        marker = " -command "
-        marker_index = lowered.find(marker)
-        if marker_index <= 0:
-            return _strip_outer_quotes(stripped)
-        launcher = _strip_outer_quotes(stripped[:marker_index].strip())
-        launcher_name = launcher.replace("\\", "/").split("/")[-1].lower()
-        if launcher_name not in {"pwsh", "pwsh.exe", "powershell", "powershell.exe"}:
-            return _strip_outer_quotes(stripped)
-        inner = _strip_outer_quotes(stripped[marker_index + len(marker) :].strip())
-        return inner or _strip_outer_quotes(stripped)
-
-    def _extract_raw_command(item: dict) -> str:
-        command = item.get("command")
-        if isinstance(command, str) and command.strip():
-            return command.strip()
-        if isinstance(command, list):
-            rendered = " ".join(str(part) for part in command if isinstance(part, (str, int, float)))
-            if rendered.strip():
-                return rendered.strip()
-        call = item.get("call")
-        if isinstance(call, dict):
-            return _extract_raw_command(call)
-        return ""
-
     def _extract_read_filename(command_text: str) -> str | None:
         command = _strip_powershell_wrapper(command_text)
         if not command:
@@ -649,7 +618,7 @@ def _stream_dispatch_stdout_line(role: str, backend: str, raw_line: str, *, verb
     if isinstance(payload, dict) and payload.get("type") == "item.completed":
         item = payload.get("item")
         if isinstance(item, dict) and item.get("type") == "command_execution":
-            command_text = _extract_raw_command(item)
+            command_text = _extract_command_summary(item)
             read_name = _extract_read_filename(command_text) if command_text else None
             if read_name:
                 read_summary = f"[{role}] Reading: {read_name}"
@@ -2443,15 +2412,12 @@ def _run_multi_round_via_subprocess(
         signal.signal(signal.SIGINT, old_sigint)
 
     if interrupted:
-        state = _load_state()
-        state["state"] = STATE_DONE
-        state["outcome"] = "interrupted"
-        state["error"] = "User interrupted (SIGINT)"
-        state["failed_at"] = _ts()
-        _save_state(state)
-        _log(f"Run interrupted by user; state saved as outcome=interrupted")
-        print("\n  Interrupted. State saved — re-run with --resume to continue.")
-        sys.exit(130)
+        _fail_with_state(
+            _load_state(),
+            outcome="interrupted",
+            message="User interrupted (SIGINT)",
+            exit_code=130,
+        )
 
     state = _load_state()
     state["state"] = STATE_DONE
