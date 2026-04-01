@@ -4,14 +4,15 @@ New session onboarding guide. Read this first, then `CLAUDE.md` and `AGENTS.md`.
 
 ## Current State
 
-- **2 commits** on `master` branch, clean working tree
-- **43 tests passing** (`uv run --group dev pytest`)
+- **10+ commits** on `master` branch, clean working tree
+- **139 tests passing** (`uv run --group dev pytest`)
 - **v0.2.0** in `__init__.py` and `pyproject.toml`
-- All core features working: auto-dispatch, streaming, archive, resume, backend registry, file locking
+- All core features working: auto-dispatch, streaming, archive, resume, backend registry, file locking, retry/backoff
+- CI configured: GitHub Actions with pytest on Python 3.11/3.12/3.13, ubuntu + windows
 
 ## Origin
 
-This package was extracted from `C:\Users\terryzzb\Desktop\wind-agent-excel\tools\orchestrator.py` after 10 iterations of improvement (T-604 through T-613). The original project uses loop-kit as an editable dependency (`uv add --editable ../git_repos/loop-kit`).
+This package was extracted from `wind-agent-excel/tools/orchestrator.py` after 10 iterations of improvement (T-604 through T-613). The original project uses loop-kit as an editable dependency (`uv add --editable ../git_repos/loop-kit`).
 
 The extraction made 3 key changes from the original:
 1. `ROOT = Path.cwd()` (was `Path(__file__).resolve().parent.parent`)
@@ -21,33 +22,43 @@ The extraction made 3 key changes from the original:
 ## What Works
 
 - `loop init` — creates `.loop/` dirs, example task card, prompt templates
-- `loop run --auto-dispatch --worker-backend codex --reviewer-backend codex` — full automated loop
+- `loop run --auto-dispatch` — full automated loop with codex/claude backends
 - `loop status`, `loop health`, `loop archive` — inspection commands
-- `loop run --resume` — resume from interrupted state
+- `loop run --resume` — resume from interrupted state via state.json contract
 - Backend registry: `register_backend()` for adding codex/claude/custom
-- Streaming output: real-time codex event parsing during dispatch
-- Subprocess-per-round: code changes take effect immediately
+- Streaming output: friendly summaries in non-verbose mode, raw JSON in verbose mode
+- Subprocess-per-round: code changes take effect immediately (self-bootstrapping)
+- Retry/backoff: configurable via `--dispatch-retries` and `--dispatch-retry-base-sec`
+- Function index: worker prompt includes dynamic def/class line index
 - Windows + Unix: file locking, stdin piping, path handling
 
-## Immediate Next Steps (Roadmap)
+## Completed Work (since extraction)
 
-These are candidate improvements, not commitments. Prioritize by impact.
+### Phase 1: Infrastructure ✅
+- `.gitignore`, `LICENSE` (MIT), CI (`.github/workflows/ci.yml`)
 
-### High Priority
-1. **Port remaining 147 tests** — The original project has 190 tests; loop-kit has 43. The other 147 test edge cases for streaming, archive, resume, state contract, locking. Import path is the only difference (`from loop_kit import orchestrator`).
-2. **End-to-end smoke test** — Write a test that actually runs `loop run --auto-dispatch` with a mock backend, validating the full multi-round cycle.
-3. **Proper packaging** — Add `.gitignore`, LICENSE, CI config (GitHub Actions with pytest on 3.11/3.12).
+### Phase 2: Test Coverage ✅
+- Expanded from 43 to 139 tests covering: pure utilities, streaming/parsing, dispatch, locking, heartbeat, state contract, CLI commands, validation, archive, backend registry
 
-### Medium Priority
-4. **Retry/backoff on dispatch failure** — Currently fails immediately on non-zero exit. Add configurable retry with exponential backoff.
-5. **Structured logging** — Replace `print()` + file log with `logging` module. Feed log (`_feed_event`) should be the primary log, console output secondary.
-6. **Config file** — Support `.loop/config.json` or `pyproject.toml [tool.loop-kit]` for default backend, timeout, max-rounds so CLI flags aren't needed every time.
-7. **Cancellation signal** — Allow graceful shutdown (SIGINT/Ctrl+C) mid-round: write partial state, don't leave stale lock files.
+### Phase 3: Robustness & Readability ✅ (core items)
+- Dispatch retry with exponential backoff (`--dispatch-retries`, `--dispatch-retry-base-sec`)
+- Dynamic function index in worker prompt (reduces codex code-reading rounds)
+- SIGINT handling (`_terminate_subprocess_on_interrupt`)
+- AGENTS.md rewritten as concise coding constraint checklist
+- Role docs: `docs/roles/code-writer.md`, `docs/roles/reviewer.md`
+- Stream summary simplification: removed ~170 lines of unreliable shell command string parsing, now uses only structured JSON fields
 
-### Lower Priority
-8. **Template inheritance** — Allow projects to override only parts of the prompt template (e.g., custom worker instructions without rewriting the whole template).
-9. **Metrics/telemetry hook** — Optional callback/interface for reporting round duration, tokens, approval rates.
-10. **Plugin system** — Allow projects to register custom backends, custom role prompts, pre/post-round hooks.
+## Remaining Improvements (nice-to-have)
+
+| Task | Priority | Notes |
+|------|----------|-------|
+| Outer loop graceful shutdown | Medium | `_run_multi_round_via_subprocess` SIGINT propagation to single-round subprocess |
+| Duplicate dirty tree warning | Low | Single-round subprocess redundantly checks (parent already checked) |
+| Structured logging | Low | Replace `print()` + file log with `logging` module |
+| Config file | Low | `.loop/config.json` or `pyproject.toml [tool.loop-kit]` for defaults |
+| End-to-end smoke test | Low | Full multi-round cycle test with mock backend |
+| Template inheritance | Low | Allow overriding parts of prompt templates |
+| Metrics/telemetry hook | Low | Optional callback for round duration, tokens, approval rates |
 
 ## Known Gotchas
 
@@ -55,14 +66,15 @@ These are candidate improvements, not commitments. Prioritize by impact.
 - **Windows CLI length**: Prompts are piped via stdin because Windows has ~8191 char CLI limit. All backends must support stdin piping.
 - **Test import**: Tests use `from loop_kit import orchestrator`, not `from tools import orchestrator`.
 - **Global state**: `_configure_loop_paths()` mutates module-level globals (`LOOP_DIR`, etc.). Tests that call it should use `tmp_path` and restore defaults after.
+- **Worker role**: Claude Code is the **PM/orchestrator**, not the worker. Non-trivial coding tasks should use `loop run --auto-dispatch`.
 
 ## First Thing To Do
 
 ```bash
 cd C:\Users\terryzzb\Desktop\git_repos\loop-kit
 uv sync
-uv run --group dev pytest        # verify 43 tests pass
+uv run --group dev pytest        # verify 139 tests pass
 uv run python -m loop_kit init   # smoke test
 ```
 
-Then read `src/loop_kit/orchestrator.py` to understand the full codebase (~2200 lines, single file).
+Then read `src/loop_kit/orchestrator.py` to understand the full codebase (~2100 lines, single file).
