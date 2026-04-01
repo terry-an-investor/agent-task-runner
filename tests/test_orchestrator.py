@@ -391,6 +391,52 @@ def test_run_auto_dispatch_streams_compact_summaries_in_non_verbose_mode(
     assert "[worker] Message: Implementing changes..." in out
 
 
+def test_run_auto_dispatch_collapses_consecutive_read_commands(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        orchestrator,
+        "_agent_command",
+        lambda backend, prompt: (["codex.exe", "exec", "short instruction"], None, "STDIN_PAYLOAD"),
+    )
+    monkeypatch.setattr(orchestrator, "_log", lambda msg: None)
+    monkeypatch.setattr(orchestrator, "_feed_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(orchestrator, "_write_dispatch_log", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        orchestrator.subprocess,
+        "Popen",
+        lambda cmd, **kwargs: _FakeProc(
+            stdout_lines=[
+                json.dumps({
+                    "type": "item.completed",
+                    "item": {
+                        "type": "command_execution",
+                        "command": (
+                            'pwsh.exe -NoLogo -Command "Get-Content -LiteralPath '
+                            'src/loop_kit/orchestrator.py | Select-Object -First 40"'
+                        ),
+                    },
+                }) + "\n",
+                json.dumps({
+                    "type": "item.completed",
+                    "item": {
+                        "type": "command_execution",
+                        "command": (
+                            'pwsh.exe -NoLogo -Command "Get-Content -LiteralPath '
+                            "src/loop_kit/orchestrator.py | Select-Object -Skip 40 -First 40"
+                            '"'
+                        ),
+                    },
+                }) + "\n",
+            ],
+        ),
+    )
+    monkeypatch.delattr(orchestrator._stream_dispatch_stdout_line, "_read_summary_state", raising=False)
+
+    orchestrator._run_auto_dispatch("worker", "codex", "ignored", 30, verbose=False)
+
+    out = capsys.readouterr().out
+    assert out.count("[worker] Reading: orchestrator.py") == 1
+
+
 def test_run_auto_dispatch_verbose_prints_all_stdout_lines(monkeypatch, capsys) -> None:
     raw_lines = [
         '{"type":"item.completed","item":{"type":"agent_message","text":"hello"}}\n',
@@ -2120,16 +2166,26 @@ class TestCodexEventSummary:
         })
         result = orchestrator._codex_event_summary("worker", "codex", line)
         assert result is not None
-        assert "[worker] Editing: src/loop_kit/orchestrator.py, tests/test_orchestrator.py" == result
+        assert "[worker] Editing: orchestrator.py, test_orchestrator.py" == result
+
+    def test_command_execution_strips_pwsh_wrapper(self) -> None:
+        line = json.dumps({
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution",
+                "command": 'pwsh.exe -NoLogo -NoProfile -Command "git status --short"',
+            },
+        })
+        result = orchestrator._codex_event_summary("worker", "codex", line)
+        assert result is not None
+        assert "[worker] Running: git status --short" == result
 
     def test_item_started(self) -> None:
         line = json.dumps({
             "type": "item.started",
             "item": {"type": "command_execution"},
         })
-        result = orchestrator._codex_event_summary("worker", "codex", line)
-        assert result is not None
-        assert "[worker] Starting: command_execution" == result
+        assert orchestrator._codex_event_summary("worker", "codex", line) is None
 
     def test_non_codex_returns_none(self) -> None:
         line = json.dumps({"type": "item.completed", "item": {"type": "command_execution"}})
