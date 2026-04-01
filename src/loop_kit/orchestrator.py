@@ -583,7 +583,6 @@ def _stream_dispatch_stdout_line(role: str, backend: str, raw_line: str, *, verb
         and len(last_state) == 2
         and last_state[0] == summary
         and isinstance(last_state[1], float)
-        and (now - last_state[1]) <= 1.0
     ):
         state[key] = (summary, now)
         _stream_dispatch_stdout_line._read_summary_state = state
