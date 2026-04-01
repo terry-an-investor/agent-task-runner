@@ -819,6 +819,28 @@ def test_log_writes_jsonl_feed_entry(tmp_path: Path, monkeypatch) -> None:
     assert latest["data"]["message"] == "structured log message"
 
 
+def test_configure_loop_paths_resets_log_dir_ensure_flag(tmp_path: Path, monkeypatch) -> None:
+    original_root = orchestrator.ROOT
+    monkeypatch.setattr(orchestrator, "ROOT", tmp_path)
+    monkeypatch.setattr(orchestrator, "_LOGS_DIR_ENSURED", False)
+    monkeypatch.setattr(orchestrator, "_LOGS_DIR_ENSURED_PATH", None)
+    orchestrator._set_feed_task_id(None)
+
+    orchestrator._configure_loop_paths(".loop-a")
+    orchestrator._log("first log")
+    assert (tmp_path / ".loop-a" / "logs" / "orchestrator.log").exists()
+
+    orchestrator._configure_loop_paths(".loop-b")
+    assert orchestrator._LOGS_DIR_ENSURED is False
+    orchestrator._log("second log")
+
+    assert (tmp_path / ".loop-b" / "logs" / "orchestrator.log").exists()
+    assert (tmp_path / ".loop-b" / "logs" / "feed.jsonl").exists()
+
+    monkeypatch.setattr(orchestrator, "ROOT", original_root)
+    orchestrator._configure_loop_paths(".loop")
+
+
 def test_feed_event_filters_by_task_id(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(orchestrator, "LOGS_DIR", tmp_path)
     orchestrator._set_feed_task_id("T-777")
@@ -1254,6 +1276,74 @@ def test_single_round_processes_exactly_one_round_then_exits(tmp_path: Path, mon
     assert state["round"] == 2
 
 
+def test_single_round_skips_non_dict_blocking_issues(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+
+    task_path = tmp_path / "task_input.json"
+    task_path.write_text(
+        json.dumps({"task_id": "T-604", "goal": "mixed blocking issues"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    orchestrator.STATE_FILE.write_text(
+        json.dumps(
+            {
+                "state": orchestrator.STATE_AWAITING_WORK,
+                "round": 1,
+                "task_id": "T-604",
+                "base_sha": "base-sha",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    work_report = {
+        "task_id": "T-604",
+        "round": 1,
+        "head_sha": "head-sha",
+        "files_changed": ["tools/orchestrator.py"],
+        "tests": [],
+        "notes": "ok",
+    }
+    review_report = {
+        "task_id": "T-604",
+        "round": 1,
+        "decision": "changes_required",
+        "blocking_issues": [
+            {"id": "R1", "severity": "high", "file": "tools/orchestrator.py", "reason": "fix me"},
+            "bad-item",
+            None,
+            123,
+        ],
+        "non_blocking_suggestions": [],
+    }
+
+    def fake_wait(path: Path, description: str, **kwargs) -> dict | None:
+        _ = (description, kwargs)
+        if path == orchestrator.WORK_REPORT:
+            return work_report
+        if path == orchestrator.REVIEW_REPORT:
+            return review_report
+        return None
+
+    monkeypatch.setattr(orchestrator, "_wait_for_file", fake_wait)
+    monkeypatch.setattr(orchestrator, "_diff", lambda base, head: f"diff {base}->{head}")
+    monkeypatch.setattr(orchestrator, "_log_oneline", lambda base, head: f"log {base}->{head}")
+
+    orchestrator.cmd_run(
+        _run_config(str(task_path)),
+        single_round=True,
+        round_num=1,
+    )
+
+    fix_list = json.loads(orchestrator.FIX_LIST.read_text(encoding="utf-8"))
+    state = json.loads(orchestrator.STATE_FILE.read_text(encoding="utf-8"))
+
+    assert fix_list["fixes"] == [review_report["blocking_issues"][0]]
+    assert state["state"] == orchestrator.STATE_AWAITING_WORK
+    assert state["round"] == 2
+
+
 def test_single_round_invalid_work_report_sets_invalid_outcome(tmp_path: Path, monkeypatch) -> None:
     _configure_loop_paths(monkeypatch, tmp_path)
 
@@ -1297,6 +1387,17 @@ def test_single_round_invalid_work_report_sets_invalid_outcome(tmp_path: Path, m
     state = json.loads(orchestrator.STATE_FILE.read_text(encoding="utf-8"))
     assert state["outcome"] == "invalid_work_report"
     assert "round" in state["error"]
+
+
+def test_load_task_card_rejects_non_dict_json(tmp_path: Path, capsys) -> None:
+    task_path = tmp_path / "task_input.json"
+    task_path.write_text("[]\n", encoding="utf-8")
+
+    with pytest.raises(SystemExit) as exc:
+        orchestrator._load_task_card(str(task_path))
+
+    assert exc.value.code == 1
+    assert "task card must be a JSON object" in capsys.readouterr().err
 
 
 def test_single_round_approved_summary_includes_round_details(tmp_path: Path, monkeypatch) -> None:

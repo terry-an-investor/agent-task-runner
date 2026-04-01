@@ -54,6 +54,7 @@ DISPATCH_STREAM_POLL_SEC = 0.1
 _WAIT_SAFETY_CAP_SEC = 86400  # 24h absolute cap in _wait_for_file
 _FEED_TASK_ID: str | None = None
 _LOGS_DIR_ENSURED = False
+_LOGS_DIR_ENSURED_PATH: str | None = None
 
 
 def hello() -> str:
@@ -117,6 +118,8 @@ def _configure_loop_paths(loop_dir: str | Path = ".loop") -> None:
     global REVIEW_REQ
     global REVIEW_REPORT
     global LOCK_FILE
+    global _LOGS_DIR_ENSURED
+    global _LOGS_DIR_ENSURED_PATH
 
     LOOP_DIR = _resolve_loop_dir(loop_dir)
     LOGS_DIR = LOOP_DIR / "logs"
@@ -129,6 +132,8 @@ def _configure_loop_paths(loop_dir: str | Path = ".loop") -> None:
     REVIEW_REQ = _path("review_request.json")
     REVIEW_REPORT = _path("review_report.json")
     LOCK_FILE = _path("lock")
+    _LOGS_DIR_ENSURED = False
+    _LOGS_DIR_ENSURED_PATH = None
 
 
 def _loop_templates_dir() -> Path:
@@ -266,9 +271,17 @@ def _set_feed_task_id(task_id: str | None) -> None:
 
 def _ensure_logs_dir() -> None:
     global _LOGS_DIR_ENSURED
-    if not _LOGS_DIR_ENSURED:
-        LOGS_DIR.mkdir(parents=True, exist_ok=True)
-        _LOGS_DIR_ENSURED = True
+    global _LOGS_DIR_ENSURED_PATH
+    current_logs_dir = _normalized_abs(LOGS_DIR)
+    if (
+        _LOGS_DIR_ENSURED
+        and _LOGS_DIR_ENSURED_PATH == current_logs_dir
+        and LOGS_DIR.is_dir()
+    ):
+        return
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    _LOGS_DIR_ENSURED = True
+    _LOGS_DIR_ENSURED_PATH = current_logs_dir
 
 def _feed_event(event: str, *, level: str = "info", data: dict | None = None) -> None:
     if _FEED_TASK_ID and data and data.get("task_id") not in (None, _FEED_TASK_ID):
@@ -1764,6 +1777,9 @@ def _load_task_card(task_path: str) -> tuple[Path, dict, str]:
         print(f"Error: task card not found: {tp}", file=sys.stderr)
         sys.exit(1)
     task_card = json.loads(tp.read_text(encoding="utf-8"))
+    if not isinstance(task_card, dict):
+        print(f"Error: task card must be a JSON object: {tp}", file=sys.stderr)
+        sys.exit(1)
     task_id = task_card.get("task_id", "UNKNOWN")
     return tp, task_card, task_id
 
@@ -2173,13 +2189,15 @@ def _run_single_round(
         _log("Task approved. Summary written to .loop/summary.json")
         return
 
-    blocking = review.get("blocking_issues", [])
+    raw_blocking = review.get("blocking_issues", [])
+    blocking = raw_blocking if isinstance(raw_blocking, list) else []
+    blocking_items = [item for item in blocking if isinstance(item, dict)]
     fix_list = {
         "task_id": task_id,
         "round": round_num + 1,
         "base_sha": base_sha,
         "head_sha": head_sha,
-        "fixes": blocking,
+        "fixes": blocking_items,
         "prior_round_notes": work.get("notes", ""),
         "prior_review_non_blocking": review.get("non_blocking_suggestions", []),
     }
@@ -2191,8 +2209,8 @@ def _run_single_round(
     _archive_bus_file(WORK_REPORT, task_id, round_num, "work_report")
     WORK_REPORT.unlink(missing_ok=True)
 
-    print(f"  Blocking issues: {len(blocking)}")
-    for issue in blocking:
+    print(f"  Blocking issues: {len(blocking_items)}")
+    for issue in blocking_items:
         print(
             f"    - [{issue.get('severity','?')}] {issue.get('file','')}: "
             f"{issue.get('reason','')}"
