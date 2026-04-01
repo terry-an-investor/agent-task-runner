@@ -49,6 +49,7 @@ DEFAULT_DISPATCH_RETRY_BASE_SEC = 5
 MAX_DISPATCH_RETRY_DELAY_SEC = 60
 DEFAULT_DISPATCH_BACKEND = "native"
 DISPATCH_STREAM_POLL_SEC = 0.1
+_WAIT_SAFETY_CAP_SEC = 86400  # 24h absolute cap in _wait_for_file
 _FEED_TASK_ID: str | None = None
 _LOGS_DIR_ENSURED = False
 
@@ -1414,11 +1415,11 @@ def _git(*args: str) -> str:
 
 def _is_valid_ref(ref: str) -> bool:
     """Check that *ref* is a valid git rev (no argument injection)."""
-    result = subprocess.run(
-        ["git", "-C", str(ROOT), "rev-parse", "--verify", ref],
-        capture_output=True, text=True, encoding="utf-8",
-    )
-    return result.returncode == 0
+    try:
+        _git("rev-parse", "--verify", ref)
+        return True
+    except RuntimeError:
+        return False
 
 def _current_sha() -> str:
     return _git("rev-parse", "HEAD")
@@ -1571,7 +1572,7 @@ def _wait_for_file(
             return None
         # Absolute safety cap: even with timeout_sec=0 (unlimited),
         # bail after 24 hours to prevent runaway processes.
-        if elapsed >= 86400:
+        if elapsed >= _WAIT_SAFETY_CAP_SEC:
             _log(f"Safety cap (24h) reached waiting for {path.name}")
             return None
         time.sleep(POLL_INTERVAL_SEC)
@@ -1687,12 +1688,10 @@ def cmd_archive(task_id: str, restore: str | None = None) -> None:
 
 # ── extract-diff ────────────────────────────────────────────────────
 def cmd_extract_diff(base: str, head: str) -> None:
-    if not _is_valid_ref(base):
-        print(f"Error: invalid git ref: {base!r}", file=sys.stderr)
-        sys.exit(1)
-    if not _is_valid_ref(head):
-        print(f"Error: invalid git ref: {head!r}", file=sys.stderr)
-        sys.exit(1)
+    for ref in (base, head):
+        if not _is_valid_ref(ref):
+            print(f"Error: invalid git ref: {ref!r}", file=sys.stderr)
+            sys.exit(1)
     print(_diff(base, head))
 
 def cmd_heartbeat(role: str, interval: int) -> None:
