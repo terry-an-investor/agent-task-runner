@@ -462,144 +462,6 @@ def _codex_event_summary(role: str, backend: str, line: str) -> str | None:
                 shortened[index] = "/".join(parts[-min(depth, len(parts)) :])
         return shortened
 
-    def _split_shell_tokens(text: str) -> list[str]:
-        tokens: list[str] = []
-        current: list[str] = []
-        quote: str | None = None
-        for char in text:
-            if quote is not None:
-                if char == quote:
-                    quote = None
-                else:
-                    current.append(char)
-                continue
-            if char in ("'", '"'):
-                quote = char
-                continue
-            if char.isspace():
-                if current:
-                    tokens.append("".join(current))
-                    current = []
-                continue
-            current.append(char)
-        if current:
-            tokens.append("".join(current))
-        return tokens
-
-    def _strip_outer_quotes(text: str) -> str:
-        stripped = text.strip()
-        while len(stripped) >= 2 and (
-            (stripped.startswith('"') and stripped.endswith('"'))
-            or (stripped.startswith("'") and stripped.endswith("'"))
-        ):
-            stripped = stripped[1:-1].strip()
-        return stripped
-
-    def _extract_raw_command(value: dict) -> str:
-        command_value = value.get("command")
-        if isinstance(command_value, str) and command_value.strip():
-            return command_value.strip()
-        if isinstance(command_value, list):
-            rendered = " ".join(
-                str(part)
-                for part in command_value
-                if isinstance(part, (str, int, float))
-            )
-            if rendered.strip():
-                return rendered.strip()
-        call = value.get("call")
-        if isinstance(call, dict):
-            return _extract_raw_command(call)
-        return ""
-
-    def _strip_pwsh_wrapper(command: str) -> str:
-        stripped = command.strip()
-        if not stripped:
-            return ""
-        tokens = _split_shell_tokens(stripped)
-        if not tokens:
-            return stripped
-        exe_name = tokens[0].replace("\\", "/").split("/")[-1].lower()
-        if exe_name not in {"pwsh", "pwsh.exe", "powershell", "powershell.exe"}:
-            return stripped
-        for index, token in enumerate(tokens[1:], start=1):
-            if token.lower() in {"-command", "/command", "-c", "/c"}:
-                inner = " ".join(tokens[index + 1 :]).strip()
-                return _strip_outer_quotes(inner) if inner else stripped
-        return stripped
-
-    def _extract_read_filename(command: str) -> str | None:
-        tokens = _split_shell_tokens(command)
-        if not tokens:
-            return None
-        head = tokens[0].replace("\\", "/").split("/")[-1].lower()
-        if head not in {"get-content", "cat", "gc"}:
-            return None
-
-        path_flags = {"-path", "-literalpath"}
-
-        for token in tokens[1:]:
-            lowered = token.lower()
-            for path_flag in path_flags:
-                inline_prefix = f"{path_flag}:"
-                if lowered.startswith(inline_prefix) and len(token) > len(inline_prefix):
-                    candidate = token[len(inline_prefix) :]
-                    name = _short_filename(candidate)
-                    if name:
-                        return name
-
-        for index, token in enumerate(tokens[1:], start=1):
-            if token.lower() not in path_flags:
-                continue
-            if index + 1 >= len(tokens):
-                continue
-            candidate = tokens[index + 1]
-            if candidate.startswith("-"):
-                continue
-            name = _short_filename(candidate)
-            if name:
-                return name
-
-        option_flags_with_values = {
-            "-credential",
-            "-delimiter",
-            "-encoding",
-            "-exclude",
-            "-filter",
-            "-include",
-            "-path",
-            "-literalpath",
-            "-readcount",
-            "-stream",
-            "-tail",
-            "-totalcount",
-        }
-        switch_flags = {"-force", "-raw", "-wait", "-asbytestream"}
-        candidate = ""
-        index = 1
-        while index < len(tokens):
-            token = tokens[index]
-            lowered = token.lower()
-            if lowered.startswith("-"):
-                option_name = lowered.split(":", 1)[0]
-                if ":" in lowered:
-                    index += 1
-                    continue
-                if option_name in switch_flags:
-                    index += 1
-                    continue
-                if option_name in option_flags_with_values and index + 1 < len(tokens):
-                    index += 2
-                    continue
-                index += 1
-                continue
-            candidate = token
-            break
-        if not candidate:
-            return None
-        name = _short_filename(candidate)
-        return name or None
-
     try:
         payload = json.loads(line)
     except json.JSONDecodeError:
@@ -632,15 +494,7 @@ def _codex_event_summary(role: str, backend: str, line: str) -> str | None:
     if payload_type == "item.started":
         return None
     if item_type == "command_execution":
-        raw_command = _extract_raw_command(item)
-        if raw_command:
-            normalized_command = _strip_pwsh_wrapper(raw_command)
-            read_filename = _extract_read_filename(normalized_command)
-            if read_filename:
-                return f"[{role}] Reading: {read_filename}"
-            command = _truncate_summary_text(normalized_command)
-        else:
-            command = _extract_command_summary(item)
+        command = _extract_command_summary(item)
         return f"[{role}] Running: {command}" if command else f"[{role}] Running command"
     if item_type == "agent_message":
         message = _flatten_text_payload(item)
@@ -661,31 +515,8 @@ def _stream_dispatch_stdout_line(role: str, backend: str, raw_line: str, *, verb
         print(line, flush=True)
         return
     summary = _codex_event_summary(role, backend, line)
-    if not summary:
-        return
-
-    state = getattr(_stream_dispatch_stdout_line, "_read_summary_state", {})
-    if not isinstance(state, dict):
-        state = {}
-
-    key = f"{role}:{backend}"
-    now = time.monotonic()
-    is_reading_summary = summary.startswith(f"[{role}] Reading: ")
-    last_state = state.get(key)
-    if (
-        is_reading_summary
-        and isinstance(last_state, tuple)
-        and len(last_state) == 2
-        and last_state[0] == summary
-        and isinstance(last_state[1], float)
-    ):
-        state[key] = (summary, now)
-        _stream_dispatch_stdout_line._read_summary_state = state
-        return
-
-    state[key] = (summary, now) if is_reading_summary else None
-    _stream_dispatch_stdout_line._read_summary_state = state
-    print(summary, flush=True)
+    if summary:
+        print(summary, flush=True)
 
 
 BackendBuildFn = Callable[[str, str], tuple[list[str], str | None, str | None]]
