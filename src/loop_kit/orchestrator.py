@@ -741,6 +741,34 @@ def _collect_streamed_text_output(
     return "".join(stdout_chunks), "".join(stderr_chunks), returncode
 
 
+def _terminate_subprocess_on_interrupt(proc: subprocess.Popen[str], *, context: str) -> None:
+    stdin = getattr(proc, "stdin", None)
+    if stdin is not None:
+        close_stdin = getattr(stdin, "close", None)
+        if callable(close_stdin):
+            try:
+                close_stdin()
+            except OSError:
+                pass
+
+    is_running = False
+    try:
+        is_running = proc.poll() is None
+    except OSError:
+        is_running = False
+
+    if is_running:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    try:
+        proc.wait()
+    except OSError:
+        pass
+    _log(f"Interrupted by SIGINT; terminated subprocess ({context})")
+
+
 def _run_auto_dispatch(
     role: str,
     backend: str,
@@ -771,14 +799,33 @@ def _run_auto_dispatch(
             text=True,
             encoding="utf-8",
         )
-        stdout, stderr, returncode, timed_out = _collect_streamed_process_output(
-            proc,
-            role=role,
-            backend=backend,
-            stdin_text=stdin_text,
-            timeout_sec=timeout_sec,
-            verbose=verbose,
-        )
+        try:
+            stdout, stderr, returncode, timed_out = _collect_streamed_process_output(
+                proc,
+                role=role,
+                backend=backend,
+                stdin_text=stdin_text,
+                timeout_sec=timeout_sec,
+                verbose=verbose,
+            )
+        except KeyboardInterrupt:
+            _terminate_subprocess_on_interrupt(
+                proc,
+                context=f"auto-dispatch role={role} backend={backend} attempt={attempt}",
+            )
+            _feed_event(
+                "dispatch_summary",
+                level="error",
+                data={
+                    "role": role,
+                    "mode": "native",
+                    "backend": backend,
+                    "interrupted": True,
+                    "attempt": attempt,
+                    "max_attempts": max_attempts,
+                },
+            )
+            raise
         if timed_out:
             result = subprocess.CompletedProcess(
                 cmd,
@@ -974,6 +1021,23 @@ def _as_prompt_list(items: object) -> str:
     return "\n".join(f"- {item}" for item in items)
 
 
+def _function_index(path: Path) -> str:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return "- <unavailable>"
+
+    entries: list[str] = []
+    for line_no, raw_line in enumerate(lines, start=1):
+        stripped = raw_line.lstrip()
+        if stripped.startswith(("def ", "async def ", "class ")):
+            entries.append(f"- L{line_no}: {stripped}")
+
+    if not entries:
+        return "- <none>"
+    return "\n".join(entries)
+
+
 def _render_task_card_section(task_card: dict) -> str:
     return (
         "=== TASK CARD ===\n"
@@ -1031,6 +1095,9 @@ DEFAULT_WORKER_PROMPT_TEMPLATE = (
     "=== BEGIN docs/roles/code-writer.md ===\n"
     "{role_md}\n"
     "=== END docs/roles/code-writer.md ===\n\n"
+    "=== BEGIN FUNCTION INDEX: {orchestrator_path} ===\n"
+    "{function_index}\n"
+    "=== END FUNCTION INDEX ===\n\n"
     "{task_card_section}{prior_context_section}"
 )
 
@@ -1076,6 +1143,7 @@ def _read_required_text(path: Path, *, label: str) -> str:
 def _worker_prompt(task_id: str, round_num: int) -> str:
     agents_text = _read_required_text(ROOT / "AGENTS.md", label="AGENTS.md")
     role_text = _read_required_text(ROOT / "docs" / "roles" / "code-writer.md", label="code-writer role doc")
+    orchestrator_path = ROOT / "src" / "loop_kit" / "orchestrator.py"
     task_card = _read_json_if_exists(TASK_CARD)
     task_card_section = _render_task_card_section(task_card if isinstance(task_card, dict) else {})
     prior_context_section = _render_prior_round_context_section(round_num)
@@ -1084,6 +1152,8 @@ def _worker_prompt(task_id: str, round_num: int) -> str:
         "round_num": str(round_num),
         "agents_md": agents_text,
         "role_md": role_text,
+        "orchestrator_path": _display_path(orchestrator_path),
+        "function_index": _function_index(orchestrator_path),
         "task_card_section": task_card_section,
         "prior_context_section": (f"\n{prior_context_section}" if prior_context_section else ""),
         "work_report_path": _display_path(WORK_REPORT),
@@ -1929,6 +1999,8 @@ def _run_multi_round_via_subprocess(
         _enforce_clean_worktree_or_exit(allow_dirty=allow_dirty)
 
     start_round = 1
+    task_id = ""
+    base_sha = ""
     if resume_from_state is None:
         task_card, task_id = _sync_task_card_to_bus(task_path, round_num=1)
         _set_feed_task_id(task_id)
