@@ -1743,3 +1743,551 @@ def test_cmd_run_exits_5_when_run_lock_is_unavailable(monkeypatch, capsys) -> No
     assert exc.value.code == 5
     err = capsys.readouterr().err
     assert "already running" in err
+
+
+# ── pure utility functions ──────────────────────────────────────────
+
+
+class TestParsePorcelainPath:
+    def test_plain_path(self) -> None:
+        assert orchestrator._parse_porcelain_path("  src/main.py  ") == "src/main.py"
+
+    def test_rename_arrow(self) -> None:
+        assert orchestrator._parse_porcelain_path("old.py -> new.py") == "new.py"
+
+    def test_quoted_path(self) -> None:
+        assert orchestrator._parse_porcelain_path('"path with spaces.py"') == "path with spaces.py"
+
+    def test_backslash_to_forward_slash(self) -> None:
+        assert orchestrator._parse_porcelain_path("src\\nested\\file.py") == "src/nested/file.py"
+
+    def test_quoted_rename(self) -> None:
+        assert orchestrator._parse_porcelain_path('"old name.py" -> "new name.py"') == "new name.py"
+
+
+class TestDisplayPath:
+    def test_relative_to_root(self, monkeypatch, tmp_path: Path) -> None:
+        monkeypatch.setattr(orchestrator, "ROOT", tmp_path)
+        result = orchestrator._display_path(tmp_path / "src" / "main.py")
+        assert result == "src/main.py"
+
+    def test_outside_root_falls_back_to_absolute(self, monkeypatch, tmp_path: Path) -> None:
+        monkeypatch.setattr(orchestrator, "ROOT", tmp_path)
+        result = orchestrator._display_path(Path("/other/location/file.py"))
+        assert "other" in result
+
+
+class TestNormalizedAbs:
+    def test_returns_normalized_string(self, tmp_path: Path) -> None:
+        result = orchestrator._normalized_abs(tmp_path / "file.py")
+        assert isinstance(result, str)
+        assert "file.py" in result
+
+
+class TestReadJsonIfExists:
+    def test_returns_parsed_json(self, tmp_path: Path) -> None:
+        p = tmp_path / "data.json"
+        p.write_text('{"key": "value"}', encoding="utf-8")
+        assert orchestrator._read_json_if_exists(p) == {"key": "value"}
+
+    def test_returns_none_on_missing(self, tmp_path: Path) -> None:
+        assert orchestrator._read_json_if_exists(tmp_path / "nope.json") is None
+
+    def test_returns_none_on_invalid_json(self, tmp_path: Path) -> None:
+        p = tmp_path / "bad.json"
+        p.write_text("not json", encoding="utf-8")
+        assert orchestrator._read_json_if_exists(p) is None
+
+
+class TestReadTextOptional:
+    def test_returns_content(self, tmp_path: Path) -> None:
+        p = tmp_path / "file.txt"
+        p.write_text("hello", encoding="utf-8")
+        assert orchestrator._read_text_optional(p) == "hello"
+
+    def test_returns_none_on_missing(self, tmp_path: Path) -> None:
+        assert orchestrator._read_text_optional(tmp_path / "nope.txt") is None
+
+
+class TestAsPromptList:
+    def test_list_items(self) -> None:
+        result = orchestrator._as_prompt_list(["a", "b", "c"])
+        assert result == "- a\n- b\n- c"
+
+    def test_empty_list(self) -> None:
+        assert orchestrator._as_prompt_list([]) == "- <none>"
+
+    def test_non_list(self) -> None:
+        assert orchestrator._as_prompt_list("not a list") == "- <none>"
+
+    def test_none(self) -> None:
+        assert orchestrator._as_prompt_list(None) == "- <none>"
+
+
+class TestTruncateSummaryText:
+    def test_short_text_unchanged(self) -> None:
+        assert orchestrator._truncate_summary_text("hello world") == "hello world"
+
+    def test_long_text_truncated(self) -> None:
+        text = "a" * 200
+        result = orchestrator._truncate_summary_text(text)
+        assert len(result) == 120
+        assert result.endswith("...")
+
+    def test_whitespace_normalized(self) -> None:
+        assert orchestrator._truncate_summary_text("  a   b   c  ") == "a b c"
+
+
+class TestTs:
+    def test_format_matches_iso8601(self) -> None:
+        result = orchestrator._ts()
+        assert result.endswith("Z")
+        assert "T" in result
+        # verify it parses as a valid timestamp
+        from datetime import datetime, timezone
+        datetime.strptime(result, "%Y-%m-%dT%H:%M:%SZ")
+
+
+class TestTestsSummary:
+    def test_pass_fail_other(self) -> None:
+        tests = [
+            {"result": "pass"},
+            {"result": "pass"},
+            {"result": "fail"},
+            {"result": "error"},
+            {"result": "skip"},
+        ]
+        s = orchestrator._tests_summary(tests)
+        assert s == {"total": 5, "pass": 2, "fail": 2, "other": 1}
+
+    def test_non_list_input(self) -> None:
+        s = orchestrator._tests_summary(None)
+        assert s == {"total": 0, "pass": 0, "fail": 0, "other": 0}
+
+    def test_empty_list(self) -> None:
+        s = orchestrator._tests_summary([])
+        assert s == {"total": 0, "pass": 0, "fail": 0, "other": 0}
+
+    def test_failed_variant(self) -> None:
+        s = orchestrator._tests_summary([{"result": "failed"}])
+        assert s["fail"] == 1
+
+
+# ── streaming / parsing ─────────────────────────────────────────────
+
+
+class TestExtractCodexThreadId:
+    def test_finds_thread_started(self) -> None:
+        stdout = (
+            '{"type":"thread.started","thread_id":"tid_123"}\n'
+            '{"type":"item.completed","item":{}}\n'
+        )
+        assert orchestrator._extract_codex_thread_id(stdout) == "tid_123"
+
+    def test_returns_none_on_no_match(self) -> None:
+        stdout = '{"type":"item.completed"}\n'
+        assert orchestrator._extract_codex_thread_id(stdout) is None
+
+    def test_ignores_malformed_json(self) -> None:
+        stdout = "not json\n{}\n"
+        assert orchestrator._extract_codex_thread_id(stdout) is None
+
+
+class TestFlattenTextPayload:
+    def test_string(self) -> None:
+        assert orchestrator._flatten_text_payload("  hello  ") == "hello"
+
+    def test_list(self) -> None:
+        assert orchestrator._flatten_text_payload(["a", "b"]) == "a b"
+
+    def test_nested_dict_text_key(self) -> None:
+        assert orchestrator._flatten_text_payload({"text": "value"}) == "value"
+
+    def test_nested_dict_message_key(self) -> None:
+        assert orchestrator._flatten_text_payload({"message": "val"}) == "val"
+
+    def test_empty_dict(self) -> None:
+        assert orchestrator._flatten_text_payload({}) == ""
+
+    def test_none(self) -> None:
+        assert orchestrator._flatten_text_payload(None) == ""
+
+
+class TestExtractCommandSummary:
+    def test_string_command(self) -> None:
+        result = orchestrator._extract_command_summary({"command": "npm test"})
+        assert result == "npm test"
+
+    def test_list_command(self) -> None:
+        result = orchestrator._extract_command_summary({"command": ["python", "-m", "pytest"]})
+        assert "python" in result
+        assert "pytest" in result
+
+    def test_call_dict_fallback(self) -> None:
+        result = orchestrator._extract_command_summary({"call": {"command": "make build"}})
+        assert result == "make build"
+
+    def test_empty_returns_empty(self) -> None:
+        assert orchestrator._extract_command_summary({}) == ""
+
+
+class TestCodexEventSummary:
+    def test_command_execution(self) -> None:
+        line = json.dumps({
+            "type": "item.completed",
+            "item": {"type": "command_execution", "command": "npm test"},
+        })
+        result = orchestrator._codex_event_summary("worker", "codex", line)
+        assert result is not None
+        assert "[worker] Running: npm test" == result
+
+    def test_agent_message(self) -> None:
+        line = json.dumps({
+            "type": "item.completed",
+            "item": {"type": "agent_message", "text": "I fixed the bug."},
+        })
+        result = orchestrator._codex_event_summary("worker", "codex", line)
+        assert result is not None
+        assert "[worker] Message:" in result
+        assert "I fixed the bug." in result
+
+    def test_non_codex_returns_none(self) -> None:
+        line = json.dumps({"type": "item.completed", "item": {"type": "command_execution"}})
+        assert orchestrator._codex_event_summary("worker", "claude", line) is None
+
+    def test_malformed_json_returns_none(self) -> None:
+        assert orchestrator._codex_event_summary("worker", "codex", "bad json") is None
+
+    def test_non_item_completed_returns_none(self) -> None:
+        line = json.dumps({"type": "thread.started"})
+        assert orchestrator._codex_event_summary("worker", "codex", line) is None
+
+
+class TestDispatchFailureHint:
+    def test_timeout_hint(self) -> None:
+        result = orchestrator._dispatch_failure_hint(backend="codex", stderr="", timeout=True)
+        assert "--dispatch-timeout" in result
+
+    def test_auth_hint_codex(self) -> None:
+        result = orchestrator._dispatch_failure_hint(
+            backend="codex", stderr="Error: unauthorized 401"
+        )
+        assert "codex API key" in result
+
+    def test_auth_hint_claude(self) -> None:
+        result = orchestrator._dispatch_failure_hint(
+            backend="claude", stderr="auth token expired"
+        )
+        assert "claude authentication" in result
+
+    def test_not_found_hint(self) -> None:
+        result = orchestrator._dispatch_failure_hint(
+            backend="codex", stderr="codex: command not found"
+        )
+        assert "executable path" in result
+
+    def test_fallback_hint(self) -> None:
+        result = orchestrator._dispatch_failure_hint(backend="codex", stderr="unknown error")
+        assert "auth/network" in result
+
+
+# ── dispatch ─────────────────────────────────────────────────────────
+
+
+class TestWriteDispatchLog:
+    def test_writes_structured_log(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setattr(orchestrator, "LOGS_DIR", tmp_path)
+        result = subprocess.CompletedProcess(
+            args=["codex"], returncode=0, stdout="out\n", stderr="err\n"
+        )
+        result.stdout = "out\n"
+        result.stderr = "err\n"
+        orchestrator._write_dispatch_log(
+            "worker", ["codex", "exec"], result, "sid-123"
+        )
+        log = (tmp_path / "worker_dispatch.log").read_text(encoding="utf-8")
+        assert "role=worker" in log
+        assert "returncode=0" in log
+        assert "session_id=sid-123" in log
+        assert "cmd=codex exec" in log
+        assert "stdout:" in log
+        assert "stderr:" in log
+
+    def test_no_session_id_omits_line(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setattr(orchestrator, "LOGS_DIR", tmp_path)
+        result = subprocess.CompletedProcess(args=["codex"], returncode=1, stdout="", stderr="")
+        result.stdout = ""
+        result.stderr = ""
+        orchestrator._write_dispatch_log("worker", ["codex"], result, None)
+        log = (tmp_path / "worker_dispatch.log").read_text(encoding="utf-8")
+        assert "session_id=" not in log
+
+
+class TestResolveExeFromCandidates:
+    def test_finds_existing_file(self, tmp_path: Path) -> None:
+        exe = tmp_path / "mybin"
+        exe.write_text("")
+        result = orchestrator._resolve_exe_from_candidates(
+            backend="test", candidates=[None, str(exe)]
+        )
+        assert result == str(exe)
+
+    def test_raises_when_none_found(self) -> None:
+        with pytest.raises(RuntimeError, match="Cannot find executable"):
+            orchestrator._resolve_exe_from_candidates(
+                backend="test", candidates=[None, "/nonexistent/path"]
+            )
+
+
+class TestResolveParExe:
+    def test_absolute_path_exists(self, tmp_path: Path) -> None:
+        exe = tmp_path / "par-bin"
+        exe.write_text("")
+        result = orchestrator._resolve_par_exe(str(exe))
+        assert result == str(exe)
+
+    def test_absolute_path_missing_raises(self, tmp_path: Path) -> None:
+        with pytest.raises(RuntimeError, match="Cannot find par executable"):
+            orchestrator._resolve_par_exe(str(tmp_path / "missing-bin"))
+
+    def test_basename_not_found_raises(self, monkeypatch) -> None:
+        monkeypatch.setattr("shutil.which", lambda _: None)
+        with pytest.raises(RuntimeError, match="Cannot find par executable"):
+            orchestrator._resolve_par_exe("nonexistent-par-tool")
+
+
+# ── locking, heartbeat, polling ─────────────────────────────────────
+
+
+class TestLoopLock:
+    def test_acquire_and_release(self, tmp_path: Path) -> None:
+        lock = orchestrator._LoopLock(tmp_path / "test.lock")
+        lock.acquire()
+        assert lock._handle is not None
+        lock.release()
+        assert lock._handle is None
+
+    def test_context_manager(self, tmp_path: Path) -> None:
+        lock_file = tmp_path / "test.lock"
+        with orchestrator._LoopLock(lock_file) as lock:
+            assert lock._handle is not None
+        assert lock._handle is None
+
+    def test_release_without_acquire_is_noop(self, tmp_path: Path) -> None:
+        lock = orchestrator._LoopLock(tmp_path / "test.lock")
+        lock.release()  # should not raise
+
+    def test_second_acquire_raises(self, tmp_path: Path) -> None:
+        lock_file = tmp_path / "test.lock"
+        lock1 = orchestrator._LoopLock(lock_file)
+        lock1.acquire()
+        lock2 = orchestrator._LoopLock(lock_file)
+        with pytest.raises(RuntimeError, match="another orchestrator instance"):
+            lock2.acquire()
+        lock1.release()
+
+
+class TestHeartbeatAgeSec:
+    def test_returns_age_for_existing_file(self, tmp_path: Path) -> None:
+        hb = tmp_path / "hb.json"
+        hb.write_text("{}", encoding="utf-8")
+        age = orchestrator._heartbeat_age_sec(hb, now=hb.stat().st_mtime + 5.0)
+        assert age == pytest.approx(5.0, abs=0.1)
+
+    def test_returns_none_for_missing(self, tmp_path: Path) -> None:
+        assert orchestrator._heartbeat_age_sec(tmp_path / "nope.json") is None
+
+    def test_clamps_to_zero(self, tmp_path: Path) -> None:
+        hb = tmp_path / "hb.json"
+        hb.write_text("{}", encoding="utf-8")
+        age = orchestrator._heartbeat_age_sec(hb, now=hb.stat().st_mtime - 10.0)
+        assert age == 0.0
+
+
+class TestRoleIsAlive:
+    def test_alive_when_fresh(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        hb = orchestrator._heartbeat_path("worker")
+        hb.parent.mkdir(parents=True, exist_ok=True)
+        hb.write_text(json.dumps({"pid": 42}), encoding="utf-8")
+        alive, reason = orchestrator._role_is_alive("worker", 30)
+        assert alive
+        assert "pid=42" in reason
+
+    def test_dead_when_missing(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        alive, reason = orchestrator._role_is_alive("worker", 30)
+        assert not alive
+        assert "missing" in reason
+
+    def test_dead_when_stale(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        hb = orchestrator._heartbeat_path("worker")
+        hb.parent.mkdir(parents=True, exist_ok=True)
+        hb.write_text("{}", encoding="utf-8")
+        # make it old
+        import os, time
+        old_time = hb.stat().st_mtime - 100
+        os.utime(hb, (old_time, old_time))
+        alive, reason = orchestrator._role_is_alive("worker", 30)
+        assert not alive
+        assert "stale" in reason
+
+
+class TestWriteTemplateIfMissing:
+    def test_creates_new_file(self, tmp_path: Path) -> None:
+        p = tmp_path / "new.txt"
+        assert orchestrator._write_template_if_missing(p, "content")
+        assert p.read_text(encoding="utf-8") == "content"
+
+    def test_skips_existing(self, tmp_path: Path) -> None:
+        p = tmp_path / "existing.txt"
+        p.write_text("old", encoding="utf-8")
+        assert not orchestrator._write_template_if_missing(p, "new")
+        assert p.read_text(encoding="utf-8") == "old"
+
+
+# ── CLI commands and state ──────────────────────────────────────────
+
+
+class TestValidateWorkReport:
+    def test_valid_report(self) -> None:
+        work = {"task_id": "T-1", "head_sha": "abc", "round": 1}
+        assert orchestrator._validate_work_report(work, expected_task_id="T-1", expected_round=1) is None
+
+    def test_missing_field(self) -> None:
+        assert "missing required field" in (
+            orchestrator._validate_work_report({}, expected_task_id="T-1", expected_round=1) or ""
+        )
+
+    def test_wrong_type_int(self) -> None:
+        work = {"task_id": "T-1", "head_sha": "abc", "round": "1"}
+        assert "must be int" in (
+            orchestrator._validate_work_report(work, expected_task_id="T-1", expected_round=1) or ""
+        )
+
+    def test_empty_string(self) -> None:
+        work = {"task_id": "  ", "head_sha": "abc", "round": 1}
+        assert "non-empty" in (
+            orchestrator._validate_work_report(work, expected_task_id="T-1", expected_round=1) or ""
+        )
+
+    def test_task_id_mismatch(self) -> None:
+        work = {"task_id": "T-2", "head_sha": "abc", "round": 1}
+        assert "mismatch" in (
+            orchestrator._validate_work_report(work, expected_task_id="T-1", expected_round=1) or ""
+        )
+
+    def test_round_mismatch(self) -> None:
+        work = {"task_id": "T-1", "head_sha": "abc", "round": 2}
+        assert "mismatch" in (
+            orchestrator._validate_work_report(work, expected_task_id="T-1", expected_round=1) or ""
+        )
+
+
+class TestLoadState:
+    def test_default_when_no_file(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        state = orchestrator._load_state()
+        assert state["state"] == "idle"
+        assert state["round"] == 0
+
+    def test_loads_existing(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        orchestrator.STATE_FILE.write_text(
+            json.dumps({"state": "done", "round": 3}), encoding="utf-8"
+        )
+        state = orchestrator._load_state()
+        assert state["state"] == "done"
+        assert state["round"] == 3
+
+
+class TestSaveState:
+    def test_writes_json(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        orchestrator._save_state({"state": "done", "round": 2})
+        data = json.loads(orchestrator.STATE_FILE.read_text(encoding="utf-8"))
+        assert data["state"] == "done"
+        assert data["round"] == 2
+
+
+class TestArchiveTaskSummary:
+    def test_archives_existing_summary(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        summary = orchestrator.LOOP_DIR / "summary.json"
+        summary.write_text('{"outcome": "approved"}', encoding="utf-8")
+        dest = orchestrator._archive_task_summary("T-1")
+        assert dest is not None
+        assert dest.exists()
+        assert dest.name == "summary.json"
+
+    def test_returns_none_when_missing(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        assert orchestrator._archive_task_summary("T-1") is None
+
+
+class TestCmdStatus:
+    def test_prints_state_and_file_markers(self, tmp_path: Path, monkeypatch, capsys) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        orchestrator.STATE_FILE.write_text(
+            json.dumps({"state": "done", "round": 1}), encoding="utf-8"
+        )
+        orchestrator.TASK_CARD.write_text("{}", encoding="utf-8")
+        orchestrator.cmd_status()
+        out = capsys.readouterr().out
+        assert '"state": "done"' in out
+        assert "task_card.json: EXISTS" in out
+        assert "work_report.json: missing" in out
+
+
+class TestCmdHealth:
+    def test_reports_both_roles(self, tmp_path: Path, monkeypatch, capsys) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        orchestrator.cmd_health(30)
+        out = capsys.readouterr().out
+        assert "worker:" in out
+        assert "reviewer:" in out
+        assert "dead" in out  # no heartbeats exist
+
+
+class TestCmdExtractDiff:
+    def test_prints_diff(self, monkeypatch, capsys) -> None:
+        monkeypatch.setattr(orchestrator, "_diff", lambda base, head: f"diff {base}..{head}")
+        orchestrator.cmd_extract_diff("abc", "def")
+        assert capsys.readouterr().out.strip() == "diff abc..def"
+
+
+class TestRestoreTargetNameFromArchive:
+    def test_round_prefixed(self) -> None:
+        assert orchestrator._restore_target_name_from_archive("r1_state") == "state.json"
+
+    def test_round_prefixed_work_report(self) -> None:
+        assert orchestrator._restore_target_name_from_archive("r2_work_report") == "work_report.json"
+
+    def test_summary(self) -> None:
+        assert orchestrator._restore_target_name_from_archive("summary") == "summary.json"
+
+    def test_bare_name(self) -> None:
+        assert orchestrator._restore_target_name_from_archive("task_card") == "task_card.json"
+
+
+class TestRegisterBackendValidation:
+    def test_empty_name_raises(self) -> None:
+        with pytest.raises(ValueError, match="must not be empty"):
+            orchestrator.register_backend("  ", lambda e, p: ([], None, None), lambda b: b)
+
+    def test_strip_and_lower(self, monkeypatch) -> None:
+        monkeypatch.setattr(orchestrator, "_resolve_backend_exe", lambda b: "test.exe")
+        orchestrator.register_backend("MyBackend", lambda e, p: ([e, "run"], None, None), lambda b: "test.exe")
+        assert "mybackend" in orchestrator._available_backends()
+        # cleanup
+        del orchestrator._BACKEND_REGISTRY["mybackend"]
+
+
+class TestIsGitRepoRoot:
+    def test_true_when_git_exists(self, tmp_path: Path) -> None:
+        (tmp_path / ".git").mkdir()
+        assert orchestrator._is_git_repo_root(tmp_path)
+
+    def test_false_when_no_git(self, tmp_path: Path) -> None:
+        assert not orchestrator._is_git_repo_root(tmp_path)
