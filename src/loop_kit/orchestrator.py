@@ -21,6 +21,7 @@ import argparse
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -247,13 +248,23 @@ def _feed_event(event: str, *, level: str = "info", data: dict | None = None) ->
     with open(_feed_log_path(), "a", encoding="utf-8") as f:
         f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
-def _log(msg: str) -> None:
+def _log(msg: str, *, level: str = "info", **extra: object) -> None:
     ts = _ts()
+    # Console: human-readable
     line = f"[{ts}] {msg}"
     print(line, flush=True)
+    # Log file: structured JSON
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    entry: dict[str, object] = {
+        "ts": ts,
+        "level": level,
+        "msg": msg,
+    }
+    if _FEED_TASK_ID:
+        entry["task_id"] = _FEED_TASK_ID
+    entry.update(extra)
     with open(LOGS_DIR / "orchestrator.log", "a", encoding="utf-8") as f:
-        f.write(line + "\n")
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     _feed_event("log", data={"message": msg})
 
 
@@ -327,11 +338,11 @@ def _truncate_summary_text(text: str, max_len: int = 120) -> str:
 def _extract_command_summary(item: dict) -> str:
     command = item.get("command")
     if isinstance(command, str) and command.strip():
-        return _truncate_summary_text(command)
+        return command.strip()
     if isinstance(command, list):
         rendered = " ".join(str(part) for part in command if isinstance(part, (str, int, float)))
         if rendered.strip():
-            return _truncate_summary_text(rendered)
+            return rendered.strip()
     call = item.get("call")
     if isinstance(call, dict):
         return _extract_command_summary(call)
@@ -396,6 +407,26 @@ def _summarize_paths(paths: list[str], max_items: int = 3) -> str:
 def _codex_event_summary(role: str, backend: str, line: str) -> str | None:
     if backend != "codex":
         return None
+
+    def _strip_outer_quotes(text: str) -> str:
+        stripped = text.strip()
+        if len(stripped) >= 2 and stripped[0] == stripped[-1] and stripped[0] in ("'", '"'):
+            return stripped[1:-1].strip()
+        return stripped
+
+    def _strip_powershell_wrapper(command_text: str) -> str:
+        stripped = command_text.strip()
+        lowered = stripped.lower()
+        marker = " -command "
+        marker_index = lowered.find(marker)
+        if marker_index <= 0:
+            return _strip_outer_quotes(stripped)
+        launcher = _strip_outer_quotes(stripped[:marker_index].strip())
+        launcher_name = launcher.replace("\\", "/").split("/")[-1].lower()
+        if launcher_name not in {"pwsh", "pwsh.exe", "powershell", "powershell.exe"}:
+            return _strip_outer_quotes(stripped)
+        inner = _strip_outer_quotes(stripped[marker_index + len(marker) :].strip())
+        return inner or _strip_outer_quotes(stripped)
 
     def _clean_path_text(path_text: str) -> str:
         cleaned = path_text.strip().strip("\"'")
@@ -495,6 +526,8 @@ def _codex_event_summary(role: str, backend: str, line: str) -> str | None:
         return None
     if item_type == "command_execution":
         command = _extract_command_summary(item)
+        if command:
+            command = _truncate_summary_text(_strip_powershell_wrapper(command))
         return f"[{role}] Running: {command}" if command else f"[{role}] Running command"
     if item_type == "agent_message":
         message = _flatten_text_payload(item)
@@ -510,13 +543,126 @@ def _codex_event_summary(role: str, backend: str, line: str) -> str | None:
 
 
 def _stream_dispatch_stdout_line(role: str, backend: str, raw_line: str, *, verbose: bool) -> None:
+    def _strip_outer_quotes(text: str) -> str:
+        stripped = text.strip()
+        if len(stripped) >= 2 and stripped[0] == stripped[-1] and stripped[0] in ("'", '"'):
+            return stripped[1:-1].strip()
+        return stripped
+
+    def _strip_powershell_wrapper(command_text: str) -> str:
+        stripped = command_text.strip()
+        lowered = stripped.lower()
+        marker = " -command "
+        marker_index = lowered.find(marker)
+        if marker_index <= 0:
+            return _strip_outer_quotes(stripped)
+        launcher = _strip_outer_quotes(stripped[:marker_index].strip())
+        launcher_name = launcher.replace("\\", "/").split("/")[-1].lower()
+        if launcher_name not in {"pwsh", "pwsh.exe", "powershell", "powershell.exe"}:
+            return _strip_outer_quotes(stripped)
+        inner = _strip_outer_quotes(stripped[marker_index + len(marker) :].strip())
+        return inner or _strip_outer_quotes(stripped)
+
+    def _extract_raw_command(item: dict) -> str:
+        command = item.get("command")
+        if isinstance(command, str) and command.strip():
+            return command.strip()
+        if isinstance(command, list):
+            rendered = " ".join(str(part) for part in command if isinstance(part, (str, int, float)))
+            if rendered.strip():
+                return rendered.strip()
+        call = item.get("call")
+        if isinstance(call, dict):
+            return _extract_raw_command(call)
+        return ""
+
+    def _extract_read_filename(command_text: str) -> str | None:
+        command = _strip_powershell_wrapper(command_text)
+        if not command:
+            return None
+        try:
+            import shlex
+
+            tokens = shlex.split(command, posix=False)
+        except ValueError:
+            tokens = command.split()
+        if not tokens:
+            return None
+        if tokens[0] == "&" and len(tokens) > 1:
+            tokens = tokens[1:]
+        if not tokens:
+            return None
+        first = _strip_outer_quotes(tokens[0]).replace("\\", "/").split("/")[-1].lower()
+        if first not in {"get-content", "cat"}:
+            return None
+
+        path_token = ""
+        idx = 1
+        while idx < len(tokens):
+            token = tokens[idx]
+            lowered = token.lower()
+            if first == "get-content" and lowered in {"-path", "-literalpath"}:
+                if idx + 1 < len(tokens):
+                    path_token = tokens[idx + 1]
+                break
+            if lowered.startswith("-"):
+                idx += 1
+                continue
+            path_token = token
+            break
+        if not path_token:
+            return None
+        cleaned = _strip_outer_quotes(path_token).strip().strip("\"'").rstrip(";,")
+        if "|" in cleaned:
+            cleaned = cleaned.split("|", 1)[0].strip()
+        if not cleaned:
+            return None
+        normalized = cleaned.replace("\\", "/").rstrip("/")
+        name = normalized.split("/")[-1] if normalized else ""
+        return name or cleaned
+
+    state_local = getattr(_stream_dispatch_stdout_line, "_state_local", None)
+    if state_local is None:
+        state_local = threading.local()
+        setattr(_stream_dispatch_stdout_line, "_state_local", state_local)
+
+    read_state = getattr(state_local, "read_state", None)
+    if read_state is None:
+        read_state = {}
+        setattr(state_local, "read_state", read_state)
+
+    state_key = f"{role}:{backend}"
     line = raw_line.rstrip("\r\n")
     if verbose:
         print(line, flush=True)
         return
     summary = _codex_event_summary(role, backend, line)
-    if summary:
-        print(summary, flush=True)
+    if not summary:
+        read_state.pop(state_key, None)
+        return
+
+    read_summary: str | None = None
+    try:
+        payload = json.loads(line)
+    except json.JSONDecodeError:
+        payload = None
+    if isinstance(payload, dict) and payload.get("type") == "item.completed":
+        item = payload.get("item")
+        if isinstance(item, dict) and item.get("type") == "command_execution":
+            command_text = _extract_raw_command(item)
+            read_name = _extract_read_filename(command_text) if command_text else None
+            if read_name:
+                read_summary = f"[{role}] Reading: {read_name}"
+
+    if read_summary is not None:
+        if read_state.get(state_key) == read_summary:
+            return
+        print(read_summary, flush=True)
+        read_state[state_key] = read_summary
+        return
+
+    print(summary, flush=True)
+    read_state.pop(state_key, None)
 
 
 BackendBuildFn = Callable[[str, str], tuple[list[str], str | None, str | None]]
@@ -2146,127 +2292,166 @@ def _run_multi_round_via_subprocess(
         _dispatch_log_path(role).unlink(missing_ok=True)
 
     last_decision = "changes_required"
-    for round_num in range(start_round, max_rounds + 1):
-        print(f"\n{'='*60}")
-        print(f"  ROUND {round_num}/{max_rounds}  —  Single-Round Subprocess")
-        print(f"{'='*60}")
-        _archive_bus_file(STATE_FILE, task_id, round_num, "state")
+    interrupted = False
+    current_proc: subprocess.Popen[str] | None = None
 
-        cmd = _single_round_subprocess_cmd(
-            round_num=round_num,
-            timeout=timeout,
-            require_heartbeat=require_heartbeat,
-            heartbeat_ttl=heartbeat_ttl,
-            auto_dispatch=auto_dispatch,
-            dispatch_backend=dispatch_backend,
-            worker_backend=worker_backend,
-            reviewer_backend=reviewer_backend,
-            dispatch_timeout=dispatch_timeout,
-            dispatch_retries=dispatch_retries,
-            dispatch_retry_base_sec=dispatch_retry_base_sec,
-            artifact_timeout=artifact_timeout,
-            par_bin=par_bin,
-            par_worker_target=par_worker_target,
-            par_reviewer_target=par_reviewer_target,
-            allow_dirty=allow_dirty,
-            verbose=verbose,
-        )
-        _log(f"Launching single-round subprocess: {' '.join(cmd)}")
-        proc = subprocess.Popen(
-            cmd,
-            cwd=str(ROOT),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-        )
-        stdout, stderr, returncode = _collect_streamed_text_output(
-            proc,
-            stdout_line_callback=lambda raw_line: print(raw_line, end="", flush=True),
-        )
-        result = subprocess.CompletedProcess(
-            cmd,
-            returncode if returncode is not None else 1,
-            stdout,
-            stderr,
-        )
-        if result.returncode != 0:
-            if result.stdout:
-                _log(f"single-round stdout:\n{result.stdout.rstrip()}")
-            if result.stderr:
-                _log(f"single-round stderr:\n{result.stderr.rstrip()}")
-            _fail_with_state(
-                state,
-                outcome="single_round_failed",
-                message=f"single-round subprocess failed for round={round_num} rc={result.returncode}",
-                exit_code=3,
+    def _outer_sigint_handler(signum: int, frame: object) -> None:
+        nonlocal interrupted
+        interrupted = True
+        if current_proc is not None and current_proc.poll() is None:
+            _log(f"SIGINT received during round {round_num}; terminating subprocess")
+            try:
+                current_proc.terminate()
+            except OSError:
+                pass
+
+    old_sigint = signal.signal(signal.SIGINT, _outer_sigint_handler)
+
+    try:
+        for round_num in range(start_round, max_rounds + 1):
+            if interrupted:
+                break
+
+            print(f"\n{'='*60}")
+            print(f"  ROUND {round_num}/{max_rounds}  —  Single-Round Subprocess")
+            print(f"{'='*60}")
+            _archive_bus_file(STATE_FILE, task_id, round_num, "state")
+
+            cmd = _single_round_subprocess_cmd(
+                round_num=round_num,
+                timeout=timeout,
+                require_heartbeat=require_heartbeat,
+                heartbeat_ttl=heartbeat_ttl,
+                auto_dispatch=auto_dispatch,
+                dispatch_backend=dispatch_backend,
+                worker_backend=worker_backend,
+                reviewer_backend=reviewer_backend,
+                dispatch_timeout=dispatch_timeout,
+                dispatch_retries=dispatch_retries,
+                dispatch_retry_base_sec=dispatch_retry_base_sec,
+                artifact_timeout=artifact_timeout,
+                par_bin=par_bin,
+                par_worker_target=par_worker_target,
+                par_reviewer_target=par_reviewer_target,
+                allow_dirty=allow_dirty,
+                verbose=verbose,
             )
-            return
+            _log(f"Launching single-round subprocess: {' '.join(cmd)}")
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(ROOT),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+            )
+            current_proc = proc
+            stdout, stderr, returncode = _collect_streamed_text_output(
+                proc,
+                stdout_line_callback=lambda raw_line: print(raw_line, end="", flush=True),
+            )
+            current_proc = None
 
-        _ = _load_task_card(str(TASK_CARD))
-        review = _read_json_if_exists(REVIEW_REPORT)
-        fix_list = _read_json_if_exists(FIX_LIST)
-        state = _load_state()
+            if interrupted:
+                _log(f"Round {round_num} subprocess terminated by SIGINT")
+                break
 
-        if state.get("task_id") != task_id or state.get("base_sha") != base_sha:
+            result = subprocess.CompletedProcess(
+                cmd,
+                returncode if returncode is not None else 1,
+                stdout,
+                stderr,
+            )
+            if result.returncode != 0:
+                if result.stdout:
+                    _log(f"single-round stdout:\n{result.stdout.rstrip()}")
+                if result.stderr:
+                    _log(f"single-round stderr:\n{result.stderr.rstrip()}")
+                _fail_with_state(
+                    state,
+                    outcome="single_round_failed",
+                    message=f"single-round subprocess failed for round={round_num} rc={result.returncode}",
+                    exit_code=3,
+                )
+                return
+
+            _ = _load_task_card(str(TASK_CARD))
+            review = _read_json_if_exists(REVIEW_REPORT)
+            fix_list = _read_json_if_exists(FIX_LIST)
+            state = _load_state()
+
+            if state.get("task_id") != task_id or state.get("base_sha") != base_sha:
+                _fail_with_state(
+                    state,
+                    outcome="state_contract_mismatch",
+                    message=(
+                        "state.json contract mismatch after single-round subprocess: "
+                        f"expected task_id={task_id} base_sha={base_sha}, "
+                        f"got task_id={state.get('task_id')} base_sha={state.get('base_sha')}"
+                    ),
+                    exit_code=3,
+                )
+                return
+
+            if state.get("state") == STATE_DONE and state.get("outcome") == "approved":
+                _archive_task_summary(task_id)
+                _log(f"Task approved via state contract at round={round_num}")
+                return
+
+            if (
+                state.get("state") == STATE_AWAITING_WORK
+                and state.get("round") == round_num + 1
+            ):
+                last_decision = "changes_required"
+                if (
+                    isinstance(fix_list, dict)
+                    and fix_list.get("task_id") == task_id
+                    and fix_list.get("round") == round_num + 1
+                ):
+                    blocking = fix_list.get("fixes", [])
+                    print(f"  Blocking issues: {len(blocking)}")
+                    for issue in blocking:
+                        print(
+                            f"    - [{issue.get('severity','?')}] {issue.get('file','')}: "
+                            f"{issue.get('reason','')}"
+                        )
+                else:
+                    _log(
+                        "State indicates changes_required, but fix_list.json is missing/stale; "
+                        "continuing based on state.json contract."
+                    )
+                if isinstance(review, dict):
+                    decision = review.get("decision")
+                    if decision not in (None, "changes_required"):
+                        _log(
+                            f"Ignoring stale review_report decision={decision!r}; "
+                            "state.json is authoritative."
+                        )
+                continue
+
             _fail_with_state(
                 state,
-                outcome="state_contract_mismatch",
+                outcome="invalid_state_transition",
                 message=(
-                    "state.json contract mismatch after single-round subprocess: "
-                    f"expected task_id={task_id} base_sha={base_sha}, "
-                    f"got task_id={state.get('task_id')} base_sha={state.get('base_sha')}"
+                    "single-round subprocess exited 0 but did not produce a valid state transition: "
+                    f"state={state.get('state')!r} outcome={state.get('outcome')!r} round={state.get('round')!r}"
                 ),
                 exit_code=3,
             )
             return
+    finally:
+        signal.signal(signal.SIGINT, old_sigint)
 
-        if state.get("state") == STATE_DONE and state.get("outcome") == "approved":
-            _archive_task_summary(task_id)
-            _log(f"Task approved via state contract at round={round_num}")
-            return
-
-        if (
-            state.get("state") == STATE_AWAITING_WORK
-            and state.get("round") == round_num + 1
-        ):
-            last_decision = "changes_required"
-            if (
-                isinstance(fix_list, dict)
-                and fix_list.get("task_id") == task_id
-                and fix_list.get("round") == round_num + 1
-            ):
-                blocking = fix_list.get("fixes", [])
-                print(f"  Blocking issues: {len(blocking)}")
-                for issue in blocking:
-                    print(
-                        f"    - [{issue.get('severity','?')}] {issue.get('file','')}: "
-                        f"{issue.get('reason','')}"
-                    )
-            else:
-                _log(
-                    "State indicates changes_required, but fix_list.json is missing/stale; "
-                    "continuing based on state.json contract."
-                )
-            if isinstance(review, dict):
-                decision = review.get("decision")
-                if decision not in (None, "changes_required"):
-                    _log(
-                        f"Ignoring stale review_report decision={decision!r}; "
-                        "state.json is authoritative."
-                    )
-            continue
-
-        _fail_with_state(
-            state,
-            outcome="invalid_state_transition",
-            message=(
-                "single-round subprocess exited 0 but did not produce a valid state transition: "
-                f"state={state.get('state')!r} outcome={state.get('outcome')!r} round={state.get('round')!r}"
-            ),
-            exit_code=3,
-        )
-        return
+    if interrupted:
+        state = _load_state()
+        state["state"] = STATE_DONE
+        state["outcome"] = "interrupted"
+        state["error"] = "User interrupted (SIGINT)"
+        state["failed_at"] = _ts()
+        _save_state(state)
+        _log(f"Run interrupted by user; state saved as outcome=interrupted")
+        print("\n  Interrupted. State saved — re-run with --resume to continue.")
+        sys.exit(130)
 
     state = _load_state()
     state["state"] = STATE_DONE
@@ -2311,7 +2496,10 @@ def cmd_run(
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(5)
     try:
-        _enforce_clean_worktree_or_exit(allow_dirty=allow_dirty)
+        # Single-round subprocesses are spawned by the parent loop which already
+        # validated the worktree — skip redundant check to avoid duplicate warnings.
+        if not single_round:
+            _enforce_clean_worktree_or_exit(allow_dirty=allow_dirty)
 
         if resume and single_round:
             print("Error: --resume cannot be combined with --single-round", file=sys.stderr)
