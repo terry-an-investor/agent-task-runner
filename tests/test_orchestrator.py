@@ -12,6 +12,10 @@ import pytest
 from loop_kit import orchestrator
 
 
+def test_hello_returns_greeting() -> None:
+    assert orchestrator.hello() == "hello from loop-kit"
+
+
 class _FakeStdin:
     def __init__(self) -> None:
         self.value = ""

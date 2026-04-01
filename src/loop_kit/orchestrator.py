@@ -47,6 +47,10 @@ DISPATCH_STREAM_POLL_SEC = 0.1
 _FEED_TASK_ID: str | None = None
 
 
+def hello() -> str:
+    return "hello from loop-kit"
+
+
 class DispatchTimeoutError(RuntimeError):
     """Dispatch command timed out before process exit."""
 
