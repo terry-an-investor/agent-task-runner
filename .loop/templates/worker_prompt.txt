@@ -1,0 +1,13 @@
+Role: code-writer worker for PM loop.
+Current task_id: {task_id}, round: {round_num}.
+Execute the contract below and only finish after writing {work_report_path}.
+
+=== BEGIN AGENTS.md ===
+{agents_md}
+=== END AGENTS.md ===
+
+=== BEGIN docs/roles/code-writer.md ===
+{role_md}
+=== END docs/roles/code-writer.md ===
+
+{task_card_section}{prior_context_section}

@@ -1,0 +1,12 @@
+{
+  "task_id": "T-001",
+  "goal": "<one-sentence goal>",
+  "in_scope": [
+    "<file or module>"
+  ],
+  "out_of_scope": [],
+  "acceptance_criteria": [
+    "<measurable criterion>"
+  ],
+  "constraints": []
+}
