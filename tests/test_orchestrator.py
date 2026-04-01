@@ -210,51 +210,14 @@ def test_register_backend_allows_custom_backend_in_run_cli(monkeypatch) -> None:
     captured: dict[str, str] = {}
 
     def fake_cmd_run(
-        task_path: str,
-        max_rounds: int,
-        timeout: int,
-        require_heartbeat: bool,
-        heartbeat_ttl: int,
-        auto_dispatch: bool,
-        dispatch_backend: str,
-        worker_backend: str,
-        reviewer_backend: str,
-        dispatch_timeout: int,
-        artifact_timeout: int,
-        par_bin: str,
-        par_worker_target: str,
-        par_reviewer_target: str,
+        config: orchestrator.RunConfig,
         single_round: bool,
         round_num: int | None,
-        allow_dirty: bool = False,
         resume: bool = False,
-        verbose: bool = False,
-        dispatch_retries: int = orchestrator.DEFAULT_DISPATCH_RETRIES,
-        dispatch_retry_base_sec: int = orchestrator.DEFAULT_DISPATCH_RETRY_BASE_SEC,
     ) -> None:
-        _ = (
-            task_path,
-            max_rounds,
-            timeout,
-            require_heartbeat,
-            heartbeat_ttl,
-            auto_dispatch,
-            dispatch_backend,
-            dispatch_timeout,
-            artifact_timeout,
-            par_bin,
-            par_worker_target,
-            par_reviewer_target,
-            single_round,
-            round_num,
-            allow_dirty,
-            resume,
-            verbose,
-            dispatch_retries,
-            dispatch_retry_base_sec,
-        )
-        captured["worker_backend"] = worker_backend
-        captured["reviewer_backend"] = reviewer_backend
+        _ = (single_round, round_num, resume)
+        captured["worker_backend"] = config.worker_backend
+        captured["reviewer_backend"] = config.reviewer_backend
 
     monkeypatch.setattr(orchestrator, "cmd_run", fake_cmd_run)
     monkeypatch.setattr(
@@ -882,52 +845,16 @@ def test_main_run_parses_artifact_timeout(monkeypatch) -> None:
     captured: dict[str, int | bool | None] = {}
 
     def fake_cmd_run(
-        task_path: str,
-        max_rounds: int,
-        timeout: int,
-        require_heartbeat: bool,
-        heartbeat_ttl: int,
-        auto_dispatch: bool,
-        dispatch_backend: str,
-        worker_backend: str,
-        reviewer_backend: str,
-        dispatch_timeout: int,
-        artifact_timeout: int,
-        par_bin: str,
-        par_worker_target: str,
-        par_reviewer_target: str,
+        config: orchestrator.RunConfig,
         single_round: bool,
         round_num: int | None,
-        allow_dirty: bool = False,
         resume: bool = False,
-        verbose: bool = False,
-        dispatch_retries: int = orchestrator.DEFAULT_DISPATCH_RETRIES,
-        dispatch_retry_base_sec: int = orchestrator.DEFAULT_DISPATCH_RETRY_BASE_SEC,
     ) -> None:
-        _ = (
-            task_path,
-            max_rounds,
-            timeout,
-            require_heartbeat,
-            heartbeat_ttl,
-            auto_dispatch,
-            dispatch_backend,
-            worker_backend,
-            reviewer_backend,
-            dispatch_timeout,
-            par_bin,
-            par_worker_target,
-            par_reviewer_target,
-            allow_dirty,
-            verbose,
-            dispatch_retries,
-            dispatch_retry_base_sec,
-        )
-        captured["artifact_timeout"] = artifact_timeout
+        captured["artifact_timeout"] = config.artifact_timeout
         captured["single_round"] = single_round
         captured["round_num"] = round_num
         captured["resume"] = resume
-        captured["verbose"] = verbose
+        captured["verbose"] = config.verbose
 
     monkeypatch.setattr(orchestrator, "cmd_run", fake_cmd_run)
     monkeypatch.setattr(sys, "argv", [
@@ -954,51 +881,14 @@ def test_main_run_parses_dispatch_retry_flags(monkeypatch) -> None:
     captured: dict[str, int] = {}
 
     def fake_cmd_run(
-        task_path: str,
-        max_rounds: int,
-        timeout: int,
-        require_heartbeat: bool,
-        heartbeat_ttl: int,
-        auto_dispatch: bool,
-        dispatch_backend: str,
-        worker_backend: str,
-        reviewer_backend: str,
-        dispatch_timeout: int,
-        artifact_timeout: int,
-        par_bin: str,
-        par_worker_target: str,
-        par_reviewer_target: str,
+        config: orchestrator.RunConfig,
         single_round: bool,
         round_num: int | None,
-        allow_dirty: bool = False,
         resume: bool = False,
-        verbose: bool = False,
-        dispatch_retries: int = orchestrator.DEFAULT_DISPATCH_RETRIES,
-        dispatch_retry_base_sec: int = orchestrator.DEFAULT_DISPATCH_RETRY_BASE_SEC,
     ) -> None:
-        _ = (
-            task_path,
-            max_rounds,
-            timeout,
-            require_heartbeat,
-            heartbeat_ttl,
-            auto_dispatch,
-            dispatch_backend,
-            worker_backend,
-            reviewer_backend,
-            dispatch_timeout,
-            artifact_timeout,
-            par_bin,
-            par_worker_target,
-            par_reviewer_target,
-            single_round,
-            round_num,
-            allow_dirty,
-            resume,
-            verbose,
-        )
-        captured["dispatch_retries"] = dispatch_retries
-        captured["dispatch_retry_base_sec"] = dispatch_retry_base_sec
+        _ = (single_round, round_num, resume)
+        captured["dispatch_retries"] = config.dispatch_retries
+        captured["dispatch_retry_base_sec"] = config.dispatch_retry_base_sec
 
     monkeypatch.setattr(orchestrator, "cmd_run", fake_cmd_run)
     monkeypatch.setattr(
@@ -1055,6 +945,10 @@ def _configure_loop_paths(monkeypatch, tmp_path: Path) -> None:
         orchestrator.DEFAULT_REVIEWER_PROMPT_TEMPLATE,
         encoding="utf-8",
     )
+
+
+def _run_config(task_path: str, **overrides: object) -> orchestrator.RunConfig:
+    return orchestrator.RunConfig(task_path=task_path, **overrides)
 
 
 def test_archive_bus_file_copies_to_round_path(tmp_path: Path, monkeypatch) -> None:
@@ -1169,23 +1063,9 @@ def test_round2_start_archives_round1_bus_files(tmp_path: Path, monkeypatch) -> 
     monkeypatch.setattr(orchestrator, "_log_oneline", lambda base, head: f"log {base}->{head}")
 
     orchestrator.cmd_run(
-        str(task_path),
-        3,
-        0,
-        False,
-        orchestrator.DEFAULT_HEARTBEAT_TTL_SEC,
-        False,
-        "native",
-        "codex",
-        "codex",
-        orchestrator.DEFAULT_DISPATCH_TIMEOUT_SEC,
-        orchestrator.DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC,
-        "par",
-        "worker",
-        "reviewer",
-        True,
-        2,
-        True,
+        _run_config(str(task_path), allow_dirty=True),
+        single_round=True,
+        round_num=2,
     )
 
     archive_dir = orchestrator.LOOP_DIR / "archive" / "T-604"
@@ -1245,23 +1125,9 @@ def test_single_round_archives_state_before_overwrite(tmp_path: Path, monkeypatc
     monkeypatch.setattr(orchestrator, "_log_oneline", lambda base, head: f"log {base}->{head}")
 
     orchestrator.cmd_run(
-        str(task_path),
-        3,
-        0,
-        False,
-        orchestrator.DEFAULT_HEARTBEAT_TTL_SEC,
-        False,
-        "native",
-        "codex",
-        "codex",
-        orchestrator.DEFAULT_DISPATCH_TIMEOUT_SEC,
-        orchestrator.DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC,
-        "par",
-        "worker",
-        "reviewer",
-        True,
-        1,
-        True,
+        _run_config(str(task_path), allow_dirty=True),
+        single_round=True,
+        round_num=1,
     )
 
     archived_state = json.loads(
@@ -1273,25 +1139,17 @@ def test_single_round_archives_state_before_overwrite(tmp_path: Path, monkeypatc
 def test_cmd_run_exits_4_on_dirty_worktree(monkeypatch, capsys) -> None:
     monkeypatch.setattr(orchestrator, "_dirty_tracked_paths", lambda: ["tools/orchestrator.py"])
 
+    class _NoopLock:
+        def release(self) -> None:
+            return None
+
+    monkeypatch.setattr(orchestrator, "_acquire_run_lock", lambda: _NoopLock())
+
     with pytest.raises(SystemExit) as exc:
         orchestrator.cmd_run(
-            ".loop/task_card.json",
-            3,
-            0,
-            False,
-            orchestrator.DEFAULT_HEARTBEAT_TTL_SEC,
-            False,
-            "native",
-            "codex",
-            "codex",
-            orchestrator.DEFAULT_DISPATCH_TIMEOUT_SEC,
-            orchestrator.DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC,
-            "par",
-            "worker",
-            "reviewer",
-            False,
-            None,
-            False,
+            _run_config(".loop/task_card.json"),
+            single_round=False,
+            round_num=None,
         )
 
     assert exc.value.code == 4
@@ -1311,23 +1169,9 @@ def test_cmd_run_allow_dirty_bypasses_guard(monkeypatch) -> None:
     monkeypatch.setattr(orchestrator, "_run_single_round", fake_single_round)
 
     orchestrator.cmd_run(
-        ".loop/task_card.json",
-        3,
-        0,
-        False,
-        orchestrator.DEFAULT_HEARTBEAT_TTL_SEC,
-        False,
-        "native",
-        "codex",
-        "codex",
-        orchestrator.DEFAULT_DISPATCH_TIMEOUT_SEC,
-        orchestrator.DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC,
-        "par",
-        "worker",
-        "reviewer",
-        True,
-        1,
-        True,
+        _run_config(".loop/task_card.json", allow_dirty=True),
+        single_round=True,
+        round_num=1,
     )
 
     assert called["single_round_called"] is True
@@ -1394,22 +1238,9 @@ def test_single_round_processes_exactly_one_round_then_exits(tmp_path: Path, mon
     monkeypatch.setattr(orchestrator, "_log_oneline", lambda base, head: f"log {base}->{head}")
 
     orchestrator.cmd_run(
-        str(task_path),
-        3,
-        0,
-        False,
-        orchestrator.DEFAULT_HEARTBEAT_TTL_SEC,
-        False,
-        "native",
-        "codex",
-        "codex",
-        orchestrator.DEFAULT_DISPATCH_TIMEOUT_SEC,
-        orchestrator.DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC,
-        "par",
-        "worker",
-        "reviewer",
-        True,
-        1,
+        _run_config(str(task_path)),
+        single_round=True,
+        round_num=1,
     )
 
     assert wait_calls == [orchestrator.WORK_REPORT, orchestrator.REVIEW_REPORT]
@@ -1457,23 +1288,9 @@ def test_single_round_invalid_work_report_sets_invalid_outcome(tmp_path: Path, m
 
     with pytest.raises(SystemExit) as exc:
         orchestrator.cmd_run(
-            str(task_path),
-            3,
-            0,
-            False,
-            orchestrator.DEFAULT_HEARTBEAT_TTL_SEC,
-            False,
-            "native",
-            "codex",
-            "codex",
-            orchestrator.DEFAULT_DISPATCH_TIMEOUT_SEC,
-            orchestrator.DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC,
-            "par",
-            "worker",
-            "reviewer",
-            True,
-            1,
-            True,
+            _run_config(str(task_path), allow_dirty=True),
+            single_round=True,
+            round_num=1,
         )
 
     assert exc.value.code == 3
@@ -1535,22 +1352,9 @@ def test_single_round_approved_summary_includes_round_details(tmp_path: Path, mo
     monkeypatch.setattr(orchestrator, "_log_oneline", lambda base, head: f"log {base}->{head}")
 
     orchestrator.cmd_run(
-        str(task_path),
-        3,
-        0,
-        False,
-        orchestrator.DEFAULT_HEARTBEAT_TTL_SEC,
-        False,
-        "native",
-        "codex",
-        "codex",
-        orchestrator.DEFAULT_DISPATCH_TIMEOUT_SEC,
-        orchestrator.DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC,
-        "par",
-        "worker",
-        "reviewer",
-        True,
-        1,
+        _run_config(str(task_path)),
+        single_round=True,
+        round_num=1,
     )
 
     summary = json.loads((orchestrator.LOOP_DIR / "summary.json").read_text(encoding="utf-8"))
@@ -1605,22 +1409,23 @@ def test_outer_loop_spawns_single_round_subprocess(tmp_path: Path, monkeypatch) 
     monkeypatch.setattr(orchestrator.subprocess, "Popen", fake_subprocess_popen)
 
     orchestrator.cmd_run(
-        str(task_path),
-        3,
-        30,
-        True,
-        40,
-        True,
-        "native",
-        "codex",
-        "claude",
-        120,
-        55,
-        "par-bin",
-        "worker-target",
-        "reviewer-target",
-        False,
-        None,
+        _run_config(
+            str(task_path),
+            timeout=30,
+            require_heartbeat=True,
+            heartbeat_ttl=40,
+            auto_dispatch=True,
+            dispatch_backend="native",
+            worker_backend="codex",
+            reviewer_backend="claude",
+            dispatch_timeout=120,
+            artifact_timeout=55,
+            par_bin="par-bin",
+            par_worker_target="worker-target",
+            par_reviewer_target="reviewer-target",
+        ),
+        single_round=False,
+        round_num=None,
     )
 
     assert len(calls) == 1
@@ -1708,22 +1513,9 @@ def test_outer_loop_streams_single_round_subprocess_stdout_in_real_time(
     monkeypatch.setattr(orchestrator.subprocess, "Popen", fake_subprocess_popen)
 
     orchestrator.cmd_run(
-        str(task_path),
-        3,
-        0,
-        False,
-        orchestrator.DEFAULT_HEARTBEAT_TTL_SEC,
-        False,
-        "native",
-        "codex",
-        "codex",
-        orchestrator.DEFAULT_DISPATCH_TIMEOUT_SEC,
-        orchestrator.DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC,
-        "par",
-        "worker",
-        "reviewer",
-        False,
-        None,
+        _run_config(str(task_path)),
+        single_round=False,
+        round_num=None,
     )
 
     out = capsys.readouterr().out
@@ -1769,22 +1561,9 @@ def test_outer_loop_uses_state_as_contract(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(orchestrator.subprocess, "Popen", fake_subprocess_popen)
 
     orchestrator.cmd_run(
-        str(task_path),
-        3,
-        0,
-        False,
-        orchestrator.DEFAULT_HEARTBEAT_TTL_SEC,
-        False,
-        "native",
-        "codex",
-        "codex",
-        orchestrator.DEFAULT_DISPATCH_TIMEOUT_SEC,
-        orchestrator.DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC,
-        "par",
-        "worker",
-        "reviewer",
-        False,
-        None,
+        _run_config(str(task_path)),
+        single_round=False,
+        round_num=None,
     )
 
     assert len(calls) == 1
@@ -1829,22 +1608,9 @@ def test_outer_loop_continues_from_state_without_fresh_review_report(
     monkeypatch.setattr(orchestrator.subprocess, "Popen", fake_subprocess_popen)
 
     orchestrator.cmd_run(
-        str(task_path),
-        3,
-        0,
-        False,
-        orchestrator.DEFAULT_HEARTBEAT_TTL_SEC,
-        False,
-        "native",
-        "codex",
-        "codex",
-        orchestrator.DEFAULT_DISPATCH_TIMEOUT_SEC,
-        orchestrator.DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC,
-        "par",
-        "worker",
-        "reviewer",
-        False,
-        None,
+        _run_config(str(task_path)),
+        single_round=False,
+        round_num=None,
     )
 
     assert len(calls) == 2
@@ -1881,24 +1647,10 @@ def test_cmd_run_resume_uses_existing_state_contract(tmp_path: Path, monkeypatch
     monkeypatch.setattr(orchestrator, "_run_multi_round_via_subprocess", fake_outer)
 
     orchestrator.cmd_run(
-        str(task_path),
-        3,
-        0,
-        False,
-        orchestrator.DEFAULT_HEARTBEAT_TTL_SEC,
-        False,
-        "native",
-        "codex",
-        "codex",
-        orchestrator.DEFAULT_DISPATCH_TIMEOUT_SEC,
-        orchestrator.DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC,
-        "par",
-        "worker",
-        "reviewer",
-        False,
-        None,
-        False,
-        True,
+        _run_config(str(task_path)),
+        single_round=False,
+        round_num=None,
+        resume=True,
     )
 
     resume_state = captured.get("resume_from_state")
@@ -1928,10 +1680,10 @@ def test_cmd_run_resume_done_approved_exits_cleanly(
     monkeypatch.setattr(orchestrator, "_run_multi_round_via_subprocess", lambda **kwargs: called.update({"outer": True}))
 
     orchestrator.cmd_run(
-        str(task_path), 3, 0, False, orchestrator.DEFAULT_HEARTBEAT_TTL_SEC,
-        False, "native", "codex", "codex",
-        orchestrator.DEFAULT_DISPATCH_TIMEOUT_SEC, orchestrator.DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC,
-        "par", "worker", "reviewer", False, None, False, True,
+        _run_config(str(task_path)),
+        single_round=False,
+        round_num=None,
+        resume=True,
     )
 
     assert called["outer"] is False
@@ -1963,10 +1715,10 @@ def test_cmd_run_resume_failed_state_prints_error_and_exits_3(
 
     with pytest.raises(SystemExit) as exc:
         orchestrator.cmd_run(
-            str(task_path), 3, 0, False, orchestrator.DEFAULT_HEARTBEAT_TTL_SEC,
-            False, "native", "codex", "codex",
-            orchestrator.DEFAULT_DISPATCH_TIMEOUT_SEC, orchestrator.DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC,
-            "par", "worker", "reviewer", False, None, False, True,
+            _run_config(str(task_path)),
+            single_round=False,
+            round_num=None,
+            resume=True,
         )
 
     assert exc.value.code == 3
@@ -1985,10 +1737,9 @@ def test_cmd_run_exits_5_when_run_lock_is_unavailable(monkeypatch, capsys) -> No
 
     with pytest.raises(SystemExit) as exc:
         orchestrator.cmd_run(
-            ".loop/task_card.json", 3, 0, False, orchestrator.DEFAULT_HEARTBEAT_TTL_SEC,
-            False, "native", "codex", "codex",
-            orchestrator.DEFAULT_DISPATCH_TIMEOUT_SEC, orchestrator.DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC,
-            "par", "worker", "reviewer", False, None, False, False,
+            _run_config(".loop/task_card.json"),
+            single_round=False,
+            round_num=None,
         )
 
     assert exc.value.code == 5

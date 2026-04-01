@@ -28,6 +28,7 @@ import threading
 import types
 import time
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
@@ -72,6 +73,28 @@ WORK_REPORT = _path("work_report.json")
 REVIEW_REQ = _path("review_request.json")
 REVIEW_REPORT = _path("review_report.json")
 LOCK_FILE = _path("lock")
+
+
+@dataclass(slots=True)
+class RunConfig:
+    task_path: str = field(default_factory=lambda: str(TASK_CARD))
+    max_rounds: int = DEFAULT_MAX_ROUNDS
+    timeout: int = 0
+    require_heartbeat: bool = False
+    heartbeat_ttl: int = DEFAULT_HEARTBEAT_TTL_SEC
+    auto_dispatch: bool = False
+    dispatch_backend: str = DEFAULT_DISPATCH_BACKEND
+    worker_backend: str = "codex"
+    reviewer_backend: str = "codex"
+    dispatch_timeout: int = DEFAULT_DISPATCH_TIMEOUT_SEC
+    dispatch_retries: int = DEFAULT_DISPATCH_RETRIES
+    dispatch_retry_base_sec: int = DEFAULT_DISPATCH_RETRY_BASE_SEC
+    artifact_timeout: int = DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC
+    par_bin: str = "par"
+    par_worker_target: str = "worker"
+    par_reviewer_target: str = "reviewer"
+    allow_dirty: bool = False
+    verbose: bool = False
 
 
 def _resolve_loop_dir(loop_dir: str | Path) -> Path:
@@ -1748,23 +1771,8 @@ def _sync_task_card_to_bus(task_path: str, round_num: int = 1) -> tuple[dict, st
 
 def _single_round_subprocess_cmd(
     *,
+    config: RunConfig,
     round_num: int,
-    timeout: int,
-    require_heartbeat: bool,
-    heartbeat_ttl: int,
-    auto_dispatch: bool,
-    dispatch_backend: str,
-    worker_backend: str,
-    reviewer_backend: str,
-    dispatch_timeout: int,
-    dispatch_retries: int,
-    dispatch_retry_base_sec: int,
-    artifact_timeout: int,
-    par_bin: str,
-    par_worker_target: str,
-    par_reviewer_target: str,
-    allow_dirty: bool,
-    verbose: bool,
 ) -> list[str]:
     cmd = [
         sys.executable,
@@ -1779,62 +1787,49 @@ def _single_round_subprocess_cmd(
         "--task",
         str(TASK_CARD),
         "--timeout",
-        str(timeout),
+        str(config.timeout),
         "--heartbeat-ttl",
-        str(heartbeat_ttl),
+        str(config.heartbeat_ttl),
         "--dispatch-backend",
-        dispatch_backend,
+        config.dispatch_backend,
         "--worker-backend",
-        worker_backend,
+        config.worker_backend,
         "--reviewer-backend",
-        reviewer_backend,
+        config.reviewer_backend,
         "--dispatch-timeout",
-        str(dispatch_timeout),
+        str(config.dispatch_timeout),
         "--dispatch-retries",
-        str(dispatch_retries),
+        str(config.dispatch_retries),
         "--dispatch-retry-base-sec",
-        str(dispatch_retry_base_sec),
+        str(config.dispatch_retry_base_sec),
         "--artifact-timeout",
-        str(artifact_timeout),
+        str(config.artifact_timeout),
         "--par-bin",
-        par_bin,
+        config.par_bin,
         "--par-worker-target",
-        par_worker_target,
+        config.par_worker_target,
         "--par-reviewer-target",
-        par_reviewer_target,
+        config.par_reviewer_target,
     ]
-    if require_heartbeat:
+    if config.require_heartbeat:
         cmd.append("--require-heartbeat")
-    if auto_dispatch:
+    if config.auto_dispatch:
         cmd.append("--auto-dispatch")
-    if allow_dirty:
+    if config.allow_dirty:
         cmd.append("--allow-dirty")
-    if verbose:
+    if config.verbose:
         cmd.append("--verbose")
     return cmd
 
 
 def _run_single_round(
     *,
-    task_path: str,
+    config: RunConfig,
     round_num: int,
-    timeout: int,
-    require_heartbeat: bool,
-    heartbeat_ttl: int,
-    auto_dispatch: bool,
-    dispatch_backend: str,
-    worker_backend: str,
-    reviewer_backend: str,
-    dispatch_timeout: int,
-    dispatch_retries: int,
-    dispatch_retry_base_sec: int,
-    artifact_timeout: int,
-    par_bin: str,
-    par_worker_target: str,
-    par_reviewer_target: str,
-    verbose: bool,
+    single_round: bool,
 ) -> None:
-    task_card, task_id_from_card = _sync_task_card_to_bus(task_path, round_num=round_num)
+    _ = single_round
+    task_card, task_id_from_card = _sync_task_card_to_bus(config.task_path, round_num=round_num)
 
     state = _load_state()
     state_task_id = state.get("task_id")
@@ -1922,39 +1917,39 @@ def _run_single_round(
         print("  Send fix_list.json to Worker.")
 
     work: dict | None = None
-    if auto_dispatch:
+    if config.auto_dispatch:
         try:
-            if dispatch_backend == "par":
+            if config.dispatch_backend == "par":
                 work = _dispatch_with_artifact_fallback(
                     role="worker",
                     dispatch_call=lambda: _run_par_dispatch(
                         role="worker",
-                        target=par_worker_target,
+                        target=config.par_worker_target,
                         prompt=worker_prompt,
-                        timeout_sec=dispatch_timeout,
-                        par_bin=par_bin,
+                        timeout_sec=config.dispatch_timeout,
+                        par_bin=config.par_bin,
                     ),
                     artifact_path=WORK_REPORT,
                     task_id=task_id,
                     round_num=round_num,
-                    timeout_sec=artifact_timeout,
+                    timeout_sec=config.artifact_timeout,
                 )
             else:
                 work = _dispatch_with_artifact_fallback(
                     role="worker",
                     dispatch_call=lambda: _run_auto_dispatch(
                         role="worker",
-                        backend=worker_backend,
+                        backend=config.worker_backend,
                         prompt=worker_prompt,
-                        timeout_sec=dispatch_timeout,
-                        verbose=verbose,
-                        dispatch_retries=dispatch_retries,
-                        dispatch_retry_base_sec=dispatch_retry_base_sec,
+                        timeout_sec=config.dispatch_timeout,
+                        verbose=config.verbose,
+                        dispatch_retries=config.dispatch_retries,
+                        dispatch_retry_base_sec=config.dispatch_retry_base_sec,
                     ),
                     artifact_path=WORK_REPORT,
                     task_id=task_id,
                     round_num=round_num,
-                    timeout_sec=artifact_timeout,
+                    timeout_sec=config.artifact_timeout,
                 )
         except RuntimeError as e:
             _fail_single_round(
@@ -1968,15 +1963,15 @@ def _run_single_round(
         work = _wait_for_file(
             WORK_REPORT,
             "Worker result",
-            timeout_sec=timeout,
+            timeout_sec=config.timeout,
             expected_task_id=task_id,
             expected_round=round_num,
-            expected_role="worker" if require_heartbeat else None,
-            heartbeat_ttl_sec=heartbeat_ttl,
-            show_manual_hint=not auto_dispatch,
+            expected_role="worker" if config.require_heartbeat else None,
+            heartbeat_ttl_sec=config.heartbeat_ttl,
+            show_manual_hint=not config.auto_dispatch,
         )
     if work is None:
-        if require_heartbeat:
+        if config.require_heartbeat:
             _log("Worker unavailable or timed out. Aborting.")
             print("\n  Worker unavailable or timed out. Check .loop/runtime and logs.")
         else:
@@ -2057,39 +2052,39 @@ def _run_single_round(
     print(f"  Review request: {REVIEW_REQ}")
 
     review: dict | None = None
-    if auto_dispatch:
+    if config.auto_dispatch:
         try:
-            if dispatch_backend == "par":
+            if config.dispatch_backend == "par":
                 review = _dispatch_with_artifact_fallback(
                     role="reviewer",
                     dispatch_call=lambda: _run_par_dispatch(
                         role="reviewer",
-                        target=par_reviewer_target,
+                        target=config.par_reviewer_target,
                         prompt=_reviewer_prompt(task_id, round_num),
-                        timeout_sec=dispatch_timeout,
-                        par_bin=par_bin,
+                        timeout_sec=config.dispatch_timeout,
+                        par_bin=config.par_bin,
                     ),
                     artifact_path=REVIEW_REPORT,
                     task_id=task_id,
                     round_num=round_num,
-                    timeout_sec=artifact_timeout,
+                    timeout_sec=config.artifact_timeout,
                 )
             else:
                 review = _dispatch_with_artifact_fallback(
                     role="reviewer",
                     dispatch_call=lambda: _run_auto_dispatch(
                         role="reviewer",
-                        backend=reviewer_backend,
+                        backend=config.reviewer_backend,
                         prompt=_reviewer_prompt(task_id, round_num),
-                        timeout_sec=dispatch_timeout,
-                        verbose=verbose,
-                        dispatch_retries=dispatch_retries,
-                        dispatch_retry_base_sec=dispatch_retry_base_sec,
+                        timeout_sec=config.dispatch_timeout,
+                        verbose=config.verbose,
+                        dispatch_retries=config.dispatch_retries,
+                        dispatch_retry_base_sec=config.dispatch_retry_base_sec,
                     ),
                     artifact_path=REVIEW_REPORT,
                     task_id=task_id,
                     round_num=round_num,
-                    timeout_sec=artifact_timeout,
+                    timeout_sec=config.artifact_timeout,
                 )
         except RuntimeError as e:
             _fail_single_round(
@@ -2103,15 +2098,15 @@ def _run_single_round(
         review = _wait_for_file(
             REVIEW_REPORT,
             "Reviewer result",
-            timeout_sec=timeout,
+            timeout_sec=config.timeout,
             expected_task_id=task_id,
             expected_round=round_num,
-            expected_role="reviewer" if require_heartbeat else None,
-            heartbeat_ttl_sec=heartbeat_ttl,
-            show_manual_hint=not auto_dispatch,
+            expected_role="reviewer" if config.require_heartbeat else None,
+            heartbeat_ttl_sec=config.heartbeat_ttl,
+            show_manual_hint=not config.auto_dispatch,
         )
     if review is None:
-        if require_heartbeat:
+        if config.require_heartbeat:
             _log("Reviewer unavailable or timed out. Aborting.")
         else:
             _log("Reviewer timed out. Aborting.")
@@ -2204,35 +2199,18 @@ def _run_single_round(
 
 def _run_multi_round_via_subprocess(
     *,
-    task_path: str,
-    max_rounds: int,
-    timeout: int,
-    require_heartbeat: bool,
-    heartbeat_ttl: int,
-    auto_dispatch: bool,
-    dispatch_backend: str,
-    worker_backend: str,
-    reviewer_backend: str,
-    dispatch_timeout: int,
-    dispatch_retries: int,
-    dispatch_retry_base_sec: int,
-    artifact_timeout: int,
-    par_bin: str,
-    par_worker_target: str,
-    par_reviewer_target: str,
-    allow_dirty: bool,
-    verbose: bool,
+    config: RunConfig,
     worktree_checked: bool = False,
     resume_from_state: dict | None = None,
 ) -> None:
     if not worktree_checked:
-        _enforce_clean_worktree_or_exit(allow_dirty=allow_dirty)
+        _enforce_clean_worktree_or_exit(allow_dirty=config.allow_dirty)
 
     start_round = 1
     task_id = ""
     base_sha = ""
     if resume_from_state is None:
-        task_card, task_id = _sync_task_card_to_bus(task_path, round_num=1)
+        task_card, task_id = _sync_task_card_to_bus(config.task_path, round_num=1)
         _set_feed_task_id(task_id)
 
         _log(f"Loaded task card: {task_id}")
@@ -2328,33 +2306,18 @@ def _run_multi_round_via_subprocess(
     old_sigint = signal.signal(signal.SIGINT, _outer_sigint_handler)
 
     try:
-        for round_num in range(start_round, max_rounds + 1):
+        for round_num in range(start_round, config.max_rounds + 1):
             if interrupted:
                 break
 
             print(f"\n{'='*60}")
-            print(f"  ROUND {round_num}/{max_rounds}  —  Single-Round Subprocess")
+            print(f"  ROUND {round_num}/{config.max_rounds}  —  Single-Round Subprocess")
             print(f"{'='*60}")
             _archive_bus_file(STATE_FILE, task_id, round_num, "state")
 
             cmd = _single_round_subprocess_cmd(
+                config=config,
                 round_num=round_num,
-                timeout=timeout,
-                require_heartbeat=require_heartbeat,
-                heartbeat_ttl=heartbeat_ttl,
-                auto_dispatch=auto_dispatch,
-                dispatch_backend=dispatch_backend,
-                worker_backend=worker_backend,
-                reviewer_backend=reviewer_backend,
-                dispatch_timeout=dispatch_timeout,
-                dispatch_retries=dispatch_retries,
-                dispatch_retry_base_sec=dispatch_retry_base_sec,
-                artifact_timeout=artifact_timeout,
-                par_bin=par_bin,
-                par_worker_target=par_worker_target,
-                par_reviewer_target=par_reviewer_target,
-                allow_dirty=allow_dirty,
-                verbose=verbose,
             )
             _log(f"Launching single-round subprocess: {' '.join(cmd)}")
             proc = subprocess.Popen(
@@ -2474,34 +2437,17 @@ def _run_multi_round_via_subprocess(
     state["state"] = STATE_DONE
     state["outcome"] = "max_rounds_exhausted"
     _save_state(state)
-    print(f"\n  MAX ROUNDS ({max_rounds}) reached without approval.")
+    print(f"\n  MAX ROUNDS ({config.max_rounds}) reached without approval.")
     print(f"  Last review decision: {last_decision}")
     print("  PM should re-evaluate task scope or split the task.")
     sys.exit(1)
 
 
 def cmd_run(
-    task_path: str,
-    max_rounds: int,
-    timeout: int,
-    require_heartbeat: bool,
-    heartbeat_ttl: int,
-    auto_dispatch: bool,
-    dispatch_backend: str,
-    worker_backend: str,
-    reviewer_backend: str,
-    dispatch_timeout: int,
-    artifact_timeout: int,
-    par_bin: str,
-    par_worker_target: str,
-    par_reviewer_target: str,
+    config: RunConfig,
     single_round: bool,
     round_num: int | None,
-    allow_dirty: bool = False,
     resume: bool = False,
-    verbose: bool = False,
-    dispatch_retries: int = DEFAULT_DISPATCH_RETRIES,
-    dispatch_retry_base_sec: int = DEFAULT_DISPATCH_RETRY_BASE_SEC,
 ) -> None:
     lock: _LoopLock | None = None
     # Single-round subprocesses are spawned by the parent loop which already
@@ -2516,7 +2462,7 @@ def cmd_run(
         # Single-round subprocesses are spawned by the parent loop which already
         # validated the worktree — skip redundant check to avoid duplicate warnings.
         if not single_round:
-            _enforce_clean_worktree_or_exit(allow_dirty=allow_dirty)
+            _enforce_clean_worktree_or_exit(allow_dirty=config.allow_dirty)
 
         if resume and single_round:
             print("Error: --resume cannot be combined with --single-round", file=sys.stderr)
@@ -2527,23 +2473,9 @@ def cmd_run(
                 print("Error: --single-round requires --round N (N >= 1)", file=sys.stderr)
                 sys.exit(1)
             _run_single_round(
-                task_path=task_path,
+                config=config,
                 round_num=round_num,
-                timeout=timeout,
-                require_heartbeat=require_heartbeat,
-                heartbeat_ttl=heartbeat_ttl,
-                auto_dispatch=auto_dispatch,
-                dispatch_backend=dispatch_backend,
-                worker_backend=worker_backend,
-                reviewer_backend=reviewer_backend,
-                dispatch_timeout=dispatch_timeout,
-                dispatch_retries=dispatch_retries,
-                dispatch_retry_base_sec=dispatch_retry_base_sec,
-                artifact_timeout=artifact_timeout,
-                par_bin=par_bin,
-                par_worker_target=par_worker_target,
-                par_reviewer_target=par_reviewer_target,
-                verbose=verbose,
+                single_round=single_round,
             )
             return
 
@@ -2573,24 +2505,7 @@ def cmd_run(
                 sys.exit(3)
 
         _run_multi_round_via_subprocess(
-            task_path=task_path,
-            max_rounds=max_rounds,
-            timeout=timeout,
-            require_heartbeat=require_heartbeat,
-            heartbeat_ttl=heartbeat_ttl,
-            auto_dispatch=auto_dispatch,
-            dispatch_backend=dispatch_backend,
-            worker_backend=worker_backend,
-            reviewer_backend=reviewer_backend,
-            dispatch_timeout=dispatch_timeout,
-            dispatch_retries=dispatch_retries,
-            dispatch_retry_base_sec=dispatch_retry_base_sec,
-            artifact_timeout=artifact_timeout,
-            par_bin=par_bin,
-            par_worker_target=par_worker_target,
-            par_reviewer_target=par_reviewer_target,
-            allow_dirty=allow_dirty,
-            verbose=verbose,
+            config=config,
             worktree_checked=True,
             resume_from_state=resume_state,
         )
@@ -2699,15 +2614,32 @@ def main() -> None:
     elif args.cmd == "archive":
         cmd_archive(args.task_id, args.restore)
     elif args.cmd == "run":
-        task_path = args.task if args.task is not None else str(TASK_CARD)
-        cmd_run(task_path, args.max_rounds, args.timeout,
-                args.require_heartbeat, args.heartbeat_ttl,
-                args.auto_dispatch, args.dispatch_backend,
-                args.worker_backend, args.reviewer_backend,
-                args.dispatch_timeout, args.artifact_timeout, args.par_bin,
-                args.par_worker_target, args.par_reviewer_target,
-                args.single_round, args.round, args.allow_dirty, args.resume, args.verbose,
-                args.dispatch_retries, args.dispatch_retry_base_sec)
+        config = RunConfig(
+            task_path=args.task if args.task is not None else str(TASK_CARD),
+            max_rounds=args.max_rounds,
+            timeout=args.timeout,
+            require_heartbeat=args.require_heartbeat,
+            heartbeat_ttl=args.heartbeat_ttl,
+            auto_dispatch=args.auto_dispatch,
+            dispatch_backend=args.dispatch_backend,
+            worker_backend=args.worker_backend,
+            reviewer_backend=args.reviewer_backend,
+            dispatch_timeout=args.dispatch_timeout,
+            dispatch_retries=args.dispatch_retries,
+            dispatch_retry_base_sec=args.dispatch_retry_base_sec,
+            artifact_timeout=args.artifact_timeout,
+            par_bin=args.par_bin,
+            par_worker_target=args.par_worker_target,
+            par_reviewer_target=args.par_reviewer_target,
+            allow_dirty=args.allow_dirty,
+            verbose=args.verbose,
+        )
+        cmd_run(
+            config,
+            single_round=args.single_round,
+            round_num=args.round,
+            resume=args.resume,
+        )
     else:
         parser.print_help()
 
