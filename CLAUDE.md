@@ -68,6 +68,10 @@ When documents disagree: `src/loop_kit/orchestrator.py` > `AGENTS.md` > `CLAUDE.
 - For non-trivial tasks, act as the **PM/orchestrator**, not the worker. Create a task card and run `loop run --auto-dispatch` to delegate coding to the worker backend (codex/claude). Do not write the code yourself.
 - Always commit after completing a set of changes. Do not leave uncommitted work.
 
+## Known Gotchas
+
+- **`.loop/lock` stale file**: After a crash/interrupt, `.loop/lock` may persist. Delete it manually before re-running. The lock uses OS-level file locking so a dead process doesn't hold it, but the file itself remains.
+
 ## Commit Convention
 
 Write clear, descriptive commit messages. No emoji prefix required.
