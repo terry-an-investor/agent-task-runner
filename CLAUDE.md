@@ -62,6 +62,12 @@ uv run python -m loop_kit init             # smoke test
 
 When documents disagree: `src/loop_kit/orchestrator.py` > `AGENTS.md` > `CLAUDE.md` > `README.md`.
 
+## Workflow
+
+- For trivial tasks (typos, one-line fixes, obvious small changes), just do them directly — no task cards needed
+- For non-trivial tasks (multi-step changes, new features, bug investigations), use loop-kit itself to drive the work (self-bootstrapping)
+- Always commit after completing a set of changes. Do not leave uncommitted work.
+
 ## Commit Convention
 
 Write clear, descriptive commit messages. No emoji prefix required.
