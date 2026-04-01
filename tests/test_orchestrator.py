@@ -57,6 +57,7 @@ class _FakeProc:
         self._poll_ready_after = poll_ready_after
         self._poll_calls = 0
         self.kill_called = False
+        self.terminate_called = False
         self.wait_called = False
 
     def poll(self) -> int | None:
@@ -74,6 +75,13 @@ class _FakeProc:
         if callable(close):
             close()
         self.returncode = -9
+
+    def terminate(self) -> None:
+        self.terminate_called = True
+        close = getattr(self.stdin, "close", None)
+        if callable(close):
+            close()
+        self.returncode = -15
 
     def wait(self) -> int:
         self.wait_called = True
@@ -327,7 +335,7 @@ def test_run_auto_dispatch_timeout_kills_and_waits_process(monkeypatch) -> None:
     with pytest.raises(orchestrator.DispatchTimeoutError) as exc:
         orchestrator._run_auto_dispatch("worker", "codex", "ignored", 30)
 
-    assert proc.kill_called is True
+    assert proc.terminate_called is True
     assert proc.wait_called is True
     assert "try --dispatch-timeout 900" in str(exc.value)
 
@@ -356,7 +364,7 @@ def test_run_auto_dispatch_timeout_still_triggers_when_stdin_write_blocks(monkey
     with pytest.raises(orchestrator.DispatchTimeoutError):
         orchestrator._run_auto_dispatch("worker", "codex", "ignored", 30)
 
-    assert proc.kill_called is True
+    assert proc.terminate_called is True
     assert proc.wait_called is True
     assert isinstance(proc.stdin, _BlockingStdin)
     assert proc.stdin.closed is True
@@ -775,7 +783,7 @@ def test_worker_prompt_raises_when_template_missing(
 
     message = str(exc.value)
     assert "Missing required prompt template" in message
-    assert "Run loop init to create required files" in message
+    assert "Run 'loop init' to create it" in message
 
 
 def test_reviewer_prompt_includes_role_doc(monkeypatch) -> None:
@@ -805,7 +813,7 @@ def test_worker_prompt_raises_when_code_writer_role_doc_missing(
 
     message = str(exc.value)
     assert "Missing required code-writer role doc" in message
-    assert "Run loop init to create required files" in message
+    assert "Create this file and re-run" in message
 
 
 def test_worker_prompt_raises_when_agents_doc_missing(tmp_path: Path, monkeypatch) -> None:
@@ -817,7 +825,7 @@ def test_worker_prompt_raises_when_agents_doc_missing(tmp_path: Path, monkeypatc
 
     message = str(exc.value)
     assert "Missing required AGENTS.md" in message
-    assert "Run loop init to create required files" in message
+    assert "Create this file and re-run" in message
 
 
 def test_reviewer_prompt_raises_when_role_doc_missing(tmp_path: Path, monkeypatch) -> None:
@@ -829,7 +837,7 @@ def test_reviewer_prompt_raises_when_role_doc_missing(tmp_path: Path, monkeypatc
 
     message = str(exc.value)
     assert "Missing required reviewer role doc" in message
-    assert "Run loop init to create required files" in message
+    assert "Create this file and re-run" in message
 
 
 def test_log_writes_jsonl_feed_entry(tmp_path: Path, monkeypatch) -> None:
@@ -2563,6 +2571,7 @@ class TestCmdHealth:
 class TestCmdExtractDiff:
     def test_prints_diff(self, monkeypatch, capsys) -> None:
         monkeypatch.setattr(orchestrator, "_diff", lambda base, head: f"diff {base}..{head}")
+        monkeypatch.setattr(orchestrator, "_is_valid_ref", lambda ref: True)
         orchestrator.cmd_extract_diff("abc", "def")
         assert capsys.readouterr().out.strip() == "diff abc..def"
 
@@ -2599,5 +2608,157 @@ class TestIsGitRepoRoot:
         (tmp_path / ".git").mkdir()
         assert orchestrator._is_git_repo_root(tmp_path)
 
+    def test_true_when_git_is_file(self, tmp_path: Path) -> None:
+        # git worktrees and submodules use a .git file, not directory
+        (tmp_path / ".git").write_text("gitdir: /some/other/path\n", encoding="utf-8")
+        assert orchestrator._is_git_repo_root(tmp_path)
+
     def test_false_when_no_git(self, tmp_path: Path) -> None:
         assert not orchestrator._is_git_repo_root(tmp_path)
+
+
+class TestFailWithState:
+    def test_exits_with_given_code(self, monkeypatch, tmp_path) -> None:
+        monkeypatch.setattr(orchestrator, "STATE_FILE", tmp_path / "state.json")
+        state = {"state": "idle"}
+        with pytest.raises(SystemExit) as exc:
+            orchestrator._fail_with_state(state, outcome="test_fail", message="boom", exit_code=42)
+        assert exc.value.code == 42
+
+    def test_saves_state(self, monkeypatch, tmp_path) -> None:
+        state_file = tmp_path / "state.json"
+        monkeypatch.setattr(orchestrator, "STATE_FILE", state_file)
+        state = {"state": "idle", "round": 1}
+        with pytest.raises(SystemExit):
+            orchestrator._fail_with_state(state, outcome="test_fail", message="boom")
+        saved = json.loads(state_file.read_text(encoding="utf-8"))
+        assert saved["state"] == orchestrator.STATE_DONE
+        assert saved["outcome"] == "test_fail"
+        assert saved["error"] == "boom"
+        assert "failed_at" in saved
+
+
+class TestEnforceCleanWorktree:
+    def test_clean_tree_passes(self, monkeypatch) -> None:
+        monkeypatch.setattr(orchestrator, "_dirty_tracked_paths", lambda: [])
+        # Should not raise
+        orchestrator._enforce_clean_worktree_or_exit(allow_dirty=False)
+
+    def test_dirty_tree_exits_4(self, monkeypatch, capsys) -> None:
+        monkeypatch.setattr(orchestrator, "_dirty_tracked_paths", lambda: ["src/foo.py"])
+        with pytest.raises(SystemExit) as exc:
+            orchestrator._enforce_clean_worktree_or_exit(allow_dirty=False)
+        assert exc.value.code == 4
+        assert "dirty git working tree" in capsys.readouterr().err
+
+    def test_dirty_tree_with_allow_dirty_passes(self, monkeypatch, capsys) -> None:
+        monkeypatch.setattr(orchestrator, "_dirty_tracked_paths", lambda: ["src/foo.py"])
+        orchestrator._enforce_clean_worktree_or_exit(allow_dirty=True)
+        assert "Proceeding" in capsys.readouterr().err
+
+
+class TestDirtyTrackedPaths:
+    def test_excludes_untracked(self, monkeypatch) -> None:
+        monkeypatch.setattr(orchestrator, "_is_git_repo_root", lambda p: True)
+        monkeypatch.setattr(orchestrator, "_git", lambda *a: "?? newfile.py\n M modified.py\n")
+        result = orchestrator._dirty_tracked_paths()
+        assert result == ["modified.py"]
+
+    def test_excludes_loop_dir(self, monkeypatch) -> None:
+        monkeypatch.setattr(orchestrator, "_is_git_repo_root", lambda p: True)
+        monkeypatch.setattr(orchestrator, "_git", lambda *a: " M .loop/state.json\n M src/main.py\n")
+        result = orchestrator._dirty_tracked_paths()
+        assert result == ["src/main.py"]
+
+    def test_returns_empty_when_not_git_repo(self, monkeypatch) -> None:
+        monkeypatch.setattr(orchestrator, "_is_git_repo_root", lambda p: False)
+        result = orchestrator._dirty_tracked_paths()
+        assert result == []
+
+
+class TestAtomicWriteJson:
+    def test_writes_json(self, tmp_path) -> None:
+        target = tmp_path / "out.json"
+        orchestrator._atomic_write_json(target, {"key": "value"})
+        assert target.exists()
+        data = json.loads(target.read_text(encoding="utf-8"))
+        assert data == {"key": "value"}
+
+    def test_no_tmp_left_on_success(self, tmp_path) -> None:
+        target = tmp_path / "out.json"
+        orchestrator._atomic_write_json(target, {"a": 1})
+        assert not target.with_suffix(".tmp").exists()
+
+    def test_no_tmp_left_on_failure(self, tmp_path, monkeypatch) -> None:
+        target = tmp_path / "out.json"
+        # Pre-create the tmp file to verify it gets cleaned up
+        tmp = target.with_suffix(".tmp")
+        tmp.write_text("garbage", encoding="utf-8")
+        # Make write_text on the tmp path raise
+        original_write_text = orchestrator.Path.write_text
+
+        def _failing_write_text(self_path, *args, **kwargs):
+            if self_path.suffix == ".tmp":
+                raise OSError("simulated write failure")
+            return original_write_text(self_path, *args, **kwargs)
+
+        monkeypatch.setattr(orchestrator.Path, "write_text", _failing_write_text)
+        with pytest.raises(OSError, match="simulated"):
+            orchestrator._atomic_write_json(target, {"a": 1})
+        assert not tmp.exists()
+
+    def test_replaces_existing_file(self, tmp_path) -> None:
+        target = tmp_path / "out.json"
+        target.write_text('{"old": true}', encoding="utf-8")
+        orchestrator._atomic_write_json(target, {"new": True})
+        data = json.loads(target.read_text(encoding="utf-8"))
+        assert data == {"new": True}
+
+
+class TestCmdExtractDiffValidation:
+    def test_rejects_invalid_base(self, monkeypatch, capsys) -> None:
+        monkeypatch.setattr(orchestrator, "_is_valid_ref", lambda r: False)
+        with pytest.raises(SystemExit) as exc:
+            orchestrator.cmd_extract_diff("nonexistent", "HEAD")
+        assert exc.value.code == 1
+        assert "invalid git ref" in capsys.readouterr().err
+
+    def test_rejects_invalid_head(self, monkeypatch, capsys) -> None:
+        calls: list[str] = []
+        def fake_valid_ref(r):
+            calls.append(r)
+            return r == "HEAD"
+        monkeypatch.setattr(orchestrator, "_is_valid_ref", fake_valid_ref)
+        with pytest.raises(SystemExit) as exc:
+            orchestrator.cmd_extract_diff("HEAD", "nonexistent")
+        assert exc.value.code == 1
+
+    def test_passes_valid_refs(self, monkeypatch, capsys) -> None:
+        monkeypatch.setattr(orchestrator, "_is_valid_ref", lambda r: True)
+        monkeypatch.setattr(orchestrator, "_diff", lambda b, h: f"diff {b}..{h}")
+        orchestrator.cmd_extract_diff("HEAD~1", "HEAD")
+        assert "diff HEAD~1..HEAD" in capsys.readouterr().out
+
+
+class TestCmdArchiveRestoreTraversal:
+    def test_rejects_path_traversal(self, monkeypatch, capsys, tmp_path) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        archive_dir = tmp_path / ".loop" / "archive" / "T-001"
+        archive_dir.mkdir(parents=True)
+        (archive_dir / "r1_state.json").write_text("{}")
+
+        with pytest.raises(SystemExit) as exc:
+            orchestrator.cmd_archive("T-001", restore="../../etc/passwd")
+        assert exc.value.code == 1
+        assert "escapes archive directory" in capsys.readouterr().err
+
+    def test_valid_restore_succeeds(self, monkeypatch, tmp_path) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        archive_dir = tmp_path / ".loop" / "archive" / "T-001"
+        archive_dir.mkdir(parents=True)
+        (archive_dir / "r1_state.json").write_text('{"round": 1}')
+
+        orchestrator.cmd_archive("T-001", restore="r1_state")
+        state_file = tmp_path / ".loop" / "state.json"
+        assert state_file.exists()
+        assert json.loads(state_file.read_text(encoding="utf-8"))["round"] == 1

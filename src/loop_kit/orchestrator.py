@@ -25,6 +25,7 @@ import signal
 import subprocess
 import sys
 import threading
+import types
 import time
 import uuid
 from datetime import datetime, timezone
@@ -207,7 +208,12 @@ class _LoopLock:
         self.acquire()
         return self
 
-    def __exit__(self, exc_type, exc, tb) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: types.TracebackType | None,
+    ) -> None:
         self.release()
 
 
@@ -276,7 +282,8 @@ def _read_json_if_exists(path: Path) -> dict | None:
         return None
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as e:
+        _log(f"Warning: {path.name} has invalid JSON: {e}")
         return None
 
 def _heartbeat_age_sec(path: Path, now: float | None = None) -> float | None:
@@ -669,24 +676,36 @@ def _resolve_exe_from_candidates(*, backend: str, candidates: list[str | None]) 
 
 
 def _resolve_codex_exe(backend: str) -> str:
+    home = Path.home()
     return _resolve_exe_from_candidates(
         backend=backend,
         candidates=[
             shutil.which("codex"),
             shutil.which("codex.cmd"),
-            str(Path.home() / "AppData" / "Roaming" / "npm" / "codex.cmd"),
-            str(Path.home() / "AppData" / "Roaming" / "npm" / "codex"),
+            # Windows npm global
+            str(home / "AppData" / "Roaming" / "npm" / "codex.cmd"),
+            str(home / "AppData" / "Roaming" / "npm" / "codex"),
+            # Unix npm global
+            str(home / ".npm-global" / "bin" / "codex"),
+            str(home / ".local" / "bin" / "codex"),
+            "/usr/local/bin/codex",
         ],
     )
 
 
 def _resolve_claude_exe(backend: str) -> str:
+    home = Path.home()
     return _resolve_exe_from_candidates(
         backend=backend,
         candidates=[
             shutil.which("claude"),
             shutil.which("claude.exe"),
-            str(Path.home() / ".local" / "bin" / "claude.exe"),
+            # Windows
+            str(home / "AppData" / "Local" / "Programs" / "claude" / "claude.exe"),
+            str(home / ".local" / "bin" / "claude.exe"),
+            # Unix
+            str(home / ".local" / "bin" / "claude"),
+            "/usr/local/bin/claude",
         ],
     )
 
@@ -864,7 +883,7 @@ def _collect_streamed_process_output(
         if deadline is not None and time.monotonic() > deadline:
             timed_out = True
             _close_pipe(proc.stdin)
-            proc.kill()
+            proc.terminate()
             break
         time.sleep(DISPATCH_STREAM_POLL_SEC)
 
@@ -938,7 +957,7 @@ def _terminate_subprocess_on_interrupt(proc: subprocess.Popen[str], *, context: 
 
     if is_running:
         try:
-            proc.kill()
+            proc.terminate()
         except OSError:
             pass
     try:
@@ -1299,8 +1318,7 @@ def _render_prompt_template(
     if template_text is None:
         raise RuntimeError(
             f"Missing required prompt template: {_display_path(template_path)}. "
-            "Run loop init to create required files "
-            "(loop init)."
+            "Run 'loop init' to create it."
         )
     try:
         return template_text.format(**context)
@@ -1314,8 +1332,7 @@ def _read_required_text(path: Path, *, label: str) -> str:
         return text
     raise RuntimeError(
         f"Missing required {label}: {_display_path(path)}. "
-        "Run loop init to create required files "
-        "(loop init)."
+        "Create this file and re-run."
     )
 
 
@@ -1370,9 +1387,20 @@ def _load_state() -> dict:
         return json.loads(STATE_FILE.read_text(encoding="utf-8"))
     return {"state": STATE_IDLE, "round": 0, "task_id": None}
 
+def _atomic_write_json(path: Path, data: object) -> None:
+    """Write *data* as JSON to *path* atomically (write-then-rename)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    try:
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n",
+                       encoding="utf-8")
+        tmp.replace(path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
 def _save_state(state: dict) -> None:
-    STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n",
-                          encoding="utf-8")
+    _atomic_write_json(STATE_FILE, state)
 
 # ── git helpers ─────────────────────────────────────────────────────
 def _git(*args: str) -> str:
@@ -1384,6 +1412,14 @@ def _git(*args: str) -> str:
         raise RuntimeError(f"git {' '.join(args)} failed: {result.stderr.strip()}")
     return result.stdout.strip()
 
+def _is_valid_ref(ref: str) -> bool:
+    """Check that *ref* is a valid git rev (no argument injection)."""
+    result = subprocess.run(
+        ["git", "-C", str(ROOT), "rev-parse", "--verify", ref],
+        capture_output=True, text=True, encoding="utf-8",
+    )
+    return result.returncode == 0
+
 def _current_sha() -> str:
     return _git("rev-parse", "HEAD")
 
@@ -1394,7 +1430,7 @@ def _log_oneline(base: str, head: str) -> str:
     return _git("log", "--oneline", f"{base}..{head}")
 
 def _is_git_repo_root(path: Path) -> bool:
-    return (path / ".git").exists()
+    return (path / ".git").exists() or (path / ".git").is_file()
 
 def _parse_porcelain_path(raw: str) -> str:
     text = raw.strip()
@@ -1533,6 +1569,11 @@ def _wait_for_file(
         if timeout_sec and elapsed >= timeout_sec:
             _log(f"Timeout ({timeout_sec}s) waiting for {path.name}")
             return None
+        # Absolute safety cap: even with timeout_sec=0 (unlimited),
+        # bail after 24 hours to prevent runaway processes.
+        if elapsed >= 86400:
+            _log(f"Safety cap (24h) reached waiting for {path.name}")
+            return None
         time.sleep(POLL_INTERVAL_SEC)
         elapsed += POLL_INTERVAL_SEC
 
@@ -1629,7 +1670,10 @@ def cmd_archive(task_id: str, restore: str | None = None) -> None:
         return
 
     restore_name = restore if restore.endswith(".json") else f"{restore}.json"
-    src = archive_dir / restore_name
+    src = (archive_dir / restore_name).resolve()
+    if not src.is_relative_to(archive_dir.resolve()):
+        print("Error: restore path escapes archive directory", file=sys.stderr)
+        sys.exit(1)
     if not src.exists():
         print(
             f"Error: archive file not found for task_id={task_id}: {src}",
@@ -1643,6 +1687,12 @@ def cmd_archive(task_id: str, restore: str | None = None) -> None:
 
 # ── extract-diff ────────────────────────────────────────────────────
 def cmd_extract_diff(base: str, head: str) -> None:
+    if not _is_valid_ref(base):
+        print(f"Error: invalid git ref: {base!r}", file=sys.stderr)
+        sys.exit(1)
+    if not _is_valid_ref(head):
+        print(f"Error: invalid git ref: {head!r}", file=sys.stderr)
+        sys.exit(1)
     print(_diff(base, head))
 
 def cmd_heartbeat(role: str, interval: int) -> None:
@@ -1935,6 +1985,7 @@ def _run_single_round(
             print("\n  Worker did not respond in time. Check .loop/logs/ for details.")
         state["state"] = STATE_DONE
         state["outcome"] = "worker_timeout"
+        state["error"] = "Worker timed out"
         _save_single_round_state()
         sys.exit(2)
 
@@ -2067,6 +2118,7 @@ def _run_single_round(
             _log("Reviewer timed out. Aborting.")
         state["state"] = STATE_DONE
         state["outcome"] = "reviewer_timeout"
+        state["error"] = "Reviewer timed out"
         _save_single_round_state()
         sys.exit(2)
 
