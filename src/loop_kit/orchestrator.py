@@ -48,6 +48,7 @@ DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC = 90
 DEFAULT_DISPATCH_RETRIES = 2
 DEFAULT_DISPATCH_RETRY_BASE_SEC = 5
 MAX_DISPATCH_RETRY_DELAY_SEC = 60
+DEFAULT_GIT_TIMEOUT_SEC = 30
 DEFAULT_DISPATCH_BACKEND = "native"
 DISPATCH_STREAM_POLL_SEC = 0.1
 _WAIT_SAFETY_CAP_SEC = 86400  # 24h absolute cap in _wait_for_file
@@ -1427,11 +1428,17 @@ def _save_state(state: dict) -> None:
     _atomic_write_json(STATE_FILE, state)
 
 # ── git helpers ─────────────────────────────────────────────────────
-def _git(*args: str) -> str:
-    result = subprocess.run(
-        ["git", "-C", str(ROOT)] + list(args),
-        capture_output=True, text=True, encoding="utf-8",
-    )
+def _git(*args: str, timeout: float | None = DEFAULT_GIT_TIMEOUT_SEC) -> str:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(ROOT)] + list(args),
+            capture_output=True, text=True, encoding="utf-8", timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        timeout_value = exc.timeout if exc.timeout is not None else timeout
+        raise RuntimeError(
+            f"git {' '.join(args)} timed out after {timeout_value}s"
+        ) from exc
     if result.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} failed: {result.stderr.strip()}")
     return result.stdout.strip()

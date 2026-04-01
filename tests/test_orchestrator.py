@@ -2368,6 +2368,35 @@ class TestIsGitRepoRoot:
         assert not orchestrator._is_git_repo_root(tmp_path)
 
 
+class TestGitHelper:
+    def test_passes_timeout_to_subprocess_run(self, monkeypatch) -> None:
+        captured: dict[str, object] = {}
+
+        def _fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            captured["timeout"] = kwargs.get("timeout")
+            return subprocess.CompletedProcess(cmd, 0, stdout="ok\n", stderr="")
+
+        monkeypatch.setattr(orchestrator.subprocess, "run", _fake_run)
+        result = orchestrator._git("status")
+
+        assert result == "ok"
+        assert captured["cmd"] == ["git", "-C", str(orchestrator.ROOT), "status"]
+        assert captured["timeout"] == 30
+
+    def test_raises_runtime_error_on_timeout(self, monkeypatch) -> None:
+        def _fake_run(*args, **kwargs):
+            _ = args, kwargs
+            raise subprocess.TimeoutExpired(
+                cmd=["git", "-C", str(orchestrator.ROOT), "status"],
+                timeout=12,
+            )
+
+        monkeypatch.setattr(orchestrator.subprocess, "run", _fake_run)
+        with pytest.raises(RuntimeError, match=r"git status timed out after 12s"):
+            orchestrator._git("status", timeout=12)
+
+
 class TestFailWithState:
     def test_exits_with_given_code(self, monkeypatch, tmp_path) -> None:
         monkeypatch.setattr(orchestrator, "STATE_FILE", tmp_path / "state.json")
