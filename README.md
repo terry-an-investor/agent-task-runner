@@ -49,6 +49,8 @@ loop extract-diff BASE HEAD  Print git diff between two commits
 | `--worker-backend codex\|claude` | codex | Backend for worker dispatch |
 | `--reviewer-backend codex\|claude` | codex | Backend for reviewer dispatch |
 | `--dispatch-timeout N` | 600 | Per-dispatch timeout in seconds |
+| `--dispatch-retries N` | 2 | Retries on non-zero dispatch exit |
+| `--dispatch-retry-base-sec N` | 5 | Base backoff seconds between dispatch retries (max delay 60s) |
 | `--artifact-timeout N` | 90 | Post-dispatch artifact wait in seconds |
 | `--require-heartbeat` | off | Require live heartbeat while waiting |
 | `--heartbeat-ttl N` | 30 | Heartbeat freshness threshold in seconds |

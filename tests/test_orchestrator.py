@@ -221,6 +221,8 @@ def test_register_backend_allows_custom_backend_in_run_cli(monkeypatch) -> None:
         allow_dirty: bool = False,
         resume: bool = False,
         verbose: bool = False,
+        dispatch_retries: int = orchestrator.DEFAULT_DISPATCH_RETRIES,
+        dispatch_retry_base_sec: int = orchestrator.DEFAULT_DISPATCH_RETRY_BASE_SEC,
     ) -> None:
         _ = (
             task_path,
@@ -240,6 +242,8 @@ def test_register_backend_allows_custom_backend_in_run_cli(monkeypatch) -> None:
             allow_dirty,
             resume,
             verbose,
+            dispatch_retries,
+            dispatch_retry_base_sec,
         )
         captured["worker_backend"] = worker_backend
         captured["reviewer_backend"] = reviewer_backend
@@ -466,6 +470,80 @@ def test_run_auto_dispatch_dispatch_log_keeps_full_stdout_when_non_verbose(
     dispatch_log = (tmp_path / "worker_dispatch.log").read_text(encoding="utf-8")
     assert raw_lines[0].strip() in dispatch_log
     assert raw_lines[1].strip() in dispatch_log
+
+
+def test_run_auto_dispatch_retries_and_succeeds_on_second_attempt(monkeypatch) -> None:
+    monkeypatch.setattr(
+        orchestrator,
+        "_agent_command",
+        lambda backend, prompt: (["codex.exe", "exec", "short instruction"], None, "STDIN_PAYLOAD"),
+    )
+    monkeypatch.setattr(orchestrator, "_log", lambda msg: None)
+    monkeypatch.setattr(orchestrator, "_feed_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(orchestrator, "_write_dispatch_log", lambda *args, **kwargs: None)
+
+    attempts: list[_FakeProc] = [
+        _FakeProc(stdout_lines=[], stderr_lines=["first fail\n"], returncode=1),
+        _FakeProc(stdout_lines=['{"type":"thread.started","thread_id":"tid-2"}\n'], returncode=0),
+    ]
+    popen_calls: list[list[str]] = []
+    sleep_calls: list[int] = []
+
+    def fake_popen(cmd, **kwargs):
+        _ = kwargs
+        popen_calls.append(cmd)
+        return attempts[len(popen_calls) - 1]
+
+    monkeypatch.setattr(orchestrator.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(orchestrator.time, "sleep", lambda sec: sleep_calls.append(sec))
+
+    orchestrator._run_auto_dispatch(
+        "worker",
+        "codex",
+        "ignored",
+        30,
+        dispatch_retries=2,
+        dispatch_retry_base_sec=5,
+    )
+
+    assert len(popen_calls) == 2
+    assert sleep_calls == [5]
+
+
+def test_run_auto_dispatch_retry_exhaustion_raises_final_failure(monkeypatch) -> None:
+    monkeypatch.setattr(
+        orchestrator,
+        "_agent_command",
+        lambda backend, prompt: (["codex.exe", "exec", "short instruction"], None, "STDIN_PAYLOAD"),
+    )
+    monkeypatch.setattr(orchestrator, "_log", lambda msg: None)
+    monkeypatch.setattr(orchestrator, "_feed_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(orchestrator, "_write_dispatch_log", lambda *args, **kwargs: None)
+
+    popen_calls: list[list[str]] = []
+    sleep_calls: list[int] = []
+
+    def fake_popen(cmd, **kwargs):
+        _ = kwargs
+        popen_calls.append(cmd)
+        return _FakeProc(stdout_lines=[], stderr_lines=["still failing\n"], returncode=3)
+
+    monkeypatch.setattr(orchestrator.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(orchestrator.time, "sleep", lambda sec: sleep_calls.append(sec))
+
+    with pytest.raises(RuntimeError) as exc:
+        orchestrator._run_auto_dispatch(
+            "worker",
+            "codex",
+            "ignored",
+            30,
+            dispatch_retries=2,
+            dispatch_retry_base_sec=5,
+        )
+
+    assert "after 3 attempts" in str(exc.value)
+    assert len(popen_calls) == 3
+    assert sleep_calls == [5, 10]
 
 
 def test_worker_prompt_round1_includes_task_card_section(monkeypatch) -> None:
@@ -728,6 +806,8 @@ def test_main_run_parses_artifact_timeout(monkeypatch) -> None:
         allow_dirty: bool = False,
         resume: bool = False,
         verbose: bool = False,
+        dispatch_retries: int = orchestrator.DEFAULT_DISPATCH_RETRIES,
+        dispatch_retry_base_sec: int = orchestrator.DEFAULT_DISPATCH_RETRY_BASE_SEC,
     ) -> None:
         _ = (
             task_path,
@@ -745,6 +825,8 @@ def test_main_run_parses_artifact_timeout(monkeypatch) -> None:
             par_reviewer_target,
             allow_dirty,
             verbose,
+            dispatch_retries,
+            dispatch_retry_base_sec,
         )
         captured["artifact_timeout"] = artifact_timeout
         captured["single_round"] = single_round
@@ -771,6 +853,76 @@ def test_main_run_parses_artifact_timeout(monkeypatch) -> None:
     assert captured["round_num"] == 7
     assert captured["resume"] is False
     assert captured["verbose"] is True
+
+
+def test_main_run_parses_dispatch_retry_flags(monkeypatch) -> None:
+    captured: dict[str, int] = {}
+
+    def fake_cmd_run(
+        task_path: str,
+        max_rounds: int,
+        timeout: int,
+        require_heartbeat: bool,
+        heartbeat_ttl: int,
+        auto_dispatch: bool,
+        dispatch_backend: str,
+        worker_backend: str,
+        reviewer_backend: str,
+        dispatch_timeout: int,
+        artifact_timeout: int,
+        par_bin: str,
+        par_worker_target: str,
+        par_reviewer_target: str,
+        single_round: bool,
+        round_num: int | None,
+        allow_dirty: bool = False,
+        resume: bool = False,
+        verbose: bool = False,
+        dispatch_retries: int = orchestrator.DEFAULT_DISPATCH_RETRIES,
+        dispatch_retry_base_sec: int = orchestrator.DEFAULT_DISPATCH_RETRY_BASE_SEC,
+    ) -> None:
+        _ = (
+            task_path,
+            max_rounds,
+            timeout,
+            require_heartbeat,
+            heartbeat_ttl,
+            auto_dispatch,
+            dispatch_backend,
+            worker_backend,
+            reviewer_backend,
+            dispatch_timeout,
+            artifact_timeout,
+            par_bin,
+            par_worker_target,
+            par_reviewer_target,
+            single_round,
+            round_num,
+            allow_dirty,
+            resume,
+            verbose,
+        )
+        captured["dispatch_retries"] = dispatch_retries
+        captured["dispatch_retry_base_sec"] = dispatch_retry_base_sec
+
+    monkeypatch.setattr(orchestrator, "cmd_run", fake_cmd_run)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "orchestrator.py",
+            "run",
+            "--dispatch-retries",
+            "4",
+            "--dispatch-retry-base-sec",
+            "7",
+        ],
+    )
+
+    orchestrator.main()
+
+    assert captured["dispatch_retries"] == 4
+    assert captured["dispatch_retry_base_sec"] == 7
 
 
 def _configure_loop_paths(monkeypatch, tmp_path: Path) -> None:
@@ -1955,6 +2107,30 @@ class TestCodexEventSummary:
         assert "[worker] Message:" in result
         assert "I fixed the bug." in result
 
+    def test_file_change(self) -> None:
+        line = json.dumps({
+            "type": "item.completed",
+            "item": {
+                "type": "file_change",
+                "changes": [
+                    {"path": "src/loop_kit/orchestrator.py"},
+                    {"path": "tests/test_orchestrator.py"},
+                ],
+            },
+        })
+        result = orchestrator._codex_event_summary("worker", "codex", line)
+        assert result is not None
+        assert "[worker] Editing: src/loop_kit/orchestrator.py, tests/test_orchestrator.py" == result
+
+    def test_item_started(self) -> None:
+        line = json.dumps({
+            "type": "item.started",
+            "item": {"type": "command_execution"},
+        })
+        result = orchestrator._codex_event_summary("worker", "codex", line)
+        assert result is not None
+        assert "[worker] Starting: command_execution" == result
+
     def test_non_codex_returns_none(self) -> None:
         line = json.dumps({"type": "item.completed", "item": {"type": "command_execution"}})
         assert orchestrator._codex_event_summary("worker", "claude", line) is None
@@ -1962,8 +2138,8 @@ class TestCodexEventSummary:
     def test_malformed_json_returns_none(self) -> None:
         assert orchestrator._codex_event_summary("worker", "codex", "bad json") is None
 
-    def test_non_item_completed_returns_none(self) -> None:
-        line = json.dumps({"type": "thread.started"})
+    def test_unknown_event_type_returns_none(self) -> None:
+        line = json.dumps({"type": "unknown.event"})
         assert orchestrator._codex_event_summary("worker", "codex", line) is None
 
 

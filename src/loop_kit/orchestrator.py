@@ -42,6 +42,9 @@ POLL_INTERVAL_SEC = 5
 DEFAULT_HEARTBEAT_TTL_SEC = 30
 DEFAULT_DISPATCH_TIMEOUT_SEC = 600
 DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC = 90
+DEFAULT_DISPATCH_RETRIES = 2
+DEFAULT_DISPATCH_RETRY_BASE_SEC = 5
+MAX_DISPATCH_RETRY_DELAY_SEC = 60
 DEFAULT_DISPATCH_BACKEND = "native"
 DISPATCH_STREAM_POLL_SEC = 0.1
 _FEED_TASK_ID: str | None = None
@@ -335,6 +338,61 @@ def _extract_command_summary(item: dict) -> str:
     return ""
 
 
+def _extract_file_paths(item: dict) -> list[str]:
+    found: list[str] = []
+
+    def _append_path(value: object) -> None:
+        if not isinstance(value, str):
+            return
+        normalized = value.strip()
+        if not normalized:
+            return
+        if normalized not in found:
+            found.append(normalized)
+
+    def _walk(value: object) -> None:
+        if isinstance(value, dict):
+            for key in (
+                "path",
+                "file",
+                "filepath",
+                "file_path",
+                "relative_path",
+                "absolute_path",
+                "target_path",
+            ):
+                _append_path(value.get(key))
+            for key in (
+                "paths",
+                "files",
+                "file_paths",
+                "changes",
+                "edits",
+                "items",
+                "entries",
+            ):
+                nested = value.get(key)
+                if isinstance(nested, (dict, list)):
+                    _walk(nested)
+            return
+        if isinstance(value, list):
+            for item_value in value:
+                _walk(item_value)
+
+    _walk(item)
+    return found
+
+
+def _summarize_paths(paths: list[str], max_items: int = 3) -> str:
+    if not paths:
+        return ""
+    if len(paths) <= max_items:
+        return ", ".join(paths)
+    head = ", ".join(paths[:max_items])
+    remaining = len(paths) - max_items
+    return f"{head} (+{remaining} more)"
+
+
 def _codex_event_summary(role: str, backend: str, line: str) -> str | None:
     if backend != "codex":
         return None
@@ -342,18 +400,48 @@ def _codex_event_summary(role: str, backend: str, line: str) -> str | None:
         payload = json.loads(line)
     except json.JSONDecodeError:
         return None
-    if not isinstance(payload, dict) or payload.get("type") != "item.completed":
+    if not isinstance(payload, dict):
+        return None
+    payload_type = payload.get("type")
+    if payload_type == "thread.started":
+        thread_id = payload.get("thread_id")
+        if isinstance(thread_id, str) and thread_id.strip():
+            return f"[{role}] Session: {thread_id.strip()}"
+        return f"[{role}] Session started"
+    if payload_type == "turn.started":
+        return f"[{role}] Turn started"
+    if payload_type == "turn.completed":
+        return f"[{role}] Turn completed"
+    if payload_type == "file_change":
+        paths = _extract_file_paths(payload)
+        return (
+            f"[{role}] Editing: {_summarize_paths(paths)}"
+            if paths
+            else f"[{role}] Editing files"
+        )
+    if payload_type not in ("item.started", "item.completed"):
         return None
     item = payload.get("item")
     if not isinstance(item, dict):
         return None
     item_type = item.get("type")
+    if payload_type == "item.started":
+        if isinstance(item_type, str) and item_type.strip():
+            return f"[{role}] Starting: {item_type.strip()}"
+        return f"[{role}] Starting"
     if item_type == "command_execution":
         command = _extract_command_summary(item)
         return f"[{role}] Running: {command}" if command else f"[{role}] Running command"
     if item_type == "agent_message":
         message = _flatten_text_payload(item)
         return f"[{role}] Message: {_truncate_summary_text(message)}" if message else f"[{role}] Message"
+    if item_type == "file_change":
+        paths = _extract_file_paths(item)
+        return (
+            f"[{role}] Editing: {_summarize_paths(paths)}"
+            if paths
+            else f"[{role}] Editing files"
+        )
     return None
 
 
@@ -660,83 +748,108 @@ def _run_auto_dispatch(
     timeout_sec: int,
     *,
     verbose: bool = False,
+    dispatch_retries: int = DEFAULT_DISPATCH_RETRIES,
+    dispatch_retry_base_sec: int = DEFAULT_DISPATCH_RETRY_BASE_SEC,
 ) -> None:
-    _log(f"Auto-dispatch start: role={role} backend={backend}")
-    cmd, cmd_sid, stdin_text = _agent_command(backend, prompt)
-    proc = subprocess.Popen(
-        cmd,
-        cwd=str(ROOT),
-        stdin=(subprocess.PIPE if stdin_text is not None else None),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
+    retry_count = max(0, int(dispatch_retries))
+    retry_base_sec = max(1, int(dispatch_retry_base_sec))
+    max_attempts = retry_count + 1
+    _log(
+        f"Auto-dispatch start: role={role} backend={backend} retries={retry_count} "
+        f"retry_base_sec={retry_base_sec}"
     )
-    stdout, stderr, returncode, timed_out = _collect_streamed_process_output(
-        proc,
-        role=role,
-        backend=backend,
-        stdin_text=stdin_text,
-        timeout_sec=timeout_sec,
-        verbose=verbose,
-    )
-    if timed_out:
+    attempt = 0
+    while attempt < max_attempts:
+        attempt += 1
+        cmd, cmd_sid, stdin_text = _agent_command(backend, prompt)
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(ROOT),
+            stdin=(subprocess.PIPE if stdin_text is not None else None),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+        )
+        stdout, stderr, returncode, timed_out = _collect_streamed_process_output(
+            proc,
+            role=role,
+            backend=backend,
+            stdin_text=stdin_text,
+            timeout_sec=timeout_sec,
+            verbose=verbose,
+        )
+        if timed_out:
+            result = subprocess.CompletedProcess(
+                cmd,
+                returncode if returncode is not None else -9,
+                stdout,
+                stderr,
+            )
+            _write_dispatch_log(role, cmd, result, cmd_sid)
+            _feed_event(
+                "dispatch_summary",
+                level="error",
+                data={
+                    "role": role,
+                    "mode": "native",
+                    "backend": backend,
+                    "timeout_sec": timeout_sec,
+                    "returncode": result.returncode,
+                    "attempt": attempt,
+                    "max_attempts": max_attempts,
+                },
+            )
+            raise DispatchTimeoutError(
+                f"{role} dispatch timeout after {timeout_sec}s (backend={backend})."
+                + _dispatch_failure_hint(backend=backend, stderr=stderr or "", timeout=True)
+            )
         result = subprocess.CompletedProcess(
             cmd,
-            returncode if returncode is not None else -9,
+            returncode if returncode is not None else 1,
             stdout,
             stderr,
         )
-        _write_dispatch_log(role, cmd, result, cmd_sid)
+
+        session_id = cmd_sid
+        if backend == "codex":
+            parsed = _extract_codex_thread_id(result.stdout or "")
+            if parsed:
+                session_id = parsed
+        _write_dispatch_log(role, cmd, result, session_id)
         _feed_event(
             "dispatch_summary",
-            level="error",
+            level=("info" if result.returncode == 0 else "error"),
             data={
                 "role": role,
                 "mode": "native",
                 "backend": backend,
-                "timeout_sec": timeout_sec,
                 "returncode": result.returncode,
+                "session_id": session_id,
+                "stdout_len": len(result.stdout or ""),
+                "stderr_len": len(result.stderr or ""),
+                "attempt": attempt,
+                "max_attempts": max_attempts,
             },
         )
-        raise DispatchTimeoutError(
-            f"{role} dispatch timeout after {timeout_sec}s (backend={backend})."
-            + _dispatch_failure_hint(backend=backend, stderr=stderr or "", timeout=True)
-        )
-    result = subprocess.CompletedProcess(
-        cmd,
-        returncode if returncode is not None else 1,
-        stdout,
-        stderr,
-    )
 
-    session_id = cmd_sid
-    if backend == "codex":
-        parsed = _extract_codex_thread_id(result.stdout or "")
-        if parsed:
-            session_id = parsed
-    _write_dispatch_log(role, cmd, result, session_id)
-    _feed_event(
-        "dispatch_summary",
-        level=("info" if result.returncode == 0 else "error"),
-        data={
-            "role": role,
-            "mode": "native",
-            "backend": backend,
-            "returncode": result.returncode,
-            "session_id": session_id,
-            "stdout_len": len(result.stdout or ""),
-            "stderr_len": len(result.stderr or ""),
-        },
-    )
+        if result.returncode == 0:
+            _log(f"Auto-dispatch done: role={role} backend={backend} attempts={attempt}")
+            return
 
-    if result.returncode != 0:
-        stderr = (result.stderr or "").strip()
-        raise RuntimeError(
-            f"{role} dispatch failed (backend={backend}, rc={result.returncode}): {stderr}"
-            + _dispatch_failure_hint(backend=backend, stderr=stderr)
+        stderr_text = (result.stderr or "").strip()
+        if attempt >= max_attempts:
+            raise RuntimeError(
+                f"{role} dispatch failed (backend={backend}, rc={result.returncode}) "
+                f"after {attempt} attempts: {stderr_text}"
+                + _dispatch_failure_hint(backend=backend, stderr=stderr_text)
+            )
+        retry_delay = min(MAX_DISPATCH_RETRY_DELAY_SEC, retry_base_sec * (2 ** (attempt - 1)))
+        _log(
+            f"{role} dispatch failed (backend={backend}, rc={result.returncode}) on attempt "
+            f"{attempt}/{max_attempts}; retrying in {retry_delay}s"
         )
-    _log(f"Auto-dispatch done: role={role} backend={backend}")
+        time.sleep(retry_delay)
 
 def _run_par_dispatch(
     role: str,
@@ -1346,6 +1459,8 @@ def _single_round_subprocess_cmd(
     worker_backend: str,
     reviewer_backend: str,
     dispatch_timeout: int,
+    dispatch_retries: int,
+    dispatch_retry_base_sec: int,
     artifact_timeout: int,
     par_bin: str,
     par_worker_target: str,
@@ -1377,6 +1492,10 @@ def _single_round_subprocess_cmd(
         reviewer_backend,
         "--dispatch-timeout",
         str(dispatch_timeout),
+        "--dispatch-retries",
+        str(dispatch_retries),
+        "--dispatch-retry-base-sec",
+        str(dispatch_retry_base_sec),
         "--artifact-timeout",
         str(artifact_timeout),
         "--par-bin",
@@ -1409,6 +1528,8 @@ def _run_single_round(
     worker_backend: str,
     reviewer_backend: str,
     dispatch_timeout: int,
+    dispatch_retries: int,
+    dispatch_retry_base_sec: int,
     artifact_timeout: int,
     par_bin: str,
     par_worker_target: str,
@@ -1529,6 +1650,8 @@ def _run_single_round(
                         prompt=worker_prompt,
                         timeout_sec=dispatch_timeout,
                         verbose=verbose,
+                        dispatch_retries=dispatch_retries,
+                        dispatch_retry_base_sec=dispatch_retry_base_sec,
                     ),
                     artifact_path=WORK_REPORT,
                     task_id=task_id,
@@ -1661,6 +1784,8 @@ def _run_single_round(
                         prompt=_reviewer_prompt(task_id, round_num),
                         timeout_sec=dispatch_timeout,
                         verbose=verbose,
+                        dispatch_retries=dispatch_retries,
+                        dispatch_retry_base_sec=dispatch_retry_base_sec,
                     ),
                     artifact_path=REVIEW_REPORT,
                     task_id=task_id,
@@ -1789,6 +1914,8 @@ def _run_multi_round_via_subprocess(
     worker_backend: str,
     reviewer_backend: str,
     dispatch_timeout: int,
+    dispatch_retries: int,
+    dispatch_retry_base_sec: int,
     artifact_timeout: int,
     par_bin: str,
     par_worker_target: str,
@@ -1899,6 +2026,8 @@ def _run_multi_round_via_subprocess(
             worker_backend=worker_backend,
             reviewer_backend=reviewer_backend,
             dispatch_timeout=dispatch_timeout,
+            dispatch_retries=dispatch_retries,
+            dispatch_retry_base_sec=dispatch_retry_base_sec,
             artifact_timeout=artifact_timeout,
             par_bin=par_bin,
             par_worker_target=par_worker_target,
@@ -2033,6 +2162,8 @@ def cmd_run(
     allow_dirty: bool = False,
     resume: bool = False,
     verbose: bool = False,
+    dispatch_retries: int = DEFAULT_DISPATCH_RETRIES,
+    dispatch_retry_base_sec: int = DEFAULT_DISPATCH_RETRY_BASE_SEC,
 ) -> None:
     lock: _LoopLock | None = None
     # Single-round subprocesses are spawned by the parent loop which already
@@ -2065,6 +2196,8 @@ def cmd_run(
                 worker_backend=worker_backend,
                 reviewer_backend=reviewer_backend,
                 dispatch_timeout=dispatch_timeout,
+                dispatch_retries=dispatch_retries,
+                dispatch_retry_base_sec=dispatch_retry_base_sec,
                 artifact_timeout=artifact_timeout,
                 par_bin=par_bin,
                 par_worker_target=par_worker_target,
@@ -2109,6 +2242,8 @@ def cmd_run(
             worker_backend=worker_backend,
             reviewer_backend=reviewer_backend,
             dispatch_timeout=dispatch_timeout,
+            dispatch_retries=dispatch_retries,
+            dispatch_retry_base_sec=dispatch_retry_base_sec,
             artifact_timeout=artifact_timeout,
             par_bin=par_bin,
             par_worker_target=par_worker_target,
@@ -2182,6 +2317,10 @@ def main() -> None:
                        help="Backend used for auto reviewer dispatch (native mode)")
     run_p.add_argument("--dispatch-timeout", type=int, default=DEFAULT_DISPATCH_TIMEOUT_SEC,
                        help="Per-dispatch timeout in seconds (default: 600, 0=unlimited)")
+    run_p.add_argument("--dispatch-retries", type=int, default=DEFAULT_DISPATCH_RETRIES,
+                       help="Retry count for non-zero dispatch exits (default: 2)")
+    run_p.add_argument("--dispatch-retry-base-sec", type=int, default=DEFAULT_DISPATCH_RETRY_BASE_SEC,
+                       help="Base retry backoff seconds (default: 5, max delay: 60)")
     run_p.add_argument("--artifact-timeout", type=int, default=DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC,
                        help="Post-dispatch artifact timeout in seconds (default: 90)")
     run_p.add_argument("--par-bin", default="par",
@@ -2226,7 +2365,8 @@ def main() -> None:
                 args.worker_backend, args.reviewer_backend,
                 args.dispatch_timeout, args.artifact_timeout, args.par_bin,
                 args.par_worker_target, args.par_reviewer_target,
-                args.single_round, args.round, args.allow_dirty, args.resume, args.verbose)
+                args.single_round, args.round, args.allow_dirty, args.resume, args.verbose,
+                args.dispatch_retries, args.dispatch_retry_base_sec)
     else:
         parser.print_help()
 
