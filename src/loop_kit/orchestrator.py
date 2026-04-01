@@ -397,23 +397,69 @@ def _codex_event_summary(role: str, backend: str, line: str) -> str | None:
     if backend != "codex":
         return None
 
-    def _short_filename(path_text: str) -> str:
+    def _clean_path_text(path_text: str) -> str:
         cleaned = path_text.strip().strip("\"'")
         if "|" in cleaned:
             cleaned = cleaned.split("|", 1)[0].strip()
-        cleaned = cleaned.rstrip(";,")
+        return cleaned.rstrip(";,")
+
+    def _path_parts(path_text: str) -> list[str]:
+        cleaned = _clean_path_text(path_text)
+        if not cleaned:
+            return []
+        normalized = cleaned.replace("\\", "/").strip()
+        return [part for part in normalized.split("/") if part and part != "."]
+
+    def _short_filename(path_text: str) -> str:
+        cleaned = _clean_path_text(path_text)
         if not cleaned:
             return ""
-        normalized = cleaned.replace("\\", "/")
-        name = Path(normalized).name
+        parts = _path_parts(cleaned)
+        name = parts[-1] if parts else Path(cleaned).name
         return name or cleaned
 
     def _shorten_paths(paths: list[str]) -> list[str]:
+        path_parts: list[list[str]] = []
         shortened: list[str] = []
+        indexes_by_name: dict[str, list[int]] = {}
+
         for path_text in paths:
-            name = _short_filename(path_text)
-            if name and name not in shortened:
-                shortened.append(name)
+            parts = _path_parts(path_text)
+            name = parts[-1] if parts else _short_filename(path_text)
+            if not name:
+                continue
+            index = len(shortened)
+            shortened.append(name)
+            path_parts.append(parts)
+            indexes_by_name.setdefault(name, []).append(index)
+
+        for indexes in indexes_by_name.values():
+            if len(indexes) < 2:
+                continue
+            depth = 2
+            while True:
+                seen: set[str] = set()
+                has_collision = False
+                for index in indexes:
+                    parts = path_parts[index]
+                    if not parts:
+                        candidate = shortened[index]
+                    else:
+                        candidate = "/".join(parts[-min(depth, len(parts)) :])
+                    if candidate in seen:
+                        has_collision = True
+                        break
+                    seen.add(candidate)
+                if not has_collision:
+                    break
+                if all(len(path_parts[index]) <= depth for index in indexes):
+                    break
+                depth += 1
+            for index in indexes:
+                parts = path_parts[index]
+                if not parts:
+                    continue
+                shortened[index] = "/".join(parts[-min(depth, len(parts)) :])
         return shortened
 
     def _split_shell_tokens(text: str) -> list[str]:
@@ -489,14 +535,63 @@ def _codex_event_summary(role: str, backend: str, line: str) -> str | None:
         head = tokens[0].replace("\\", "/").split("/")[-1].lower()
         if head not in {"get-content", "cat", "gc"}:
             return None
-        candidate = ""
-        for index, token in enumerate(tokens[1:], start=1):
+
+        path_flags = {"-path", "-literalpath"}
+
+        for token in tokens[1:]:
             lowered = token.lower()
-            if lowered in {"-path", "-literalpath"}:
-                if index + 1 < len(tokens):
-                    candidate = tokens[index + 1]
-                break
-            if token.startswith("-"):
+            for path_flag in path_flags:
+                inline_prefix = f"{path_flag}:"
+                if lowered.startswith(inline_prefix) and len(token) > len(inline_prefix):
+                    candidate = token[len(inline_prefix) :]
+                    name = _short_filename(candidate)
+                    if name:
+                        return name
+
+        for index, token in enumerate(tokens[1:], start=1):
+            if token.lower() not in path_flags:
+                continue
+            if index + 1 >= len(tokens):
+                continue
+            candidate = tokens[index + 1]
+            if candidate.startswith("-"):
+                continue
+            name = _short_filename(candidate)
+            if name:
+                return name
+
+        option_flags_with_values = {
+            "-credential",
+            "-delimiter",
+            "-encoding",
+            "-exclude",
+            "-filter",
+            "-include",
+            "-path",
+            "-literalpath",
+            "-readcount",
+            "-stream",
+            "-tail",
+            "-totalcount",
+        }
+        switch_flags = {"-force", "-raw", "-wait", "-asbytestream"}
+        candidate = ""
+        index = 1
+        while index < len(tokens):
+            token = tokens[index]
+            lowered = token.lower()
+            if lowered.startswith("-"):
+                option_name = lowered.split(":", 1)[0]
+                if ":" in lowered:
+                    index += 1
+                    continue
+                if option_name in switch_flags:
+                    index += 1
+                    continue
+                if option_name in option_flags_with_values and index + 1 < len(tokens):
+                    index += 2
+                    continue
+                index += 1
                 continue
             candidate = token
             break

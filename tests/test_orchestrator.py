@@ -2223,6 +2223,21 @@ class TestCodexEventSummary:
         assert result is not None
         assert "[worker] Editing: orchestrator.py, test_orchestrator.py" == result
 
+    def test_file_change_keeps_colliding_basenames(self) -> None:
+        line = json.dumps({
+            "type": "item.completed",
+            "item": {
+                "type": "file_change",
+                "changes": [
+                    {"path": "src/api/config.py"},
+                    {"path": "tests/config.py"},
+                ],
+            },
+        })
+        result = orchestrator._codex_event_summary("worker", "codex", line)
+        assert result is not None
+        assert "[worker] Editing: api/config.py, tests/config.py" == result
+
     def test_command_execution_strips_pwsh_wrapper(self) -> None:
         line = json.dumps({
             "type": "item.completed",
@@ -2234,6 +2249,38 @@ class TestCodexEventSummary:
         result = orchestrator._codex_event_summary("worker", "codex", line)
         assert result is not None
         assert "[worker] Running: git status --short" == result
+
+    def test_command_execution_extracts_read_filename_after_option_values(self) -> None:
+        line = json.dumps({
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution",
+                "command": (
+                    'pwsh.exe -NoLogo -NoProfile -Command '
+                    '"Get-Content -Encoding UTF8 -LiteralPath '
+                    'src/loop_kit/orchestrator.py -TotalCount 40"'
+                ),
+            },
+        })
+        result = orchestrator._codex_event_summary("worker", "codex", line)
+        assert result is not None
+        assert "[worker] Reading: orchestrator.py" == result
+
+    def test_command_execution_extracts_read_filename_with_quoted_space_path(self) -> None:
+        line = json.dumps({
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution",
+                "command": (
+                    'pwsh.exe -NoLogo -NoProfile -Command '
+                    '"Get-Content -LiteralPath '
+                    '\'src/loop kit/orchestrator file.py\' -TotalCount 20"'
+                ),
+            },
+        })
+        result = orchestrator._codex_event_summary("worker", "codex", line)
+        assert result is not None
+        assert "[worker] Reading: orchestrator file.py" == result
 
     def test_item_started(self) -> None:
         line = json.dumps({
