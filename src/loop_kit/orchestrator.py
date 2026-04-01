@@ -49,7 +49,12 @@ DEFAULT_DISPATCH_RETRIES = 2
 DEFAULT_DISPATCH_RETRY_BASE_SEC = 5
 MAX_DISPATCH_RETRY_DELAY_SEC = 60
 DEFAULT_GIT_TIMEOUT_SEC = 30
-DEFAULT_DISPATCH_BACKEND = "native"
+BACKEND_CODEX = "codex"
+BACKEND_CLAUDE = "claude"
+DISPATCH_BACKEND_NATIVE = "native"
+DEFAULT_WORKER_BACKEND = BACKEND_CODEX
+DEFAULT_REVIEWER_BACKEND = BACKEND_CODEX
+DEFAULT_DISPATCH_BACKEND = DISPATCH_BACKEND_NATIVE
 DISPATCH_STREAM_POLL_SEC = 0.1
 _WAIT_SAFETY_CAP_SEC = 86400  # 24h absolute cap in _wait_for_file
 _FEED_TASK_ID: str | None = None
@@ -86,15 +91,12 @@ class RunConfig:
     heartbeat_ttl: int = DEFAULT_HEARTBEAT_TTL_SEC
     auto_dispatch: bool = False
     dispatch_backend: str = DEFAULT_DISPATCH_BACKEND
-    worker_backend: str = "codex"
-    reviewer_backend: str = "codex"
+    worker_backend: str = DEFAULT_WORKER_BACKEND
+    reviewer_backend: str = DEFAULT_REVIEWER_BACKEND
     dispatch_timeout: int = DEFAULT_DISPATCH_TIMEOUT_SEC
     dispatch_retries: int = DEFAULT_DISPATCH_RETRIES
     dispatch_retry_base_sec: int = DEFAULT_DISPATCH_RETRY_BASE_SEC
     artifact_timeout: int = DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC
-    par_bin: str = "par"
-    par_worker_target: str = "worker"
-    par_reviewer_target: str = "reviewer"
     allow_dirty: bool = False
     verbose: bool = False
 
@@ -472,7 +474,7 @@ def _strip_powershell_wrapper(command_text: str) -> str:
 
 
 def _codex_event_summary(role: str, backend: str, line: str) -> str | None:
-    if backend != "codex":
+    if backend != BACKEND_CODEX:
         return None
 
     def _clean_path_text(path_text: str) -> str:
@@ -718,15 +720,15 @@ def _resolve_codex_exe(backend: str) -> str:
     return _resolve_exe_from_candidates(
         backend=backend,
         candidates=[
-            shutil.which("codex"),
-            shutil.which("codex.cmd"),
+            shutil.which(BACKEND_CODEX),
+            shutil.which(f"{BACKEND_CODEX}.cmd"),
             # Windows npm global
-            str(home / "AppData" / "Roaming" / "npm" / "codex.cmd"),
-            str(home / "AppData" / "Roaming" / "npm" / "codex"),
+            str(home / "AppData" / "Roaming" / "npm" / f"{BACKEND_CODEX}.cmd"),
+            str(home / "AppData" / "Roaming" / "npm" / BACKEND_CODEX),
             # Unix npm global
-            str(home / ".npm-global" / "bin" / "codex"),
-            str(home / ".local" / "bin" / "codex"),
-            "/usr/local/bin/codex",
+            str(home / ".npm-global" / "bin" / BACKEND_CODEX),
+            str(home / ".local" / "bin" / BACKEND_CODEX),
+            f"/usr/local/bin/{BACKEND_CODEX}",
         ],
     )
 
@@ -736,14 +738,14 @@ def _resolve_claude_exe(backend: str) -> str:
     return _resolve_exe_from_candidates(
         backend=backend,
         candidates=[
-            shutil.which("claude"),
-            shutil.which("claude.exe"),
+            shutil.which(BACKEND_CLAUDE),
+            shutil.which(f"{BACKEND_CLAUDE}.exe"),
             # Windows
-            str(home / "AppData" / "Local" / "Programs" / "claude" / "claude.exe"),
-            str(home / ".local" / "bin" / "claude.exe"),
+            str(home / "AppData" / "Local" / "Programs" / BACKEND_CLAUDE / f"{BACKEND_CLAUDE}.exe"),
+            str(home / ".local" / "bin" / f"{BACKEND_CLAUDE}.exe"),
             # Unix
-            str(home / ".local" / "bin" / "claude"),
-            "/usr/local/bin/claude",
+            str(home / ".local" / "bin" / BACKEND_CLAUDE),
+            f"/usr/local/bin/{BACKEND_CLAUDE}",
         ],
     )
 
@@ -773,19 +775,6 @@ def _resolve_backend_exe(backend: str) -> str:
     _, resolve_exe_fn = _require_registered_backend(backend)
     return resolve_exe_fn(backend.strip().lower())
 
-
-def _resolve_par_exe(par_bin: str) -> str:
-    if os.path.sep in par_bin or (os.path.altsep and os.path.altsep in par_bin):
-        if Path(par_bin).exists():
-            return par_bin
-        raise RuntimeError(f"Cannot find par executable: {par_bin}")
-    found = shutil.which(par_bin)
-    if found:
-        return found
-    raise RuntimeError(
-        f"Cannot find par executable '{par_bin}'. Install par or pass --par-bin <path>."
-    )
-
 def _agent_command(backend: str, prompt: str) -> tuple[list[str], str | None, str | None]:
     """Return (cmd, session_id, stdin_text).
 
@@ -797,8 +786,8 @@ def _agent_command(backend: str, prompt: str) -> tuple[list[str], str | None, st
     return build_cmd_fn(exe, prompt)
 
 
-register_backend("codex", _build_codex_command, _resolve_codex_exe)
-register_backend("claude", _build_claude_command, _resolve_claude_exe)
+register_backend(BACKEND_CODEX, _build_codex_command, _resolve_codex_exe)
+register_backend(BACKEND_CLAUDE, _build_claude_command, _resolve_claude_exe)
 
 
 def _write_dispatch_log(
@@ -832,9 +821,9 @@ def _dispatch_failure_hint(*, backend: str, stderr: str, timeout: bool = False) 
     if timeout:
         hints.append("try --dispatch-timeout 900.")
     if any(token in lowered for token in ("auth", "unauthorized", "401", "api key", "token")):
-        if backend == "codex":
+        if backend == BACKEND_CODEX:
             hints.append("check codex API key/login.")
-        elif backend == "claude":
+        elif backend == BACKEND_CLAUDE:
             hints.append("check claude authentication/session.")
         else:
             hints.append("check backend authentication.")
@@ -1054,7 +1043,7 @@ def _run_auto_dispatch(
                 level="error",
                 data={
                     "role": role,
-                    "mode": "native",
+                    "mode": DISPATCH_BACKEND_NATIVE,
                     "backend": backend,
                     "interrupted": True,
                     "attempt": attempt,
@@ -1075,7 +1064,7 @@ def _run_auto_dispatch(
                 level="error",
                 data={
                     "role": role,
-                    "mode": "native",
+                    "mode": DISPATCH_BACKEND_NATIVE,
                     "backend": backend,
                     "timeout_sec": timeout_sec,
                     "returncode": result.returncode,
@@ -1095,7 +1084,7 @@ def _run_auto_dispatch(
         )
 
         session_id = cmd_sid
-        if backend == "codex":
+        if backend == BACKEND_CODEX:
             parsed = _extract_codex_thread_id(result.stdout or "")
             if parsed:
                 session_id = parsed
@@ -1105,7 +1094,7 @@ def _run_auto_dispatch(
             level=("info" if result.returncode == 0 else "error"),
             data={
                 "role": role,
-                "mode": "native",
+                "mode": DISPATCH_BACKEND_NATIVE,
                 "backend": backend,
                 "returncode": result.returncode,
                 "session_id": session_id,
@@ -1133,57 +1122,6 @@ def _run_auto_dispatch(
             f"{attempt}/{max_attempts}; retrying in {retry_delay}s"
         )
         time.sleep(retry_delay)
-
-def _run_par_dispatch(
-    role: str,
-    target: str,
-    prompt: str,
-    timeout_sec: int,
-    par_bin: str,
-) -> None:
-    exe = _resolve_par_exe(par_bin)
-    cmd = [exe, "send", target, prompt]
-    _log(f"Par-dispatch start: role={role} target={target} par={exe}")
-    timeout = None if timeout_sec <= 0 else timeout_sec
-    try:
-        result = subprocess.run(
-            cmd,
-            cwd=str(ROOT),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired as e:
-        _feed_event(
-            "dispatch_summary",
-            level="error",
-            data={"role": role, "mode": "par", "target": target, "timeout_sec": timeout_sec},
-        )
-        raise DispatchTimeoutError(
-            f"{role} par-dispatch timeout after {timeout_sec}s (target={target}): {e}."
-            + _dispatch_failure_hint(backend="par", stderr="", timeout=True)
-        ) from e
-    _write_dispatch_log(role, cmd, result, None)
-    _feed_event(
-        "dispatch_summary",
-        level=("info" if result.returncode == 0 else "error"),
-        data={
-            "role": role,
-            "mode": "par",
-            "target": target,
-            "returncode": result.returncode,
-            "stdout_len": len(result.stdout or ""),
-            "stderr_len": len(result.stderr or ""),
-        },
-    )
-    if result.returncode != 0:
-        stderr = (result.stderr or "").strip()
-        raise RuntimeError(
-            f"{role} par-dispatch failed (target={target}, rc={result.returncode}): {stderr}"
-            + _dispatch_failure_hint(backend="par", stderr=stderr)
-        )
-    _log(f"Par-dispatch done: role={role} target={target}")
 
 def _require_dispatch_artifact(
     role: str,
@@ -1827,12 +1765,6 @@ def _single_round_subprocess_cmd(
         str(config.dispatch_retry_base_sec),
         "--artifact-timeout",
         str(config.artifact_timeout),
-        "--par-bin",
-        config.par_bin,
-        "--par-worker-target",
-        config.par_worker_target,
-        "--par-reviewer-target",
-        config.par_reviewer_target,
     ]
     if config.require_heartbeat:
         cmd.append("--require-heartbeat")
@@ -1942,38 +1874,22 @@ def _run_single_round(
     work: dict | None = None
     if config.auto_dispatch:
         try:
-            if config.dispatch_backend == "par":
-                work = _dispatch_with_artifact_fallback(
+            work = _dispatch_with_artifact_fallback(
+                role="worker",
+                dispatch_call=lambda: _run_auto_dispatch(
                     role="worker",
-                    dispatch_call=lambda: _run_par_dispatch(
-                        role="worker",
-                        target=config.par_worker_target,
-                        prompt=worker_prompt,
-                        timeout_sec=config.dispatch_timeout,
-                        par_bin=config.par_bin,
-                    ),
-                    artifact_path=WORK_REPORT,
-                    task_id=task_id,
-                    round_num=round_num,
-                    timeout_sec=config.artifact_timeout,
-                )
-            else:
-                work = _dispatch_with_artifact_fallback(
-                    role="worker",
-                    dispatch_call=lambda: _run_auto_dispatch(
-                        role="worker",
-                        backend=config.worker_backend,
-                        prompt=worker_prompt,
-                        timeout_sec=config.dispatch_timeout,
-                        verbose=config.verbose,
-                        dispatch_retries=config.dispatch_retries,
-                        dispatch_retry_base_sec=config.dispatch_retry_base_sec,
-                    ),
-                    artifact_path=WORK_REPORT,
-                    task_id=task_id,
-                    round_num=round_num,
-                    timeout_sec=config.artifact_timeout,
-                )
+                    backend=config.worker_backend,
+                    prompt=worker_prompt,
+                    timeout_sec=config.dispatch_timeout,
+                    verbose=config.verbose,
+                    dispatch_retries=config.dispatch_retries,
+                    dispatch_retry_base_sec=config.dispatch_retry_base_sec,
+                ),
+                artifact_path=WORK_REPORT,
+                task_id=task_id,
+                round_num=round_num,
+                timeout_sec=config.artifact_timeout,
+            )
         except RuntimeError as e:
             _fail_single_round(
                 outcome="worker_dispatch_failed",
@@ -2077,38 +1993,22 @@ def _run_single_round(
     review: dict | None = None
     if config.auto_dispatch:
         try:
-            if config.dispatch_backend == "par":
-                review = _dispatch_with_artifact_fallback(
+            review = _dispatch_with_artifact_fallback(
+                role="reviewer",
+                dispatch_call=lambda: _run_auto_dispatch(
                     role="reviewer",
-                    dispatch_call=lambda: _run_par_dispatch(
-                        role="reviewer",
-                        target=config.par_reviewer_target,
-                        prompt=_reviewer_prompt(task_id, round_num),
-                        timeout_sec=config.dispatch_timeout,
-                        par_bin=config.par_bin,
-                    ),
-                    artifact_path=REVIEW_REPORT,
-                    task_id=task_id,
-                    round_num=round_num,
-                    timeout_sec=config.artifact_timeout,
-                )
-            else:
-                review = _dispatch_with_artifact_fallback(
-                    role="reviewer",
-                    dispatch_call=lambda: _run_auto_dispatch(
-                        role="reviewer",
-                        backend=config.reviewer_backend,
-                        prompt=_reviewer_prompt(task_id, round_num),
-                        timeout_sec=config.dispatch_timeout,
-                        verbose=config.verbose,
-                        dispatch_retries=config.dispatch_retries,
-                        dispatch_retry_base_sec=config.dispatch_retry_base_sec,
-                    ),
-                    artifact_path=REVIEW_REPORT,
-                    task_id=task_id,
-                    round_num=round_num,
-                    timeout_sec=config.artifact_timeout,
-                )
+                    backend=config.reviewer_backend,
+                    prompt=_reviewer_prompt(task_id, round_num),
+                    timeout_sec=config.dispatch_timeout,
+                    verbose=config.verbose,
+                    dispatch_retries=config.dispatch_retries,
+                    dispatch_retry_base_sec=config.dispatch_retry_base_sec,
+                ),
+                artifact_path=REVIEW_REPORT,
+                task_id=task_id,
+                round_num=round_num,
+                timeout_sec=config.artifact_timeout,
+            )
         except RuntimeError as e:
             _fail_single_round(
                 outcome="reviewer_dispatch_failed",
@@ -2589,12 +2489,12 @@ def main() -> None:
                        help="Heartbeat freshness threshold in seconds")
     run_p.add_argument("--auto-dispatch", action="store_true",
                        help="Automatically invoke worker/reviewer backends each round")
-    run_p.add_argument("--dispatch-backend", choices=["native", "par"],
+    run_p.add_argument("--dispatch-backend", choices=[DISPATCH_BACKEND_NATIVE],
                        default=DEFAULT_DISPATCH_BACKEND,
-                       help="Dispatch transport: native subprocess calls or par send")
-    run_p.add_argument("--worker-backend", default="codex",
+                       help="Dispatch transport: native subprocess calls")
+    run_p.add_argument("--worker-backend", default=DEFAULT_WORKER_BACKEND,
                        help="Backend used for auto worker dispatch (native mode)")
-    run_p.add_argument("--reviewer-backend", default="codex",
+    run_p.add_argument("--reviewer-backend", default=DEFAULT_REVIEWER_BACKEND,
                        help="Backend used for auto reviewer dispatch (native mode)")
     run_p.add_argument("--dispatch-timeout", type=int, default=DEFAULT_DISPATCH_TIMEOUT_SEC,
                        help="Per-dispatch timeout in seconds (default: 600, 0=unlimited)")
@@ -2604,12 +2504,6 @@ def main() -> None:
                        help="Base retry backoff seconds (default: 5, max delay: 60)")
     run_p.add_argument("--artifact-timeout", type=int, default=DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC,
                        help="Post-dispatch artifact timeout in seconds (default: 90)")
-    run_p.add_argument("--par-bin", default="par",
-                       help="Par executable name or absolute path (par mode)")
-    run_p.add_argument("--par-worker-target", default="worker",
-                       help="Par target/session name for worker role (par mode)")
-    run_p.add_argument("--par-reviewer-target", default="reviewer",
-                       help="Par target/session name for reviewer role (par mode)")
     run_p.add_argument("--single-round", action="store_true",
                        help="Run exactly one round and exit")
     run_p.add_argument("--round", type=int,
@@ -2653,9 +2547,6 @@ def main() -> None:
             dispatch_retries=args.dispatch_retries,
             dispatch_retry_base_sec=args.dispatch_retry_base_sec,
             artifact_timeout=args.artifact_timeout,
-            par_bin=args.par_bin,
-            par_worker_target=args.par_worker_target,
-            par_reviewer_target=args.par_reviewer_target,
             allow_dirty=args.allow_dirty,
             verbose=args.verbose,
         )

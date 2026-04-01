@@ -1516,14 +1516,11 @@ def test_outer_loop_spawns_single_round_subprocess(tmp_path: Path, monkeypatch) 
             require_heartbeat=True,
             heartbeat_ttl=40,
             auto_dispatch=True,
-            dispatch_backend="native",
-            worker_backend="codex",
-            reviewer_backend="claude",
+            dispatch_backend=orchestrator.DISPATCH_BACKEND_NATIVE,
+            worker_backend=orchestrator.BACKEND_CODEX,
+            reviewer_backend=orchestrator.BACKEND_CLAUDE,
             dispatch_timeout=120,
             artifact_timeout=55,
-            par_bin="par-bin",
-            par_worker_target="worker-target",
-            par_reviewer_target="reviewer-target",
         ),
         single_round=False,
         round_num=None,
@@ -1534,9 +1531,12 @@ def test_outer_loop_spawns_single_round_subprocess(tmp_path: Path, monkeypatch) 
     assert "--single-round" in cmd
     assert cmd[cmd.index("--round") + 1] == "1"
     assert "--auto-dispatch" in cmd
-    assert cmd[cmd.index("--dispatch-backend") + 1] == "native"
-    assert cmd[cmd.index("--worker-backend") + 1] == "codex"
-    assert cmd[cmd.index("--reviewer-backend") + 1] == "claude"
+    assert cmd[cmd.index("--dispatch-backend") + 1] == orchestrator.DISPATCH_BACKEND_NATIVE
+    assert cmd[cmd.index("--worker-backend") + 1] == orchestrator.BACKEND_CODEX
+    assert cmd[cmd.index("--reviewer-backend") + 1] == orchestrator.BACKEND_CLAUDE
+    assert "--par-bin" not in cmd
+    assert "--par-worker-target" not in cmd
+    assert "--par-reviewer-target" not in cmd
     assert "--require-heartbeat" in cmd
 
 
@@ -2209,21 +2209,24 @@ class TestResolveExeFromCandidates:
             )
 
 
-class TestResolveParExe:
-    def test_absolute_path_exists(self, tmp_path: Path) -> None:
-        exe = tmp_path / "par-bin"
-        exe.write_text("")
-        result = orchestrator._resolve_par_exe(str(exe))
-        assert result == str(exe)
+class TestParDispatchRemoval:
+    def test_dispatch_backend_par_choice_rejected(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["orchestrator.py", "run", "--dispatch-backend", "par"],
+        )
+        with pytest.raises(SystemExit):
+            orchestrator.main()
 
-    def test_absolute_path_missing_raises(self, tmp_path: Path) -> None:
-        with pytest.raises(RuntimeError, match="Cannot find par executable"):
-            orchestrator._resolve_par_exe(str(tmp_path / "missing-bin"))
-
-    def test_basename_not_found_raises(self, monkeypatch) -> None:
-        monkeypatch.setattr("shutil.which", lambda _: None)
-        with pytest.raises(RuntimeError, match="Cannot find par executable"):
-            orchestrator._resolve_par_exe("nonexistent-par-tool")
+    def test_par_bin_flag_rejected(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["orchestrator.py", "run", "--par-bin", "par"],
+        )
+        with pytest.raises(SystemExit):
+            orchestrator.main()
 
 
 # ── locking, heartbeat, polling ─────────────────────────────────────
