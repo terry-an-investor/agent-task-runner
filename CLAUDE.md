@@ -65,7 +65,7 @@ When documents disagree: `src/loop_kit/orchestrator.py` > `AGENTS.md` > `CLAUDE.
 ## Workflow
 
 - For trivial tasks (typos, one-line fixes, obvious small changes), just do them directly — no task cards needed
-- For non-trivial tasks (multi-step changes, new features, bug investigations), use loop-kit itself to drive the work (self-bootstrapping)
+- For non-trivial tasks, act as the **PM/orchestrator**, not the worker. Create a task card and run `loop run --auto-dispatch` to delegate coding to the worker backend (codex/claude). Do not write the code yourself.
 - Always commit after completing a set of changes. Do not leave uncommitted work.
 
 ## Commit Convention
