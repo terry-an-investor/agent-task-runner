@@ -58,6 +58,7 @@ MAX_DISPATCH_RETRY_DELAY_SEC = 60
 DEFAULT_GIT_TIMEOUT_SEC = 30
 BACKEND_CODEX = "codex"
 BACKEND_CLAUDE = "claude"
+BACKEND_OPENCODE = "opencode"
 DISPATCH_BACKEND_NATIVE = "native"
 DEFAULT_WORKER_BACKEND = BACKEND_CODEX
 DEFAULT_REVIEWER_BACKEND = BACKEND_CODEX
@@ -867,8 +868,89 @@ def _require_registered_parse_event(backend: str) -> BackendParseEventFn:
     return parse_event_fn
 
 
+def _resolve_opencode_exe(backend: str) -> str:
+    home = Path.home()
+    return _resolve_exe_from_candidates(
+        backend=backend,
+        candidates=[
+            shutil.which(BACKEND_OPENCODE),
+            shutil.which(f"{BACKEND_OPENCODE}.cmd"),
+            # Windows npm global
+            str(home / "AppData" / "Roaming" / "npm" / f"{BACKEND_OPENCODE}.cmd"),
+            str(home / "AppData" / "Roaming" / "npm" / BACKEND_OPENCODE),
+            # Unix npm global
+            str(home / ".npm-global" / "bin" / BACKEND_OPENCODE),
+            str(home / ".local" / "bin" / BACKEND_OPENCODE),
+            f"/usr/local/bin/{BACKEND_OPENCODE}",
+        ],
+    )
+
+
+def _build_opencode_command(exe: str, prompt: str) -> tuple[list[str], str | None, str | None]:
+    return ([
+        exe, "run",
+        "--format", "json",
+        prompt,
+    ], None, None)
+
+
+def _opencode_parse_event(role: str, backend: str, line: str) -> str | None:
+    _ = backend
+    try:
+        payload = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    event_type = payload.get("type")
+    part = payload.get("part")
+    if not isinstance(part, dict):
+        return None
+    if event_type == "step_start":
+        session_id = part.get("sessionID", "")
+        if isinstance(session_id, str) and session_id.strip():
+            return f"[{role}] Session: {session_id.strip()}"
+        return f"[{role}] Session started"
+    if event_type == "text":
+        text = part.get("text", "")
+        if isinstance(text, str) and text.strip():
+            return f"[{role}] Message: {_truncate_summary_text(text)}"
+        return None
+    if event_type == "tool_use":
+        state = part.get("state")
+        tool_name = part.get("tool", "")
+        if not isinstance(state, dict):
+            return None
+        status = state.get("status")
+        inp = state.get("input")
+        if status == "error":
+            return None
+        if tool_name == "write" and isinstance(inp, dict):
+            fp = inp.get("filePath", "")
+            if fp:
+                return f"[{role}] Editing: {_short_filename(str(fp))}"
+            return f"[{role}] Editing files"
+        if tool_name == "read" and isinstance(inp, dict):
+            fp = inp.get("filePath", "")
+            if fp:
+                return f"[{role}] Reading: {_short_filename(str(fp))}"
+            return f"[{role}] Reading file"
+        if tool_name in ("bash", "shell") and isinstance(inp, dict):
+            cmd_text = inp.get("command", "")
+            if cmd_text:
+                return f"[{role}] Running: {_truncate_summary_text(str(cmd_text))}"
+            return f"[{role}] Running command"
+        if tool_name:
+            return f"[{role}] Tool: {tool_name}"
+        return None
+    if event_type == "step_finish":
+        return f"[{role}] Step completed"
+    return None
+
+
 register_backend(BACKEND_CODEX, _build_codex_command, _resolve_codex_exe, _codex_event_summary)
 register_backend(BACKEND_CLAUDE, _build_claude_command, _resolve_claude_exe, _claude_parse_event)
+register_backend(BACKEND_OPENCODE, _build_opencode_command, _resolve_opencode_exe, _opencode_parse_event)
 
 
 def _write_dispatch_log(
