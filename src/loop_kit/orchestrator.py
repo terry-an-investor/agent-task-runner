@@ -719,7 +719,6 @@ def _stream_dispatch_stdout_line(
     line = raw_line.rstrip("\r\n")
     if verbose:
         print(line, flush=True)
-        return
     summary = parse_event_fn(role, backend, line)
     if not summary:
         read_state.pop(state_key, None)
@@ -898,8 +897,12 @@ def _build_opencode_command(exe: str, prompt: str) -> tuple[list[str], str | Non
     return ([
         exe, "run",
         "--format", "json",
-        prompt,
-    ], None, None)
+        (
+            "Execute the context provided via stdin.  Follow the instructions"
+            " embedded in it and only finish after the required output artifact"
+            " is written."
+        ),
+    ], None, prompt)
 
 
 def _opencode_parse_event(role: str, backend: str, line: str) -> str | None:

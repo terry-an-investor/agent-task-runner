@@ -27,11 +27,12 @@ Run at minimum:
 
 If a command fails, keep the failure in the final report with captured output.
 
-## Commit Discipline
+## Commit Discipline (MANDATORY)
 
-- All implementation changes must be committed.
-- Commit after meaningful validated work.
-- Do not claim completion without a commit SHA.
+- **All implementation changes MUST be committed via `git` before writing the output artifact.**
+- Stage changes: `git add -A && git commit -m "descriptive message"`
+- **The `head_sha` in the output artifact MUST be the new commit SHA (after your commit).**
+- **Do NOT claim completion without committing first. The orchestrator will reject your work if `head_sha` has not advanced.**
 
 ## Output Contract
 

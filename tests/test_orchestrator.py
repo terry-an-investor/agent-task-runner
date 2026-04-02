@@ -130,6 +130,20 @@ def test_agent_command_claude_keeps_prompt_in_cli_and_no_stdin(monkeypatch) -> N
     assert stdin_text is None
 
 
+def test_agent_command_opencode_uses_stdin_and_short_cli_instruction(monkeypatch) -> None:
+    monkeypatch.setattr(orchestrator, "_resolve_backend_exe", lambda backend: f"{backend}.exe")
+    long_prompt = "PROMPT-LINE-" * 200
+
+    cmd, session_id, stdin_text = orchestrator._agent_command("opencode", long_prompt)
+
+    assert cmd[0] == "opencode.exe"
+    assert "run" in cmd
+    assert "stdin" in cmd[-1].lower()
+    assert long_prompt not in " ".join(cmd)
+    assert session_id is None
+    assert stdin_text == long_prompt
+
+
 def test_agent_command_unknown_backend_lists_available_backends() -> None:
     with pytest.raises(ValueError) as exc:
         orchestrator._agent_command("unknown-backend", "payload")
@@ -417,7 +431,7 @@ def test_run_auto_dispatch_verbose_prints_all_stdout_lines(monkeypatch, capsys) 
     out = capsys.readouterr().out
     assert raw_lines[0].strip() in out
     assert raw_lines[1].strip() in out
-    assert "[worker] Message:" not in out
+    assert "[worker] Message: hello" in out
 
 
 def test_run_auto_dispatch_non_verbose_filters_out_non_summary_lines(monkeypatch, capsys) -> None:
