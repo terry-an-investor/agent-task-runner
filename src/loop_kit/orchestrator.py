@@ -1410,7 +1410,20 @@ def _as_prompt_list(items: object) -> str:
     return "\n".join(f"- {item}" for item in items)
 
 
+_function_index_cache: tuple[tuple[int, float], str] | None = None
+
+
 def _function_index(path: Path) -> str:
+    global _function_index_cache
+    try:
+        stat = path.stat()
+    except OSError:
+        return "- <unavailable>"
+
+    key = (stat.st_mtime_ns, stat.st_size)
+    if _function_index_cache is not None and _function_index_cache[0] == key:
+        return _function_index_cache[1]
+
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except OSError:
@@ -1423,8 +1436,12 @@ def _function_index(path: Path) -> str:
             entries.append(f"- L{line_no}: {stripped}")
 
     if not entries:
-        return "- <none>"
-    return "\n".join(entries)
+        result = "- <none>"
+    else:
+        result = "\n".join(entries)
+
+    _function_index_cache = (key, result)
+    return result
 
 
 def _render_task_card_section(task_card: dict) -> str:
