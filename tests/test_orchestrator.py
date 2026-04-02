@@ -720,6 +720,43 @@ def test_run_auto_dispatch_retry_exhaustion_raises_final_failure(monkeypatch) ->
     assert sleep_calls == [5, 10]
 
 
+def test_run_auto_dispatch_permanent_error_fails_fast_without_retrying(monkeypatch) -> None:
+    monkeypatch.setattr(
+        orchestrator,
+        "_agent_command",
+        lambda backend, prompt: (["codex.exe", "exec", "short instruction"], None, "STDIN_PAYLOAD"),
+    )
+    monkeypatch.setattr(orchestrator, "_log", lambda msg: None)
+    monkeypatch.setattr(orchestrator, "_feed_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(orchestrator, "_write_dispatch_log", lambda *args, **kwargs: None)
+
+    popen_calls: list[list[str]] = []
+    sleep_calls: list[int] = []
+
+    def fake_popen(cmd, **kwargs):
+        _ = kwargs
+        popen_calls.append(cmd)
+        return _FakeProc(stdout_lines=[], stderr_lines=["authentication failed\n"], returncode=1)
+
+    monkeypatch.setattr(orchestrator.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(orchestrator.time, "sleep", lambda sec: sleep_calls.append(sec))
+
+    with pytest.raises(RuntimeError) as exc:
+        orchestrator._run_auto_dispatch(
+            "worker",
+            "codex",
+            "ignored",
+            30,
+            dispatch_retries=2,
+            dispatch_retry_base_sec=5,
+        )
+
+    assert "permanent error, not retrying" in str(exc.value)
+    assert "authentication failed" in str(exc.value)
+    assert len(popen_calls) == 1
+    assert sleep_calls == []
+
+
 def test_worker_prompt_round1_includes_task_card_section(monkeypatch) -> None:
     def fake_read(path: Path) -> str | None:
         if path.name == "AGENTS.md":
