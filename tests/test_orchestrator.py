@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import threading
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -167,6 +168,9 @@ def test_main_loop_dir_overrides_all_bus_paths(tmp_path: Path, monkeypatch) -> N
         captured["archive_dir"] = orchestrator.ARCHIVE_DIR
         captured["context_dir"] = orchestrator._CONTEXT_DIR
         captured["module_map_file"] = orchestrator._MODULE_MAP_FILE
+        captured["project_facts_file"] = orchestrator._PROJECT_FACTS_FILE
+        captured["pitfalls_file"] = orchestrator._PITFALLS_FILE
+        captured["patterns_file"] = orchestrator._PATTERNS_FILE
         captured["state_file"] = orchestrator.STATE_FILE
         captured["task_card"] = orchestrator.TASK_CARD
         captured["fix_list"] = orchestrator.FIX_LIST
@@ -187,6 +191,9 @@ def test_main_loop_dir_overrides_all_bus_paths(tmp_path: Path, monkeypatch) -> N
     assert captured["archive_dir"] == expected_loop / "archive"
     assert captured["context_dir"] == expected_loop / "context"
     assert captured["module_map_file"] == expected_loop / "context" / "module_map.json"
+    assert captured["project_facts_file"] == expected_loop / "context" / "project_facts.md"
+    assert captured["pitfalls_file"] == expected_loop / "context" / "pitfalls.md"
+    assert captured["patterns_file"] == expected_loop / "context" / "patterns.jsonl"
     assert captured["state_file"] == expected_loop / "state.json"
     assert captured["task_card"] == expected_loop / "task_card.json"
     assert captured["fix_list"] == expected_loop / "fix_list.json"
@@ -205,10 +212,23 @@ def test_main_init_creates_prompt_templates_in_loop_dir(tmp_path: Path, monkeypa
     templates_dir = (tmp_path / "my-loop" / "templates").resolve()
     assert (templates_dir / "worker_prompt.txt").exists()
     assert (templates_dir / "reviewer_prompt.txt").exists()
+    worker_template = (templates_dir / "worker_prompt.txt").read_text(encoding="utf-8")
+    assert "{knowledge_section}" in worker_template
     module_map_path = (tmp_path / "my-loop" / "context" / "module_map.json").resolve()
     module_map = json.loads(module_map_path.read_text(encoding="utf-8"))
     assert module_map["files"] == []
     assert module_map["total_files"] == 0
+    project_facts = (tmp_path / "my-loop" / "context" / "project_facts.md").resolve()
+    pitfalls = (tmp_path / "my-loop" / "context" / "pitfalls.md").resolve()
+    patterns = (tmp_path / "my-loop" / "context" / "patterns.jsonl").resolve()
+    assert project_facts.exists()
+    assert pitfalls.exists()
+    assert patterns.exists()
+    assert "single-file rule" in project_facts.read_text(encoding="utf-8")
+    assert "lock stale after crash" in pitfalls.read_text(encoding="utf-8")
+    pattern_entry = json.loads(patterns.read_text(encoding="utf-8").strip())
+    assert pattern_entry["category"] == "example"
+    assert pattern_entry["confidence"] == 0.0
 
 
 def test_main_index_dispatches_to_cmd_index(monkeypatch) -> None:
@@ -897,7 +917,7 @@ def test_worker_prompt_round2_skips_agents_md_and_function_index(monkeypatch) ->
     assert "=== FIX LIST (round 2) ===" in prompt
     assert "[high] file.py: fix it" in prompt
     assert "work_report.json" in prompt
-    assert read_calls == ["code-writer.md"]
+    assert "code-writer.md" in read_calls
 
 
 def test_worker_prompt_round1_unchanged_includes_agents_and_function_index(monkeypatch) -> None:
@@ -1306,6 +1326,9 @@ def _configure_loop_paths(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(orchestrator, "TASK_PACKET", loop_dir / "task_packet.json")
     monkeypatch.setattr(orchestrator, "_CONTEXT_DIR", loop_dir / "context")
     monkeypatch.setattr(orchestrator, "_MODULE_MAP_FILE", loop_dir / "context" / "module_map.json")
+    monkeypatch.setattr(orchestrator, "_PROJECT_FACTS_FILE", loop_dir / "context" / "project_facts.md")
+    monkeypatch.setattr(orchestrator, "_PITFALLS_FILE", loop_dir / "context" / "pitfalls.md")
+    monkeypatch.setattr(orchestrator, "_PATTERNS_FILE", loop_dir / "context" / "patterns.jsonl")
     orchestrator._set_feed_task_id(None)
     (tmp_path / "AGENTS.md").write_text("AGENTS_CONTENT", encoding="utf-8")
     role_dir = tmp_path / "docs" / "roles"
@@ -3064,6 +3087,47 @@ class TestCmdStatus:
         assert "task_card.json: EXISTS" in out
         assert "work_report.json: missing" in out
 
+    def test_shows_context_file_stats(self, tmp_path: Path, monkeypatch, capsys) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        context_dir = tmp_path / ".loop" / "context"
+        context_dir.mkdir(parents=True, exist_ok=True)
+        (context_dir / "project_facts.md").write_text(
+            "# facts\n- single-file rule\n- subprocess-per-round\n",
+            encoding="utf-8",
+        )
+        (context_dir / "pitfalls.md").write_text("# pitfalls\n- stale lock\n", encoding="utf-8")
+        (context_dir / "patterns.jsonl").write_text(
+            json.dumps(
+                {
+                    "pattern": "fresh pattern",
+                    "category": "workflow",
+                    "confidence": 0.9,
+                    "last_verified": "2026-04-01T12:00:00Z",
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "pattern": "stale pattern",
+                    "category": "workflow",
+                    "confidence": 0.9,
+                    "last_verified": "2025-01-01T00:00:00Z",
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        orchestrator.cmd_status()
+        out = capsys.readouterr().out
+
+        assert "Context files:" in out
+        assert "project_facts.md: EXISTS (facts=2)" in out
+        assert "pitfalls.md: EXISTS (pitfalls=1)" in out
+        assert "patterns.jsonl: EXISTS (entries=2, high_confidence=1, stale=1)" in out
+
 
 class TestCmdHealth:
     def test_reports_both_roles(self, tmp_path: Path, monkeypatch, capsys) -> None:
@@ -4178,3 +4242,291 @@ class TestBuildTaskPacket:
 
         assert "=== TASK PACKET ===" in prompt
         assert "src/a.py" in prompt
+
+
+class TestKnowledgeLayer:
+    def test_worker_prompt_round1_injects_knowledge_section(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        context_dir = tmp_path / ".loop" / "context"
+        context_dir.mkdir(parents=True, exist_ok=True)
+        (context_dir / "project_facts.md").write_text(
+            "# facts\n- single-file rule\n- subprocess-per-round\n",
+            encoding="utf-8",
+        )
+        (context_dir / "pitfalls.md").write_text("# pitfalls\n- stale lock handling\n", encoding="utf-8")
+        now_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        stale_iso = (datetime.now(UTC) - timedelta(days=45)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        (context_dir / "patterns.jsonl").write_text(
+            json.dumps(
+                {
+                    "pattern": "fresh pattern",
+                    "category": "workflow",
+                    "confidence": 0.9,
+                    "last_verified": now_iso,
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "pattern": "low confidence pattern",
+                    "category": "workflow",
+                    "confidence": 0.2,
+                    "last_verified": now_iso,
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "pattern": "stale pattern",
+                    "category": "workflow",
+                    "confidence": 0.9,
+                    "last_verified": stale_iso,
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        prompt = orchestrator._worker_prompt("T-612", 1)
+
+        assert "=== KNOWLEDGE ===" in prompt
+        assert "single-file rule" in prompt
+        assert "stale lock handling" in prompt
+        assert "fresh pattern" in prompt
+        assert "low confidence pattern" not in prompt
+        assert "stale pattern" not in prompt
+
+    def test_worker_prompt_graceful_degradation_when_context_missing(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        prompt = orchestrator._worker_prompt("T-612", 1)
+        assert "=== KNOWLEDGE ===" in prompt
+        assert "=== KNOWLEDGE ===\n- <none>" in prompt
+
+    def test_patterns_staleness_governance_sets_confidence_zero(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        context_dir = tmp_path / ".loop" / "context"
+        context_dir.mkdir(parents=True, exist_ok=True)
+        stale_iso = (datetime.now(UTC) - timedelta(days=31)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        fresh_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        (context_dir / "patterns.jsonl").write_text(
+            json.dumps(
+                {
+                    "pattern": "stale pattern",
+                    "category": "quality",
+                    "confidence": 0.9,
+                    "last_verified": stale_iso,
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "pattern": "fresh pattern",
+                    "category": "quality",
+                    "confidence": 0.9,
+                    "last_verified": fresh_iso,
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        entries, stale_count = orchestrator._load_patterns_with_governance(persist=True)
+
+        assert stale_count == 1
+        by_pattern = {item["pattern"]: item for item in entries}
+        assert by_pattern["stale pattern"]["confidence"] == 0.0
+        assert by_pattern["fresh pattern"]["confidence"] == 0.9
+
+        persisted = [
+            json.loads(line)
+            for line in (context_dir / "patterns.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        persisted_by_pattern = {item["pattern"]: item for item in persisted}
+        assert persisted_by_pattern["stale pattern"]["confidence"] == 0.0
+
+    def test_update_knowledge_on_approval_uses_review_blocking_issues_only(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        orchestrator.WORK_REPORT.write_text(
+            json.dumps(
+                {
+                    "task_id": "T-612",
+                    "round": 1,
+                    "notes": "worker-only-notes must not be used for knowledge updates",
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        orchestrator.REVIEW_REPORT.write_text(
+            json.dumps(
+                {
+                    "task_id": "T-612",
+                    "round": 1,
+                    "decision": "approve",
+                    "blocking_issues": [
+                        {"severity": "high", "file": "src/loop_kit/orchestrator.py", "reason": "retry replace on nt"},
+                        {"severity": "medium", "file": "tests/test_orchestrator.py", "reason": "cover stale patterns"},
+                    ],
+                    "non_blocking_suggestions": [],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        orchestrator._update_knowledge_on_approval("T-612", 1)
+
+        pitfalls_text = (tmp_path / ".loop" / "context" / "pitfalls.md").read_text(encoding="utf-8")
+        assert "retry replace on nt" in pitfalls_text
+        assert "cover stale patterns" in pitfalls_text
+        assert "worker-only-notes" not in pitfalls_text
+
+        pattern_entries = [
+            json.loads(line)
+            for line in (tmp_path / ".loop" / "context" / "patterns.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        reasons = {entry["pattern"] for entry in pattern_entries}
+        assert "retry replace on nt" in reasons
+        assert "cover stale patterns" in reasons
+        for entry in pattern_entries:
+            if entry["pattern"] in reasons:
+                assert entry["category"] == "review_blocking_issue"
+
+    def test_single_round_updates_knowledge_only_on_approve(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        task_path = tmp_path / "task_input.json"
+        task_path.write_text(
+            json.dumps(
+                {
+                    "task_id": "T-612",
+                    "goal": "knowledge update hook",
+                    "in_scope": [],
+                    "out_of_scope": [],
+                    "acceptance_criteria": [],
+                    "constraints": [],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        orchestrator.STATE_FILE.write_text(
+            json.dumps(
+                {
+                    "state": orchestrator.STATE_AWAITING_WORK,
+                    "round": 1,
+                    "task_id": "T-612",
+                    "base_sha": "base-sha",
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        def fake_wait(path: Path, description: str, **kwargs) -> dict | None:
+            _ = (description, kwargs)
+            if path == orchestrator.WORK_REPORT:
+                return {
+                    "task_id": "T-612",
+                    "round": 1,
+                    "head_sha": "head-sha",
+                    "files_changed": ["src/loop_kit/orchestrator.py"],
+                    "tests": [],
+                    "notes": "done",
+                }
+            if path == orchestrator.REVIEW_REPORT:
+                return {
+                    "task_id": "T-612",
+                    "round": 1,
+                    "decision": "approve",
+                    "blocking_issues": [],
+                    "non_blocking_suggestions": [],
+                }
+            return None
+
+        calls: list[tuple[str, int]] = []
+
+        monkeypatch.setattr(orchestrator, "_wait_for_file", fake_wait)
+        monkeypatch.setattr(orchestrator, "_diff", lambda base, head: f"diff {base}->{head}")
+        monkeypatch.setattr(orchestrator, "_log_oneline", lambda base, head: f"log {base}->{head}")
+        monkeypatch.setattr(orchestrator, "_update_knowledge_on_approval", lambda task_id, round_num: calls.append((task_id, round_num)))
+
+        orchestrator.cmd_run(
+            _run_config(str(task_path)),
+            single_round=True,
+            round_num=1,
+        )
+
+        assert calls == [("T-612", 1)]
+
+    def test_single_round_does_not_update_knowledge_when_not_approved(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        task_path = tmp_path / "task_input.json"
+        task_path.write_text(
+            json.dumps(
+                {
+                    "task_id": "T-612",
+                    "goal": "knowledge update hook",
+                    "in_scope": [],
+                    "out_of_scope": [],
+                    "acceptance_criteria": [],
+                    "constraints": [],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        orchestrator.STATE_FILE.write_text(
+            json.dumps(
+                {
+                    "state": orchestrator.STATE_AWAITING_WORK,
+                    "round": 1,
+                    "task_id": "T-612",
+                    "base_sha": "base-sha",
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        def fake_wait(path: Path, description: str, **kwargs) -> dict | None:
+            _ = (description, kwargs)
+            if path == orchestrator.WORK_REPORT:
+                return {
+                    "task_id": "T-612",
+                    "round": 1,
+                    "head_sha": "head-sha",
+                    "files_changed": ["src/loop_kit/orchestrator.py"],
+                    "tests": [],
+                    "notes": "done",
+                }
+            if path == orchestrator.REVIEW_REPORT:
+                return {
+                    "task_id": "T-612",
+                    "round": 1,
+                    "decision": "changes_required",
+                    "blocking_issues": [{"severity": "high", "file": "x.py", "reason": "fix"}],
+                    "non_blocking_suggestions": [],
+                }
+            return None
+
+        calls: list[tuple[str, int]] = []
+
+        monkeypatch.setattr(orchestrator, "_wait_for_file", fake_wait)
+        monkeypatch.setattr(orchestrator, "_diff", lambda base, head: f"diff {base}->{head}")
+        monkeypatch.setattr(orchestrator, "_log_oneline", lambda base, head: f"log {base}->{head}")
+        monkeypatch.setattr(orchestrator, "_update_knowledge_on_approval", lambda task_id, round_num: calls.append((task_id, round_num)))
+
+        orchestrator.cmd_run(
+            _run_config(str(task_path)),
+            single_round=True,
+            round_num=1,
+        )
+
+        assert calls == []

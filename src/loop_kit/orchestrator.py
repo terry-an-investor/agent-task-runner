@@ -35,7 +35,7 @@ import types
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 if os.name == "nt":
@@ -76,6 +76,8 @@ EXIT_VALIDATION_ERROR = 3
 EXIT_DIRTY_WORKTREE = 4
 EXIT_LOCK_FAILURE = 5
 EXIT_INTERRUPTED = 130
+PATTERN_STALE_DAYS = 30
+PATTERN_HIGH_CONFIDENCE = 0.7
 _FEED_TASK_ID: str | None = None
 _LOGS_DIR_ENSURED = False
 _LOGS_DIR_ENSURED_PATH: str | None = None
@@ -103,6 +105,9 @@ _TASKS_DIR = LOOP_DIR / "tasks"
 TASK_PACKET = _path("task_packet.json")
 _CONTEXT_DIR = LOOP_DIR / "context"
 _MODULE_MAP_FILE = _CONTEXT_DIR / "module_map.json"
+_PROJECT_FACTS_FILE = _CONTEXT_DIR / "project_facts.md"
+_PITFALLS_FILE = _CONTEXT_DIR / "pitfalls.md"
+_PATTERNS_FILE = _CONTEXT_DIR / "patterns.jsonl"
 _RESETTABLE_FILES = [
     LOCK_FILE,
     STATE_FILE,
@@ -162,6 +167,9 @@ def _configure_loop_paths(loop_dir: str | Path = ".loop") -> None:
     global TASK_PACKET
     global _CONTEXT_DIR
     global _MODULE_MAP_FILE
+    global _PROJECT_FACTS_FILE
+    global _PITFALLS_FILE
+    global _PATTERNS_FILE
 
     LOOP_DIR = _resolve_loop_dir(loop_dir)
     LOGS_DIR = LOOP_DIR / "logs"
@@ -180,6 +188,9 @@ def _configure_loop_paths(loop_dir: str | Path = ".loop") -> None:
     TASK_PACKET = _path("task_packet.json")
     _CONTEXT_DIR = LOOP_DIR / "context"
     _MODULE_MAP_FILE = _CONTEXT_DIR / "module_map.json"
+    _PROJECT_FACTS_FILE = _CONTEXT_DIR / "project_facts.md"
+    _PITFALLS_FILE = _CONTEXT_DIR / "pitfalls.md"
+    _PATTERNS_FILE = _CONTEXT_DIR / "patterns.jsonl"
     _LOGS_DIR_ENSURED = False
     _LOGS_DIR_ENSURED_PATH = None
 
@@ -1552,6 +1563,174 @@ def _as_prompt_list(items: object) -> str:
     return "\n".join(f"- {item}" for item in items)
 
 
+def _strip_list_prefix(line: str) -> str:
+    stripped = line.strip()
+    if stripped.startswith("- "):
+        return stripped[2:].strip()
+    if stripped.startswith("* "):
+        return stripped[2:].strip()
+    return stripped
+
+
+def _read_markdown_knowledge_lines(path: Path) -> list[str]:
+    text = _read_text_optional(path)
+    if not text:
+        return []
+    lines: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or line.startswith("<!--"):
+            continue
+        normalized = _strip_list_prefix(line)
+        if normalized:
+            lines.append(normalized)
+    return lines
+
+
+def _parse_utc_iso8601(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _to_utc_iso8601(value: datetime) -> str:
+    return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _coerce_confidence(value: object, *, default: float = 0.0) -> float:
+    raw: float
+    if isinstance(value, bool):
+        raw = default
+    elif isinstance(value, int | float):
+        raw = float(value)
+    elif isinstance(value, str):
+        try:
+            raw = float(value.strip())
+        except ValueError:
+            raw = default
+    else:
+        raw = default
+    return max(0.0, min(1.0, raw))
+
+
+def _normalize_pattern_entry(
+    entry: object,
+    *,
+    now_utc: datetime,
+) -> tuple[dict | None, bool, bool]:
+    if not isinstance(entry, dict):
+        return None, False, False
+    pattern = entry.get("pattern")
+    category = entry.get("category")
+    if not isinstance(pattern, str) or not pattern.strip():
+        return None, False, False
+    if not isinstance(category, str) or not category.strip():
+        return None, False, False
+
+    parsed_verified = _parse_utc_iso8601(entry.get("last_verified"))
+    if parsed_verified is None:
+        last_verified = "1970-01-01T00:00:00Z"
+        stale = True
+    else:
+        last_verified = _to_utc_iso8601(parsed_verified)
+        stale = now_utc - parsed_verified > timedelta(days=PATTERN_STALE_DAYS)
+
+    confidence = _coerce_confidence(entry.get("confidence"), default=0.0)
+    if stale:
+        confidence = 0.0
+
+    normalized = {
+        "pattern": pattern.strip(),
+        "category": category.strip(),
+        "confidence": confidence,
+        "last_verified": last_verified,
+    }
+    changed = any(
+        (
+            entry.get("pattern") != normalized["pattern"],
+            entry.get("category") != normalized["category"],
+            entry.get("confidence") != normalized["confidence"],
+            entry.get("last_verified") != normalized["last_verified"],
+        )
+    )
+    return normalized, changed, stale
+
+
+def _write_patterns_jsonl(entries: list[dict]) -> None:
+    _PATTERNS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    payload = "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in entries)
+    _PATTERNS_FILE.write_text(payload, encoding="utf-8")
+
+
+def _load_patterns_with_governance(*, persist: bool = False) -> tuple[list[dict], int]:
+    text = _read_text_optional(_PATTERNS_FILE)
+    if not text:
+        return [], 0
+    now_utc = datetime.now(UTC)
+    entries: list[dict] = []
+    stale_count = 0
+    changed = False
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            raw_entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        normalized, entry_changed, stale = _normalize_pattern_entry(raw_entry, now_utc=now_utc)
+        if normalized is None:
+            continue
+        entries.append(normalized)
+        changed = changed or entry_changed
+        if stale:
+            stale_count += 1
+
+    if persist and changed:
+        _write_patterns_jsonl(entries)
+    return entries, stale_count
+
+
+def _format_pattern_prompt_line(entry: dict) -> str:
+    confidence = _coerce_confidence(entry.get("confidence"), default=0.0)
+    category = entry.get("category", "")
+    pattern = entry.get("pattern", "")
+    last_verified = entry.get("last_verified", "")
+    return f"[{confidence:.2f}] ({category}) {pattern} (verified {last_verified})"
+
+
+def _render_knowledge_section() -> str:
+    project_facts = _read_markdown_knowledge_lines(_PROJECT_FACTS_FILE)
+    active_pitfalls = _read_markdown_knowledge_lines(_PITFALLS_FILE)
+    patterns, _ = _load_patterns_with_governance(persist=False)
+    high_conf_patterns = [
+        _format_pattern_prompt_line(entry)
+        for entry in patterns
+        if _coerce_confidence(entry.get("confidence"), default=0.0) >= PATTERN_HIGH_CONFIDENCE
+    ]
+    if not project_facts and not active_pitfalls and not high_conf_patterns:
+        return "- <none>"
+    return (
+        "project_facts:\n"
+        f"{_as_prompt_list(project_facts)}\n\n"
+        "active_pitfalls:\n"
+        f"{_as_prompt_list(active_pitfalls)}\n\n"
+        "high_confidence_patterns:\n"
+        f"{_as_prompt_list(high_conf_patterns)}"
+    )
+
+
 _function_index_cache: tuple[tuple[int, float], str] | None = None
 
 
@@ -1584,12 +1763,7 @@ def _build_task_packet(task_card: dict, round_num: int) -> dict:
     acceptance_criteria = task_card.get("acceptance_criteria", [])
     acceptance_checks: list[str] = [c for c in acceptance_criteria if isinstance(c, str)]
 
-    known_risks: list[str] = []
-    pitfalls_path = _CONTEXT_DIR / "pitfalls.md"
-    if pitfalls_path.exists():
-        text = _read_text_optional(pitfalls_path)
-        if text:
-            known_risks = [line.strip() for line in text.splitlines() if line.strip()]
+    known_risks: list[str] = _read_markdown_knowledge_lines(_PITFALLS_FILE)
 
     if round_num > 1:
         fix_list = _read_json_if_exists(FIX_LIST)
@@ -1705,6 +1879,7 @@ DEFAULT_WORKER_PROMPT_TEMPLATE = (
     "=== BEGIN FUNCTION INDEX: {orchestrator_path} ===\n"
     "{function_index}\n"
     "=== END FUNCTION INDEX ===\n\n"
+    "=== KNOWLEDGE ===\n{knowledge_section}\n\n"
     "=== TASK PACKET ===\n{task_packet_section}\n\n"
     "{task_card_section}{prior_context_section}"
 )
@@ -1804,6 +1979,7 @@ def _render_task_packet_section() -> str:
 
 
 def _worker_prompt(task_id: str, round_num: int) -> str:
+    knowledge_section = _render_knowledge_section()
     if round_num > 1:
         role_text = _read_text_with_default(
             ROOT / "docs" / "roles" / "code-writer.md",
@@ -1819,6 +1995,7 @@ def _worker_prompt(task_id: str, round_num: int) -> str:
             "=== BEGIN docs/roles/code-writer.md ===\n"
             f"{role_text}\n"
             "=== END docs/roles/code-writer.md ===\n\n"
+            f"=== KNOWLEDGE ===\n{knowledge_section}\n\n"
             f"=== TASK PACKET ===\n{task_packet_section}\n\n"
             f"=== FIX LIST (round {round_num}) ===\n"
             f"fixes:\n{fix_list_section}\n\n"
@@ -1845,6 +2022,7 @@ def _worker_prompt(task_id: str, round_num: int) -> str:
         "role_md": role_text,
         "orchestrator_path": _display_path(orchestrator_path),
         "function_index": _function_index(orchestrator_path),
+        "knowledge_section": knowledge_section,
         "task_card_section": task_card_section,
         "prior_context_section": (f"\n{prior_context_section}" if prior_context_section else ""),
         "work_report_path": _display_path(WORK_REPORT),
@@ -2216,6 +2394,32 @@ def _empty_module_map() -> dict:
     }
 
 
+def _default_project_facts_content() -> str:
+    return (
+        "# Stable project facts\n"
+        "- single-file rule: all production logic lives in src/loop_kit/orchestrator.py\n"
+        "- subprocess-per-round: each review round runs in a dedicated subprocess\n"
+    )
+
+
+def _default_pitfalls_content() -> str:
+    return (
+        "# Known pitfalls\n"
+        "- lock stale after crash can be misleading; confirm no live orchestrator PID before manual cleanup\n"
+        "- Windows replace needs retry when antivirus/indexers hold short file locks\n"
+    )
+
+
+def _default_patterns_content() -> str:
+    example = {
+        "pattern": "Example: run uv tests after meaningful orchestrator edits",
+        "category": "example",
+        "confidence": 0.0,
+        "last_verified": _ts(),
+    }
+    return json.dumps(example, ensure_ascii=False) + "\n"
+
+
 def _parse_module_exports_and_docstring(text: str, rel_path: str) -> tuple[list[str], str]:
     try:
         tree = ast.parse(text, filename=rel_path)
@@ -2350,6 +2554,12 @@ def cmd_init() -> None:
     if not _MODULE_MAP_FILE.exists():
         _atomic_write_json(_MODULE_MAP_FILE, _empty_module_map())
         print(f"  Created: {_MODULE_MAP_FILE}")
+    if _write_template_if_missing(_PROJECT_FACTS_FILE, _default_project_facts_content()):
+        print(f"  Created: {_PROJECT_FACTS_FILE}")
+    if _write_template_if_missing(_PITFALLS_FILE, _default_pitfalls_content()):
+        print(f"  Created: {_PITFALLS_FILE}")
+    if _write_template_if_missing(_PATTERNS_FILE, _default_patterns_content()):
+        print(f"  Created: {_PATTERNS_FILE}")
     # copy example task card if not present
     example = LOOP_DIR / "examples" / "task_card.json"
     if not example.exists():
@@ -2394,6 +2604,32 @@ def cmd_status() -> None:
     for p in [TASK_CARD, WORK_REPORT, REVIEW_REQ, REVIEW_REPORT, FIX_LIST]:
         marker = "EXISTS" if p.exists() else "missing"
         print(f"  {p.name}: {marker}")
+    print()
+    project_facts = _read_markdown_knowledge_lines(_PROJECT_FACTS_FILE)
+    pitfalls = _read_markdown_knowledge_lines(_PITFALLS_FILE)
+    patterns, stale_count = _load_patterns_with_governance(persist=False)
+    high_conf_count = sum(
+        1 for entry in patterns if _coerce_confidence(entry.get("confidence"), default=0.0) >= PATTERN_HIGH_CONFIDENCE
+    )
+    print("Context files:")
+    print(
+        "  "
+        f"{_PROJECT_FACTS_FILE.name}: "
+        f"{'EXISTS' if _PROJECT_FACTS_FILE.exists() else 'missing'} "
+        f"(facts={len(project_facts)})"
+    )
+    print(
+        "  "
+        f"{_PITFALLS_FILE.name}: "
+        f"{'EXISTS' if _PITFALLS_FILE.exists() else 'missing'} "
+        f"(pitfalls={len(pitfalls)})"
+    )
+    print(
+        "  "
+        f"{_PATTERNS_FILE.name}: "
+        f"{'EXISTS' if _PATTERNS_FILE.exists() else 'missing'} "
+        f"(entries={len(patterns)}, high_confidence={high_conf_count}, stale={stale_count})"
+    )
     print()
     print("Heartbeats:")
     for role in ("worker", "reviewer"):
@@ -2632,6 +2868,78 @@ def _print_blocking_issues(items: list[dict]) -> None:
     print(f"  Blocking issues: {len(items)}")
     for issue in items:
         print(f"    - [{issue.get('severity', '?')}] {issue.get('file', '')}: {issue.get('reason', '')}")
+
+
+def _issue_to_pitfall_line(issue: dict) -> str | None:
+    severity = str(issue.get("severity", "?")).strip() or "?"
+    file_path = str(issue.get("file", "")).strip()
+    reason = str(issue.get("reason", "")).strip()
+    if not reason and not file_path:
+        return None
+    if file_path:
+        return f"[{severity}] {file_path}: {reason}".strip()
+    return f"[{severity}] {reason}".strip()
+
+
+def _append_pitfalls(lines: list[str]) -> int:
+    if not lines:
+        return 0
+    existing = _read_markdown_knowledge_lines(_PITFALLS_FILE)
+    seen = set(existing)
+    to_append: list[str] = []
+    for line in lines:
+        normalized = line.strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        to_append.append(normalized)
+    if not to_append:
+        return 0
+
+    current = _read_text_optional(_PITFALLS_FILE) or ""
+    if current and not current.endswith("\n"):
+        current += "\n"
+    current += "".join(f"- {line}\n" for line in to_append)
+    _PITFALLS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _PITFALLS_FILE.write_text(current, encoding="utf-8")
+    return len(to_append)
+
+
+def _update_knowledge_on_approval(task_id: str, round_num: int) -> None:
+    review = _read_json_if_exists(REVIEW_REPORT)
+    if not isinstance(review, dict):
+        return
+    if review.get("task_id") != task_id or review.get("round") != round_num:
+        return
+
+    raw_blocking = review.get("blocking_issues", [])
+    blocking_issues = [item for item in raw_blocking if isinstance(item, dict)] if isinstance(raw_blocking, list) else []
+    pitfall_lines = [line for issue in blocking_issues if (line := _issue_to_pitfall_line(issue))]
+    appended_pitfalls = _append_pitfalls(pitfall_lines)
+
+    existing_patterns, _ = _load_patterns_with_governance(persist=False)
+    now_iso = _to_utc_iso8601(datetime.now(UTC))
+    appended_patterns = 0
+    for issue in blocking_issues:
+        pattern_text = str(issue.get("reason", "")).strip()
+        if not pattern_text:
+            continue
+        category = str(issue.get("category", "review_blocking_issue")).strip() or "review_blocking_issue"
+        confidence = _coerce_confidence(issue.get("confidence"), default=1.0)
+        existing_patterns.append(
+            {
+                "pattern": pattern_text,
+                "category": category,
+                "confidence": confidence,
+                "last_verified": now_iso,
+            }
+        )
+        appended_patterns += 1
+    _write_patterns_jsonl(existing_patterns)
+    _log(
+        "Knowledge updated on approval: "
+        f"pitfalls+={appended_pitfalls}, patterns+={appended_patterns}, source=review_report.blocking_issues"
+    )
 
 
 def _run_single_round(
@@ -2898,6 +3206,10 @@ def _run_single_round(
     state["round_details"] = round_details
 
     if decision == "approve":
+        try:
+            _update_knowledge_on_approval(task_id, round_num)
+        except OSError as e:
+            _log(f"Warning: failed to update knowledge context on approval: {e}")
         state["state"] = STATE_DONE
         state["outcome"] = "approved"
         _save_single_round_state()
