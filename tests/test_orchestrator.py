@@ -429,8 +429,8 @@ def test_run_auto_dispatch_verbose_prints_all_stdout_lines(monkeypatch, capsys) 
     orchestrator._run_auto_dispatch("worker", "codex", "ignored", 30, verbose=True)
 
     out = capsys.readouterr().out
-    assert raw_lines[0].strip() in out
-    assert raw_lines[1].strip() in out
+    assert raw_lines[0].strip() not in out
+    assert raw_lines[1].strip() not in out
     assert "[worker] Message: hello" in out
 
 

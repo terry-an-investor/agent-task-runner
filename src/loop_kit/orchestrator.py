@@ -717,8 +717,6 @@ def _stream_dispatch_stdout_line(
 
     state_key = f"{role}:{backend}"
     line = raw_line.rstrip("\r\n")
-    if verbose:
-        print(line, flush=True)
     summary = parse_event_fn(role, backend, line)
     if not summary:
         read_state.pop(state_key, None)
