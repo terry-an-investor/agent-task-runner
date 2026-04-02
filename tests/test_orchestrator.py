@@ -4754,6 +4754,98 @@ class TestKnowledgeLayer:
         persisted_by_pattern = {item["pattern"]: item for item in persisted}
         assert persisted_by_pattern["stale pattern"]["confidence"] == 0.0
 
+    def test_append_pitfalls_enforces_max_lines_and_preserves_header_lines(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        monkeypatch.setattr(orchestrator, "_KNOWLEDGE_MAX_PITFALL_LINES", 3)
+        context_dir = tmp_path / ".loop" / "context"
+        context_dir.mkdir(parents=True, exist_ok=True)
+        (context_dir / "pitfalls.md").write_text(
+            "# Known pitfalls\n\n- old one\n- old two\n- old three\n",
+            encoding="utf-8",
+        )
+
+        appended = orchestrator._append_pitfalls(["new one", "new two"])
+
+        assert appended == 2
+        lines = (context_dir / "pitfalls.md").read_text(encoding="utf-8").splitlines()
+        assert lines[:2] == ["# Known pitfalls", ""]
+        assert [line for line in lines if line.startswith("- ")] == [
+            "- old three",
+            "- new one",
+            "- new two",
+        ]
+
+    def test_update_knowledge_on_approval_prunes_patterns_fifo(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        monkeypatch.setattr(orchestrator, "_KNOWLEDGE_MAX_PATTERNS", 3)
+        context_dir = tmp_path / ".loop" / "context"
+        context_dir.mkdir(parents=True, exist_ok=True)
+        now_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        (context_dir / "patterns.jsonl").write_text(
+            json.dumps(
+                {
+                    "pattern": "old-1",
+                    "category": "workflow",
+                    "confidence": 0.9,
+                    "last_verified": now_iso,
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "pattern": "old-2",
+                    "category": "workflow",
+                    "confidence": 0.9,
+                    "last_verified": now_iso,
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        orchestrator.REVIEW_REPORT.write_text(
+            json.dumps(
+                {
+                    "task_id": "T-612",
+                    "round": 2,
+                    "decision": "approve",
+                    "blocking_issues": [],
+                    "non_blocking_suggestions": [],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        archive_dir = tmp_path / ".loop" / "archive" / "T-612"
+        archive_dir.mkdir(parents=True)
+        (archive_dir / "r2_review_report.json").write_text(
+            json.dumps(
+                {
+                    "task_id": "T-612",
+                    "round": 1,
+                    "decision": "changes_required",
+                    "blocking_issues": [
+                        {"severity": "high", "file": "a.py", "reason": "new-1"},
+                        {"severity": "high", "file": "b.py", "reason": "new-2"},
+                        {"severity": "high", "file": "c.py", "reason": "new-3"},
+                    ],
+                    "non_blocking_suggestions": [],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        orchestrator._update_knowledge_on_approval("T-612", 2)
+
+        pattern_entries = [
+            json.loads(line)
+            for line in (context_dir / "patterns.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        assert [entry["pattern"] for entry in pattern_entries] == ["new-1", "new-2", "new-3"]
+
     def test_update_knowledge_on_approval_uses_review_blocking_issues_only(self, tmp_path: Path, monkeypatch) -> None:
         _configure_loop_paths(monkeypatch, tmp_path)
         orchestrator.WORK_REPORT.write_text(

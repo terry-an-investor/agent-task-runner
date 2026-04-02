@@ -79,6 +79,8 @@ EXIT_LOCK_FAILURE = 5
 EXIT_INTERRUPTED = 130
 PATTERN_STALE_DAYS = 30
 PATTERN_HIGH_CONFIDENCE = 0.7
+_KNOWLEDGE_MAX_PATTERNS = 200
+_KNOWLEDGE_MAX_PITFALL_LINES = 50
 _FEED_TASK_ID: str | None = None
 _LOGS_DIR_ENSURED = False
 _LOGS_DIR_ENSURED_PATH: str | None = None
@@ -3035,9 +3037,16 @@ def _append_pitfalls(lines: list[str]) -> int:
         return 0
 
     current = _read_text_optional(_PITFALLS_FILE) or ""
-    if current and not current.endswith("\n"):
+    merged_lines = current.splitlines() + [f"- {line}" for line in to_append]
+    non_pitfall_lines = [line for line in merged_lines if not line.startswith("- ")]
+    pitfall_lines = [line for line in merged_lines if line.startswith("- ")]
+    if _KNOWLEDGE_MAX_PITFALL_LINES <= 0:
+        pitfall_lines = []
+    elif len(pitfall_lines) > _KNOWLEDGE_MAX_PITFALL_LINES:
+        pitfall_lines = pitfall_lines[-_KNOWLEDGE_MAX_PITFALL_LINES:]
+    current = "\n".join(non_pitfall_lines + pitfall_lines)
+    if current:
         current += "\n"
-    current += "".join(f"- {line}\n" for line in to_append)
     _PITFALLS_FILE.parent.mkdir(parents=True, exist_ok=True)
     _PITFALLS_FILE.write_text(current, encoding="utf-8")
     return len(to_append)
@@ -3090,6 +3099,10 @@ def _update_knowledge_on_approval(task_id: str, round_num: int) -> None:
             }
         )
         appended_patterns += 1
+    if _KNOWLEDGE_MAX_PATTERNS <= 0:
+        existing_patterns = []
+    elif len(existing_patterns) > _KNOWLEDGE_MAX_PATTERNS:
+        existing_patterns = existing_patterns[-_KNOWLEDGE_MAX_PATTERNS:]
     _write_patterns_jsonl(existing_patterns)
     _log(
         "Knowledge updated on approval: "
