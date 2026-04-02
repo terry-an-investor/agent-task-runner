@@ -1191,6 +1191,20 @@ def _terminate_subprocess_on_interrupt(proc: subprocess.Popen[str], *, context: 
     _log(f"Interrupted by SIGINT; subprocess {status} ({context})")
 
 
+_PERMANENT_DISPATCH_PATTERNS: tuple[str, ...] = (
+    "not found",
+    "authentication",
+    "unauthorized",
+    "invalid api key",
+    "permission denied",
+)
+
+
+def _is_permanent_dispatch_error(stderr: str) -> bool:
+    lowered = stderr.lower()
+    return any(pattern in lowered for pattern in _PERMANENT_DISPATCH_PATTERNS)
+
+
 def _run_auto_dispatch(
     role: str,
     backend: str,
@@ -1301,6 +1315,12 @@ def _run_auto_dispatch(
             return
 
         stderr_text = (result.stderr or "").strip()
+        if _is_permanent_dispatch_error(stderr_text):
+            raise RuntimeError(
+                f"{role} dispatch failed with permanent error (backend={backend}, rc={result.returncode}): "
+                f"{stderr_text} — permanent error, not retrying."
+                + _dispatch_failure_hint(backend=backend, stderr=stderr_text)
+            )
         if attempt >= max_attempts:
             raise RuntimeError(
                 f"{role} dispatch failed (backend={backend}, rc={result.returncode}) "
