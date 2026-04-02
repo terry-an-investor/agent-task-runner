@@ -1280,6 +1280,8 @@ def _configure_loop_paths(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(orchestrator, "REVIEW_REQ", loop_dir / "review_request.json")
     monkeypatch.setattr(orchestrator, "REVIEW_REPORT", loop_dir / "review_report.json")
     monkeypatch.setattr(orchestrator, "LOCK_FILE", loop_dir / "lock")
+    monkeypatch.setattr(orchestrator, "TASK_PACKET", loop_dir / "task_packet.json")
+    monkeypatch.setattr(orchestrator, "_CONTEXT_DIR", loop_dir / "context")
     orchestrator._set_feed_task_id(None)
     (tmp_path / "AGENTS.md").write_text("AGENTS_CONTENT", encoding="utf-8")
     role_dir = tmp_path / "docs" / "roles"
@@ -3655,3 +3657,413 @@ class TestCmdStatusSummary:
         assert "Round: 0" in out
         assert "Task ID:" not in out
         assert "Outcome:" not in out
+
+
+class TestBuildTaskPacket:
+    def test_target_files_from_in_scope_glob(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        src = tmp_path / "src" / "loop_kit"
+        src.mkdir(parents=True)
+        (src / "orchestrator.py").write_text("def foo(): pass\n", encoding="utf-8")
+        (src / "utils.py").write_text("def bar(): pass\n", encoding="utf-8")
+
+        task_card = {
+            "goal": "test",
+            "in_scope": ["src/loop_kit/*.py"],
+            "acceptance_criteria": ["must pass tests"],
+            "constraints": ["no new dependencies"],
+        }
+
+        packet = orchestrator._build_task_packet(task_card, 1)
+
+        assert "src/loop_kit/orchestrator.py" in packet["target_files"]
+        assert "src/loop_kit/utils.py" in packet["target_files"]
+
+    def test_target_files_from_in_scope_exact_path(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        src = tmp_path / "src"
+        src.mkdir(parents=True)
+        (src / "main.py").write_text("def main(): pass\n", encoding="utf-8")
+
+        task_card = {
+            "goal": "test",
+            "in_scope": ["src/main.py"],
+            "acceptance_criteria": [],
+            "constraints": [],
+        }
+
+        packet = orchestrator._build_task_packet(task_card, 1)
+
+        assert "src/main.py" in packet["target_files"]
+
+    def test_target_symbols_from_function_index(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        src = tmp_path / "src"
+        src.mkdir(parents=True)
+        (src / "mod.py").write_text("def hello():\n    pass\n\nclass Greeter:\n    pass\n", encoding="utf-8")
+
+        task_card = {
+            "goal": "test",
+            "in_scope": ["src/mod.py"],
+            "acceptance_criteria": [],
+            "constraints": [],
+        }
+
+        packet = orchestrator._build_task_packet(task_card, 1)
+
+        assert any("def hello" in s for s in packet["target_symbols"])
+        assert any("class Greeter" in s for s in packet["target_symbols"])
+
+    def test_invariants_from_constraints(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+
+        task_card = {
+            "goal": "test",
+            "in_scope": [],
+            "acceptance_criteria": [],
+            "constraints": ["No new dependencies", "Python 3.11+"],
+        }
+
+        packet = orchestrator._build_task_packet(task_card, 1)
+
+        assert packet["invariants"] == ["No new dependencies", "Python 3.11+"]
+
+    def test_acceptance_checks_from_acceptance_criteria(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+
+        task_card = {
+            "goal": "test",
+            "in_scope": [],
+            "acceptance_criteria": ["All tests pass", "No lint errors"],
+            "constraints": [],
+        }
+
+        packet = orchestrator._build_task_packet(task_card, 1)
+
+        assert packet["acceptance_checks"] == ["All tests pass", "No lint errors"]
+
+    def test_known_risks_from_pitfalls_md(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        context_dir = tmp_path / ".loop" / "context"
+        context_dir.mkdir()
+        (context_dir / "pitfalls.md").write_text(
+            "Risk 1: circular imports\nRisk 2: race conditions\n", encoding="utf-8"
+        )
+
+        task_card = {
+            "goal": "test",
+            "in_scope": [],
+            "acceptance_criteria": [],
+            "constraints": [],
+        }
+
+        packet = orchestrator._build_task_packet(task_card, 1)
+
+        assert "Risk 1: circular imports" in packet["known_risks"]
+        assert "Risk 2: race conditions" in packet["known_risks"]
+
+    def test_known_risks_empty_without_pitfalls(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+
+        task_card = {
+            "goal": "test",
+            "in_scope": [],
+            "acceptance_criteria": [],
+            "constraints": [],
+        }
+
+        packet = orchestrator._build_task_packet(task_card, 1)
+
+        assert packet["known_risks"] == []
+
+    def test_commands_to_run_fixed_whitelist(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+
+        task_card = {
+            "goal": "test",
+            "in_scope": [],
+            "acceptance_criteria": [],
+            "constraints": [],
+        }
+
+        packet = orchestrator._build_task_packet(task_card, 1)
+
+        assert packet["commands_to_run"] == [
+            "uv run --group dev pytest",
+            "uv run python -m py_compile src/loop_kit/orchestrator.py",
+        ]
+
+    def test_round2_includes_fix_list_as_known_risks(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        orchestrator.FIX_LIST.write_text(
+            json.dumps(
+                {
+                    "task_id": "T-611",
+                    "round": 2,
+                    "fixes": [
+                        {"severity": "high", "file": "src/orchestrator.py", "reason": "fix type error"},
+                        {"severity": "medium", "file": "tests/test_orchestrator.py", "reason": "add test"},
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        task_card = {
+            "goal": "test",
+            "in_scope": [],
+            "acceptance_criteria": [],
+            "constraints": [],
+        }
+
+        packet = orchestrator._build_task_packet(task_card, 2)
+
+        assert "[high] src/orchestrator.py: fix type error" in packet["known_risks"]
+        assert "[medium] tests/test_orchestrator.py: add test" in packet["known_risks"]
+
+    def test_graceful_degradation_no_loop_context(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+
+        task_card = {
+            "goal": "test",
+            "in_scope": ["nonexistent/file.py"],
+            "acceptance_criteria": [],
+            "constraints": [],
+        }
+
+        packet = orchestrator._build_task_packet(task_card, 1)
+
+        assert packet["target_files"] == []
+        assert packet["target_symbols"] == []
+        assert packet["known_risks"] == []
+
+    def test_task_packet_written_before_dispatch(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+
+        task_path = tmp_path / "task_input.json"
+        task_path.write_text(
+            json.dumps(
+                {
+                    "task_id": "T-611",
+                    "goal": "packet test",
+                    "in_scope": [],
+                    "out_of_scope": [],
+                    "acceptance_criteria": ["criteria"],
+                    "constraints": ["constraint"],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        orchestrator.STATE_FILE.write_text(
+            json.dumps(
+                {
+                    "state": orchestrator.STATE_AWAITING_WORK,
+                    "round": 1,
+                    "task_id": "T-611",
+                    "base_sha": "base-sha",
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        def fake_wait(path: Path, description: str, **kwargs) -> dict | None:
+            _ = (description, kwargs)
+            if path == orchestrator.WORK_REPORT:
+                return {
+                    "task_id": "T-611",
+                    "round": 1,
+                    "head_sha": "head-sha",
+                    "files_changed": ["src/a.py"],
+                    "tests": [],
+                    "notes": "done",
+                }
+            if path == orchestrator.REVIEW_REPORT:
+                return {
+                    "task_id": "T-611",
+                    "round": 1,
+                    "decision": "approve",
+                    "blocking_issues": [],
+                    "non_blocking_suggestions": [],
+                }
+            return None
+
+        monkeypatch.setattr(orchestrator, "_wait_for_file", fake_wait)
+        monkeypatch.setattr(orchestrator, "_diff", lambda base, head: f"diff {base}->{head}")
+        monkeypatch.setattr(orchestrator, "_log_oneline", lambda base, head: f"log {base}->{head}")
+
+        orchestrator.cmd_run(
+            _run_config(str(task_path)),
+            single_round=True,
+            round_num=1,
+        )
+
+        assert orchestrator.TASK_PACKET.exists()
+        data = json.loads(orchestrator.TASK_PACKET.read_text(encoding="utf-8"))
+        assert "target_files" in data
+        assert "target_symbols" in data
+        assert "invariants" in data
+        assert data["invariants"] == ["constraint"]
+        assert "acceptance_checks" in data
+        assert data["acceptance_checks"] == ["criteria"]
+        assert "known_risks" in data
+        assert "commands_to_run" in data
+
+    def test_render_task_packet_section(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        orchestrator.TASK_PACKET.write_text(
+            json.dumps(
+                {
+                    "target_files": ["src/a.py"],
+                    "target_symbols": ["- L1: def foo()"],
+                    "invariants": ["no deps"],
+                    "acceptance_checks": ["tests pass"],
+                    "known_risks": ["risk 1"],
+                    "commands_to_run": ["cmd1", "cmd2"],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        section = orchestrator._render_task_packet_section()
+
+        assert "target_files:" in section
+        assert "src/a.py" in section
+        assert "target_symbols:" in section
+        assert "def foo" in section
+        assert "invariants:" in section
+        assert "no deps" in section
+        assert "acceptance_checks:" in section
+        assert "tests pass" in section
+        assert "known_risks:" in section
+        assert "risk 1" in section
+        assert "commands_to_run:" in section
+
+    def test_render_task_packet_section_empty(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+
+        section = orchestrator._render_task_packet_section()
+
+        assert section == "- <none>"
+
+    def test_worker_prompt_round1_includes_task_packet(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        orchestrator.TASK_PACKET.write_text(
+            json.dumps(
+                {
+                    "target_files": ["src/a.py"],
+                    "target_symbols": [],
+                    "invariants": [],
+                    "acceptance_checks": [],
+                    "known_risks": [],
+                    "commands_to_run": ["cmd"],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        def fake_read(path: Path) -> str | None:
+            if path.name == "AGENTS.md":
+                return "AGENTS_CONTENT"
+            if path.name == "code-writer.md":
+                return "CODE_WRITER_CONTENT"
+            if path == orchestrator._worker_prompt_template_path():
+                return orchestrator.DEFAULT_WORKER_PROMPT_TEMPLATE
+            return None
+
+        def fake_read_json(path: Path) -> dict | None:
+            if path == orchestrator.TASK_CARD:
+                return {
+                    "goal": "test",
+                    "in_scope": [],
+                    "out_of_scope": [],
+                    "acceptance_criteria": [],
+                    "constraints": [],
+                }
+            if path == orchestrator.TASK_PACKET:
+                return {
+                    "target_files": ["src/a.py"],
+                    "target_symbols": [],
+                    "invariants": [],
+                    "acceptance_checks": [],
+                    "known_risks": [],
+                    "commands_to_run": ["cmd"],
+                }
+            return None
+
+        monkeypatch.setattr(orchestrator, "_read_text_optional", fake_read)
+        monkeypatch.setattr(orchestrator, "_read_json_if_exists", fake_read_json)
+
+        prompt = orchestrator._worker_prompt("T-611", 1)
+
+        assert "=== TASK PACKET ===" in prompt
+        assert "src/a.py" in prompt
+
+    def test_worker_prompt_round2_includes_task_packet(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        orchestrator.TASK_PACKET.write_text(
+            json.dumps(
+                {
+                    "target_files": ["src/a.py"],
+                    "target_symbols": [],
+                    "invariants": [],
+                    "acceptance_checks": [],
+                    "known_risks": ["[high] file.py: fix it"],
+                    "commands_to_run": ["cmd"],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        def fake_read(path: Path) -> str | None:
+            if path.name == "code-writer.md":
+                return "CODE_WRITER_CONTENT"
+            if path == orchestrator._worker_prompt_template_path():
+                return orchestrator.DEFAULT_WORKER_PROMPT_TEMPLATE
+            return None
+
+        def fake_read_json(path: Path) -> dict | None:
+            if path == orchestrator.TASK_CARD:
+                return {
+                    "goal": "test",
+                    "in_scope": [],
+                    "out_of_scope": [],
+                    "acceptance_criteria": [],
+                    "constraints": [],
+                }
+            if path == orchestrator.TASK_PACKET:
+                return {
+                    "target_files": ["src/a.py"],
+                    "target_symbols": [],
+                    "invariants": [],
+                    "acceptance_checks": [],
+                    "known_risks": ["[high] file.py: fix it"],
+                    "commands_to_run": ["cmd"],
+                }
+            if path == orchestrator.WORK_REPORT:
+                return {"notes": "prev", "files_changed": ["file.py"]}
+            if path == orchestrator.REVIEW_REPORT:
+                return {
+                    "blocking_issues": [{"severity": "high", "file": "file.py", "reason": "fix it"}],
+                    "non_blocking_suggestions": [],
+                }
+            if path == orchestrator.FIX_LIST:
+                return {
+                    "task_id": "T-611",
+                    "round": 2,
+                    "fixes": [{"severity": "high", "file": "file.py", "reason": "fix it"}],
+                }
+            return None
+
+        monkeypatch.setattr(orchestrator, "_read_text_optional", fake_read)
+        monkeypatch.setattr(orchestrator, "_read_json_if_exists", fake_read_json)
+
+        prompt = orchestrator._worker_prompt("T-611", 2)
+
+        assert "=== TASK PACKET ===" in prompt
+        assert "src/a.py" in prompt

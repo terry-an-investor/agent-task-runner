@@ -98,6 +98,8 @@ LOCK_FILE = _path("lock")
 _SUMMARY_FILE = _path("summary.json")
 _CONFIG_FILE = _path("config.json")
 _TASKS_DIR = LOOP_DIR / "tasks"
+TASK_PACKET = _path("task_packet.json")
+_CONTEXT_DIR = LOOP_DIR / "context"
 _RESETTABLE_FILES = [
     LOCK_FILE,
     STATE_FILE,
@@ -107,6 +109,7 @@ _RESETTABLE_FILES = [
     REVIEW_REQ,
     FIX_LIST,
     TASK_CARD,
+    TASK_PACKET,
 ]
 
 
@@ -153,6 +156,8 @@ def _configure_loop_paths(loop_dir: str | Path = ".loop") -> None:
     global _TASKS_DIR
     global _LOGS_DIR_ENSURED
     global _LOGS_DIR_ENSURED_PATH
+    global TASK_PACKET
+    global _CONTEXT_DIR
 
     LOOP_DIR = _resolve_loop_dir(loop_dir)
     LOGS_DIR = LOOP_DIR / "logs"
@@ -168,6 +173,8 @@ def _configure_loop_paths(loop_dir: str | Path = ".loop") -> None:
     _SUMMARY_FILE = LOOP_DIR / "summary.json"
     _CONFIG_FILE = LOOP_DIR / "config.json"
     _TASKS_DIR = LOOP_DIR / "tasks"
+    TASK_PACKET = _path("task_packet.json")
+    _CONTEXT_DIR = LOOP_DIR / "context"
     _LOGS_DIR_ENSURED = False
     _LOGS_DIR_ENSURED_PATH = None
 
@@ -1543,6 +1550,69 @@ def _as_prompt_list(items: object) -> str:
 _function_index_cache: tuple[tuple[int, float], str] | None = None
 
 
+def _build_task_packet(task_card: dict, round_num: int) -> dict:
+    in_scope = task_card.get("in_scope", [])
+    target_files: list[str] = []
+    for item in in_scope:
+        if not isinstance(item, str):
+            continue
+        matched = sorted(p.relative_to(ROOT).as_posix() for p in ROOT.glob(item) if p.is_file())
+        if matched:
+            target_files.extend(matched)
+        else:
+            resolved = (ROOT / item).resolve()
+            if resolved.is_file():
+                target_files.append(resolved.relative_to(ROOT).as_posix())
+
+    target_symbols: list[str] = []
+    for filepath in target_files:
+        index_text = _function_index(ROOT / filepath)
+        if index_text and index_text != "- <none>" and index_text != "- <unavailable>":
+            for line in index_text.splitlines():
+                stripped = line.strip()
+                if stripped:
+                    target_symbols.append(stripped)
+
+    constraints = task_card.get("constraints", [])
+    invariants: list[str] = [c for c in constraints if isinstance(c, str)]
+
+    acceptance_criteria = task_card.get("acceptance_criteria", [])
+    acceptance_checks: list[str] = [c for c in acceptance_criteria if isinstance(c, str)]
+
+    known_risks: list[str] = []
+    pitfalls_path = _CONTEXT_DIR / "pitfalls.md"
+    if pitfalls_path.exists():
+        text = _read_text_optional(pitfalls_path)
+        if text:
+            known_risks = [line.strip() for line in text.splitlines() if line.strip()]
+
+    if round_num > 1:
+        fix_list = _read_json_if_exists(FIX_LIST)
+        if isinstance(fix_list, dict):
+            fixes = fix_list.get("fixes", [])
+            if isinstance(fixes, list):
+                for issue in fixes:
+                    if isinstance(issue, dict):
+                        severity = issue.get("severity", "?")
+                        file = issue.get("file", "")
+                        reason = issue.get("reason", "")
+                        known_risks.append(f"[{severity}] {file}: {reason}")
+
+    commands_to_run = [
+        "uv run --group dev pytest",
+        "uv run python -m py_compile src/loop_kit/orchestrator.py",
+    ]
+
+    return {
+        "target_files": target_files,
+        "target_symbols": target_symbols,
+        "invariants": invariants,
+        "acceptance_checks": acceptance_checks,
+        "known_risks": known_risks,
+        "commands_to_run": commands_to_run,
+    }
+
+
 def _function_index(path: Path) -> str:
     global _function_index_cache
     try:
@@ -1630,6 +1700,7 @@ DEFAULT_WORKER_PROMPT_TEMPLATE = (
     "=== BEGIN FUNCTION INDEX: {orchestrator_path} ===\n"
     "{function_index}\n"
     "=== END FUNCTION INDEX ===\n\n"
+    "=== TASK PACKET ===\n{task_packet_section}\n\n"
     "{task_card_section}{prior_context_section}"
 )
 
@@ -1707,6 +1778,26 @@ def _render_fix_list_section(round_num: int) -> str:
     return "\n".join(lines) if lines else "- <none>"
 
 
+def _render_task_packet_section() -> str:
+    packet = _read_json_if_exists(TASK_PACKET)
+    if not isinstance(packet, dict):
+        return "- <none>"
+    lines = []
+    target_files = packet.get("target_files", [])
+    lines.append(f"target_files:\n{_as_prompt_list(target_files)}")
+    target_symbols = packet.get("target_symbols", [])
+    lines.append(f"target_symbols:\n{_as_prompt_list(target_symbols)}")
+    invariants = packet.get("invariants", [])
+    lines.append(f"invariants:\n{_as_prompt_list(invariants)}")
+    acceptance_checks = packet.get("acceptance_checks", [])
+    lines.append(f"acceptance_checks:\n{_as_prompt_list(acceptance_checks)}")
+    known_risks = packet.get("known_risks", [])
+    lines.append(f"known_risks:\n{_as_prompt_list(known_risks)}")
+    commands_to_run = packet.get("commands_to_run", [])
+    lines.append(f"commands_to_run:\n{_as_prompt_list(commands_to_run)}")
+    return "\n\n".join(lines)
+
+
 def _worker_prompt(task_id: str, round_num: int) -> str:
     if round_num > 1:
         role_text = _read_text_with_default(
@@ -1715,6 +1806,7 @@ def _worker_prompt(task_id: str, round_num: int) -> str:
         )
         fix_list_section = _render_fix_list_section(round_num)
         prior_context = _render_prior_round_context_section(round_num)
+        task_packet_section = _render_task_packet_section()
         return (
             "Role: code-writer worker for PM loop.\n"
             f"Current task_id: {task_id}, round: {round_num}.\n"
@@ -1722,6 +1814,7 @@ def _worker_prompt(task_id: str, round_num: int) -> str:
             "=== BEGIN docs/roles/code-writer.md ===\n"
             f"{role_text}\n"
             "=== END docs/roles/code-writer.md ===\n\n"
+            f"=== TASK PACKET ===\n{task_packet_section}\n\n"
             f"=== FIX LIST (round {round_num}) ===\n"
             f"fixes:\n{fix_list_section}\n\n"
             f"{prior_context if prior_context else ''}"
@@ -1739,6 +1832,7 @@ def _worker_prompt(task_id: str, round_num: int) -> str:
     task_card = _read_json_if_exists(TASK_CARD)
     task_card_section = _render_task_card_section(task_card if isinstance(task_card, dict) else {})
     prior_context_section = _render_prior_round_context_section(round_num)
+    task_packet_section = _render_task_packet_section()
     context = {
         "task_id": task_id,
         "round_num": str(round_num),
@@ -1749,6 +1843,7 @@ def _worker_prompt(task_id: str, round_num: int) -> str:
         "task_card_section": task_card_section,
         "prior_context_section": (f"\n{prior_context_section}" if prior_context_section else ""),
         "work_report_path": _display_path(WORK_REPORT),
+        "task_packet_section": task_packet_section,
     }
     return _render_prompt_template(
         template_path=_worker_prompt_template_path(),
@@ -2483,6 +2578,12 @@ def _run_single_round(
     state["round"] = round_num
     state["state"] = STATE_AWAITING_WORK
     _save_single_round_state()
+
+    task_packet = _build_task_packet(task_card, round_num)
+    TASK_PACKET.write_text(
+        json.dumps(task_packet, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
 
     worker_prompt = _worker_prompt(task_id, round_num)
     _prepare_bus_file(WORK_REPORT, task_id, round_num, "work_report")
