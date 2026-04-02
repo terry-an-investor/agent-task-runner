@@ -865,8 +865,76 @@ def _resolve_exe_from_candidates(*, backend: str, candidates: list[str | None]) 
     raise RuntimeError(f"Cannot find executable for backend={backend}")
 
 
+_TOOL_READ_NAMES = frozenset({"read", "Read", "read_file"})
+_TOOL_EDIT_NAMES = frozenset({"write", "Edit", "edit_file"})
+_TOOL_WRITE_NAMES = frozenset({"Write", "write_file"})
+_TOOL_BASH_NAMES = frozenset({"bash", "shell", "Bash"})
+_TOOL_SEARCH_NAMES = frozenset({"Glob", "Grep"})
+_TOOL_FETCH_NAMES = frozenset({"WebFetch", "WebSearch"})
+
+
+def _tool_action_summary(role: str, tool_name: str, tool_input: dict | None) -> str | None:
+    """Map a tool invocation to a human-readable stream summary.
+
+    Shared by backends that expose tool-use events (claude, opencode).
+    Returns ``None`` for unrecognized tools.
+    """
+    inp = tool_input if isinstance(tool_input, dict) else {}
+    if tool_name in _TOOL_READ_NAMES:
+        fp = inp.get("filePath", "") or inp.get("file_path", "")
+        return f"[{role}] Reading: {_short_filename(str(fp))}" if fp else f"[{role}] Reading file"
+    if tool_name in _TOOL_EDIT_NAMES:
+        fp = inp.get("filePath", "") or inp.get("file_path", "")
+        return f"[{role}] Editing: {_short_filename(str(fp))}" if fp else f"[{role}] Editing files"
+    if tool_name in _TOOL_WRITE_NAMES:
+        fp = inp.get("filePath", "") or inp.get("file_path", "")
+        return f"[{role}] Writing: {_short_filename(str(fp))}" if fp else f"[{role}] Writing file"
+    if tool_name in _TOOL_BASH_NAMES:
+        cmd_text = inp.get("command", "")
+        return f"[{role}] Running: {_truncate_summary_text(str(cmd_text))}" if cmd_text else f"[{role}] Running command"
+    if tool_name in _TOOL_SEARCH_NAMES:
+        pattern = inp.get("pattern", "")
+        return f"[{role}] Searching: {pattern}" if pattern else f"[{role}] Searching files"
+    if tool_name in _TOOL_FETCH_NAMES:
+        detail = inp.get("url", "") or inp.get("query", "")
+        return f"[{role}] Fetching: {detail[:80]}" if detail else f"[{role}] Fetching"
+    if tool_name:
+        return f"[{role}] Tool: {tool_name}"
+    return None
+
+
 def _claude_parse_event(role: str, backend: str, line: str) -> str | None:
-    _ = (role, backend, line)
+    _ = backend
+    try:
+        payload = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    event_type = payload.get("type")
+    if event_type == "system":
+        if payload.get("subtype") == "init":
+            session_id = payload.get("session_id", "")
+            return f"[{role}] Session: {session_id}" if session_id else f"[{role}] Session started"
+        return None
+    if event_type == "assistant":
+        message = payload.get("message")
+        if not isinstance(message, dict):
+            return None
+        for block in message.get("content", []):
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text":
+                text = block.get("text", "")
+                if isinstance(text, str) and text.strip():
+                    return f"[{role}] Message: {_truncate_summary_text(text)}"
+            if block.get("type") == "tool_use":
+                summary = _tool_action_summary(role, block.get("name", ""), block.get("input"))
+                if summary:
+                    return summary
+        return None
+    if event_type == "result":
+        return f"[{role}] Session completed"
     return None
 
 
@@ -931,6 +999,9 @@ def _build_claude_command(exe: str, prompt: str) -> tuple[list[str], str | None,
         [
             exe,
             "-p",
+            "--output-format",
+            "stream-json",
+            "--verbose",
             "--dangerously-skip-permissions",
             "--session-id",
             sid,
@@ -1022,30 +1093,10 @@ def _opencode_parse_event(role: str, backend: str, line: str) -> str | None:
     if event_type == "tool_use":
         state = part.get("state")
         tool_name = part.get("tool", "")
-        if not isinstance(state, dict):
+        if not isinstance(state, dict) or state.get("status") == "error":
             return None
-        status = state.get("status")
-        inp = state.get("input")
-        if status == "error":
-            return None
-        if tool_name == "write" and isinstance(inp, dict):
-            fp = inp.get("filePath", "")
-            if fp:
-                return f"[{role}] Editing: {_short_filename(str(fp))}"
-            return f"[{role}] Editing files"
-        if tool_name == "read" and isinstance(inp, dict):
-            fp = inp.get("filePath", "")
-            if fp:
-                return f"[{role}] Reading: {_short_filename(str(fp))}"
-            return f"[{role}] Reading file"
-        if tool_name in ("bash", "shell") and isinstance(inp, dict):
-            cmd_text = inp.get("command", "")
-            if cmd_text:
-                return f"[{role}] Running: {_truncate_summary_text(str(cmd_text))}"
-            return f"[{role}] Running command"
-        if tool_name:
-            return f"[{role}] Tool: {tool_name}"
-        return None
+        summary = _tool_action_summary(role, tool_name, state.get("input"))
+        return summary
     if event_type == "step_finish":
         return f"[{role}] Step completed"
     return None

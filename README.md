@@ -2,7 +2,7 @@
 
 PM-driven review-loop orchestrator for AI coding agents.
 
-agent-task-runner runs a multi-round review loop: a **Worker** writes code, a **Reviewer** checks it, and the loop repeats until approval or max rounds. It supports OpenAI Codex and Anthropic Claude as worker/reviewer backends, with automatic dispatch and real-time streaming output.
+agent-task-runner runs a multi-round review loop: a **Worker** writes code, a **Reviewer** checks it, and the loop repeats until approval or max rounds. It ships with built-in support for **OpenAI Codex**, **Anthropic Claude**, and **OpenCode** as worker/reviewer backends, with automatic dispatch and real-time streaming output. Need something different? Use `register_backend()` to plug in your own — no core modifications required.
 
 ## Quick Start
 
