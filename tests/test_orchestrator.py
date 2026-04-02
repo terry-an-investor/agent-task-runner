@@ -438,7 +438,8 @@ def test_run_auto_dispatch_timeout_kills_and_waits_process(monkeypatch) -> None:
 
     assert proc.terminate_called is True
     assert proc.wait_called is True
-    assert "try --dispatch-timeout 900" in str(exc.value)
+    assert "Backend codex timed out." in str(exc.value)
+    assert "(current: 30s)" in str(exc.value)
 
 
 def test_run_auto_dispatch_timeout_still_triggers_when_stdin_write_blocks(monkeypatch) -> None:
@@ -827,6 +828,7 @@ def test_run_auto_dispatch_retry_exhaustion_raises_final_failure(monkeypatch) ->
         )
 
     assert "after 3 attempts" in str(exc.value)
+    assert "(backend=codex, rc=3)" in str(exc.value)
     assert len(popen_calls) == 3
     assert sleep_calls == [5, 10]
 
@@ -864,6 +866,7 @@ def test_run_auto_dispatch_permanent_error_fails_fast_without_retrying(monkeypat
 
     assert "permanent error, not retrying" in str(exc.value)
     assert "authentication failed" in str(exc.value)
+    assert "(backend=codex, rc=1)" in str(exc.value)
     assert len(popen_calls) == 1
     assert sleep_calls == []
 
@@ -3058,20 +3061,35 @@ class TestCodexEventSummary:
 
 class TestDispatchFailureHint:
     def test_timeout_hint(self) -> None:
-        result = orchestrator._dispatch_failure_hint(backend="codex", stderr="", timeout=True)
-        assert "--dispatch-timeout" in result
+        result = orchestrator._dispatch_failure_hint(backend="codex", stderr="", timeout=True, timeout_sec=45)
+        assert "Backend codex timed out. Try increasing --dispatch-timeout (current: 45s)." in result
 
-    def test_auth_hint_codex(self) -> None:
+    def test_auth_hint(self) -> None:
         result = orchestrator._dispatch_failure_hint(backend="codex", stderr="Error: unauthorized 401")
-        assert "codex API key" in result
-
-    def test_auth_hint_claude(self) -> None:
-        result = orchestrator._dispatch_failure_hint(backend="claude", stderr="auth token expired")
-        assert "claude authentication" in result
+        assert "Authentication failed for codex. Check your API key / token configuration." in result
 
     def test_not_found_hint(self) -> None:
         result = orchestrator._dispatch_failure_hint(backend="codex", stderr="codex: command not found")
-        assert "executable path" in result
+        assert "Backend codex not found. Run `codex --version` to verify installation." in result
+
+    def test_not_recognized_hint(self) -> None:
+        result = orchestrator._dispatch_failure_hint(
+            backend="codex",
+            stderr="'codex' is not recognized as an internal or external command",
+        )
+        assert "Backend codex not found. Run `codex --version` to verify installation." in result
+
+    def test_rate_limit_hint(self) -> None:
+        result = orchestrator._dispatch_failure_hint(backend="codex", stderr="rate limit exceeded (429)")
+        assert "codex rate limit hit. Wait a moment or increase --dispatch-timeout." in result
+
+    def test_timeout_hint_from_stderr(self) -> None:
+        result = orchestrator._dispatch_failure_hint(
+            backend="codex",
+            stderr="request timed out",
+            timeout_sec=120,
+        )
+        assert "Backend codex timed out. Try increasing --dispatch-timeout (current: 120s)." in result
 
     def test_fallback_hint(self) -> None:
         result = orchestrator._dispatch_failure_hint(backend="codex", stderr="unknown error")

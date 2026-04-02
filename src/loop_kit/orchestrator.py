@@ -1240,20 +1240,26 @@ def _write_dispatch_log(
         f.write("-" * 60 + "\n")
 
 
-def _dispatch_failure_hint(*, backend: str, stderr: str, timeout: bool = False) -> str:
+def _dispatch_failure_hint(
+    *,
+    backend: str,
+    stderr: str,
+    timeout: bool = False,
+    timeout_sec: int | None = None,
+) -> str:
     hints: list[str] = []
     lowered = stderr.lower()
-    if timeout:
-        hints.append("try --dispatch-timeout 900.")
-    if any(token in lowered for token in ("auth", "unauthorized", "401", "api key", "token")):
-        if backend == BACKEND_CODEX:
-            hints.append("check codex API key/login.")
-        elif backend == BACKEND_CLAUDE:
-            hints.append("check claude authentication/session.")
-        else:
-            hints.append("check backend authentication.")
-    if any(token in lowered for token in ("not found", "no such file", "cannot find")):
-        hints.append("verify backend executable path and installation.")
+    effective_timeout_sec = DEFAULT_DISPATCH_TIMEOUT_SEC if timeout_sec is None else timeout_sec
+    if any(token in lowered for token in ("command not found", "not recognized")):
+        hints.append(f"Backend {backend} not found. Run `{backend} --version` to verify installation.")
+    if any(token in lowered for token in ("authentication", "api key", "unauthorized", "401", "403")):
+        hints.append(f"Authentication failed for {backend}. Check your API key / token configuration.")
+    if any(token in lowered for token in ("rate limit", "429", "quota")):
+        hints.append(f"{backend} rate limit hit. Wait a moment or increase --dispatch-timeout.")
+    if timeout or any(token in lowered for token in ("timeout", "timed out")):
+        hints.append(
+            f"Backend {backend} timed out. Try increasing --dispatch-timeout (current: {effective_timeout_sec}s)."
+        )
     if not hints:
         hints.append("check backend auth/network and retry.")
     return " Remediation: " + " ".join(hints)
@@ -1541,7 +1547,12 @@ def _run_auto_dispatch(
                 )
                 raise DispatchTimeoutError(
                     f"{role} dispatch timeout after {timeout_sec}s (backend={backend})."
-                    + _dispatch_failure_hint(backend=backend, stderr=stderr or "", timeout=True)
+                    + _dispatch_failure_hint(
+                        backend=backend,
+                        stderr=stderr or "",
+                        timeout=True,
+                        timeout_sec=timeout_sec,
+                    )
                 )
             result = _completed_proc(
                 cmd,
@@ -1575,13 +1586,21 @@ def _run_auto_dispatch(
                 raise RuntimeError(
                     f"{role} dispatch failed with permanent error (backend={backend}, rc={result.returncode}): "
                     f"{stderr_text} — permanent error, not retrying."
-                    + _dispatch_failure_hint(backend=backend, stderr=stderr_text)
+                    + _dispatch_failure_hint(
+                        backend=backend,
+                        stderr=stderr_text,
+                        timeout_sec=timeout_sec,
+                    )
                 )
             if attempt >= max_attempts:
                 raise RuntimeError(
                     f"{role} dispatch failed (backend={backend}, rc={result.returncode}) "
                     f"after {attempt} attempts: {stderr_text}"
-                    + _dispatch_failure_hint(backend=backend, stderr=stderr_text)
+                    + _dispatch_failure_hint(
+                        backend=backend,
+                        stderr=stderr_text,
+                        timeout_sec=timeout_sec,
+                    )
                 )
             retry_delay = min(MAX_DISPATCH_RETRY_DELAY_SEC, retry_base_sec * (2 ** (attempt - 1)))
             _log(
