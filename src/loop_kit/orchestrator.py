@@ -57,6 +57,7 @@ DEFAULT_DISPATCH_RETRIES = 2
 DEFAULT_DISPATCH_RETRY_BASE_SEC = 5
 MAX_DISPATCH_RETRY_DELAY_SEC = 60
 DEFAULT_GIT_TIMEOUT_SEC = 30
+_STALE_STATE_KEYS = ("outcome", "failed_at", "error", "head_sha", "round_details")
 BACKEND_CODEX = "codex"
 BACKEND_CLAUDE = "claude"
 BACKEND_OPENCODE = "opencode"
@@ -1515,8 +1516,8 @@ def _dispatch_with_artifact_fallback(
     if artifact_path.exists():
         data = _read_json_if_exists(artifact_path)
         if isinstance(data, dict) and data.get("task_id") == task_id and data.get("round") == round_num:
-                _log(f"{role} dispatch produced {artifact_path.name} directly; skipping wait")
-                return data
+            _log(f"{role} dispatch produced {artifact_path.name} directly; skipping wait")
+            return data
     return _require_dispatch_artifact(
         role=role,
         path=artifact_path,
@@ -1968,73 +1969,58 @@ def _enforce_clean_worktree_or_exit(*, allow_dirty: bool) -> None:
     sys.exit(EXIT_DIRTY_WORKTREE)
 
 
-def _validate_work_report(
-    work: dict,
+def _validate_report(
+    report: dict,
     *,
     expected_task_id: str,
     expected_round: int,
+    schema: str,
 ) -> str | None:
-    required_types: dict[str, type] = {
-        "task_id": str,
-        "head_sha": str,
-        "round": int,
-    }
+    if schema == "work_report":
+        required_types: dict[str, type] = {
+            "task_id": str,
+            "head_sha": str,
+            "round": int,
+        }
+        prefix = "work_report"
+    elif schema == "review_report":
+        required_types = {
+            "task_id": str,
+            "round": int,
+            "decision": str,
+        }
+        prefix = "review_report"
+    else:
+        raise ValueError(f"Unknown schema: {schema}")
+
     for field_name, typ in required_types.items():
-        if field_name not in work:
-            return f"work_report.json missing required field '{field_name}'"
-        value = work[field_name]
+        if field_name not in report:
+            return f"{prefix} missing required field '{field_name}'"
+        value = report[field_name]
         if typ is int:
             if type(value) is not int:
-                return f"work_report field '{field_name}' must be int, got {type(value).__name__}"
+                return f"{prefix} field '{field_name}' must be int, got {type(value).__name__}"
         elif not isinstance(value, typ):
-            return f"work_report field '{field_name}' must be {typ.__name__}, got {type(value).__name__}"
+            return f"{prefix} field '{field_name}' must be {typ.__name__}, got {type(value).__name__}"
         if typ is str and not value.strip():
-            return f"work_report field '{field_name}' must be non-empty"
+            return f"{prefix} field '{field_name}' must be non-empty"
 
-    for list_field in ("files_changed", "tests"):
-        if list_field in work and not isinstance(work[list_field], list):
-            return f"work_report field '{list_field}' must be a list, got {type(work[list_field]).__name__}"
+    if schema == "work_report":
+        for list_field in ("files_changed", "tests"):
+            if list_field in report and not isinstance(report[list_field], list):
+                return f"{prefix} field '{list_field}' must be a list, got {type(report[list_field]).__name__}"
+    elif schema == "review_report":
+        if report["decision"] not in {"approve", "changes_required"}:
+            return (
+                f"{prefix} field 'decision' must be one of "
+                "{{'approve', 'changes_required'}}, "
+                f"got {report['decision']!r}"
+            )
 
-    if work["task_id"] != expected_task_id:
-        return f"work_report field 'task_id' mismatch: expected {expected_task_id!r}, got {work['task_id']!r}"
-    if work["round"] != expected_round:
-        return f"work_report field 'round' mismatch: expected {expected_round}, got {work['round']!r}"
-    return None
-
-
-def _validate_review_report(
-    review: dict,
-    *,
-    expected_task_id: str,
-    expected_round: int,
-) -> str | None:
-    required_types: dict[str, type] = {
-        "task_id": str,
-        "round": int,
-        "decision": str,
-    }
-    for field_name, typ in required_types.items():
-        if field_name not in review:
-            return f"review_report.json missing required field '{field_name}'"
-        value = review[field_name]
-        if typ is int:
-            if type(value) is not int:
-                return f"review_report field '{field_name}' must be int, got {type(value).__name__}"
-        elif not isinstance(value, typ):
-            return f"review_report field '{field_name}' must be {typ.__name__}, got {type(value).__name__}"
-        if typ is str and not value.strip():
-            return f"review_report field '{field_name}' must be non-empty"
-
-    if review["decision"] not in {"approve", "changes_required"}:
-        return (
-            "review_report field 'decision' must be one of "
-            "{'approve', 'changes_required'}, "
-            f"got {review['decision']!r}"
-        )
-    if review["task_id"] != expected_task_id:
-        return f"review_report field 'task_id' mismatch: expected {expected_task_id!r}, got {review['task_id']!r}"
-    if review["round"] != expected_round:
-        return f"review_report field 'round' mismatch: expected {expected_round}, got {review['round']!r}"
+    if report["task_id"] != expected_task_id:
+        return f"{prefix} field 'task_id' mismatch: expected {expected_task_id!r}, got {report['task_id']!r}"
+    if report["round"] != expected_round:
+        return f"{prefix} field 'round' mismatch: expected {expected_round}, got {report['round']!r}"
     return None
 
 
@@ -2490,7 +2476,7 @@ def _run_single_round(
     _log(f"Goal: {task_card.get('goal', '<no goal>')}")
     _log(f"Single-round state contract: task_id={task_id} base_sha={base_sha}")
 
-    _clean_stale_state(state, "outcome", "failed_at", "error")
+    _clean_stale_state(state, *_STALE_STATE_KEYS[:3])
     if not isinstance(state.get("round_details"), list):
         state["round_details"] = []
     state["started_at"] = _ts()
@@ -2543,10 +2529,11 @@ def _run_single_round(
         _save_single_round_state()
         sys.exit(EXIT_TIMEOUT)
 
-    report_error = _validate_work_report(
+    report_error = _validate_report(
         work,
         expected_task_id=task_id,
         expected_round=round_num,
+        schema="work_report",
     )
     if report_error:
         _fail_single_round(
@@ -2644,10 +2631,11 @@ def _run_single_round(
         _save_single_round_state()
         sys.exit(EXIT_TIMEOUT)
 
-    review_error = _validate_review_report(
+    review_error = _validate_report(
         review,
         expected_task_id=task_id,
         expected_round=round_num,
+        schema="review_report",
     )
     if review_error:
         _fail_single_round(
@@ -2758,7 +2746,7 @@ def _run_multi_round_via_subprocess(
         _log(f"Base SHA: {base_sha}")
 
         state = _load_state()
-        _clean_stale_state(state, "outcome", "failed_at", "error", "head_sha", "round_details")
+        _clean_stale_state(state, *_STALE_STATE_KEYS)
         state.update(
             {
                 "state": STATE_AWAITING_WORK,
@@ -2809,7 +2797,7 @@ def _run_multi_round_via_subprocess(
         _set_feed_task_id(task_id)
         _log(f"Resuming task: {task_id}")
         _log(f"Resume contract: base_sha={base_sha} round={start_round}")
-        _clean_stale_state(state, "outcome", "failed_at", "error", "head_sha")
+        _clean_stale_state(state, *_STALE_STATE_KEYS[:4])
         if not isinstance(state.get("round_details"), list):
             state["round_details"] = []
         state["state"] = STATE_AWAITING_WORK

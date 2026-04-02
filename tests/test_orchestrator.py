@@ -2735,67 +2735,145 @@ class TestWriteTemplateIfMissing:
 # ── CLI commands and state ──────────────────────────────────────────
 
 
-class TestValidateWorkReport:
-    def test_valid_report(self) -> None:
+class TestValidateReport:
+    def test_valid_work_report(self) -> None:
         work = {"task_id": "T-1", "head_sha": "abc", "round": 1}
-        assert orchestrator._validate_work_report(work, expected_task_id="T-1", expected_round=1) is None
-
-    def test_missing_field(self) -> None:
-        assert "missing required field" in (
-            orchestrator._validate_work_report({}, expected_task_id="T-1", expected_round=1) or ""
-        )
-
-    def test_wrong_type_int(self) -> None:
-        work = {"task_id": "T-1", "head_sha": "abc", "round": "1"}
-        assert "must be int" in (
-            orchestrator._validate_work_report(work, expected_task_id="T-1", expected_round=1) or ""
-        )
-
-    def test_empty_string(self) -> None:
-        work = {"task_id": "  ", "head_sha": "abc", "round": 1}
-        assert "non-empty" in (orchestrator._validate_work_report(work, expected_task_id="T-1", expected_round=1) or "")
-
-    def test_task_id_mismatch(self) -> None:
-        work = {"task_id": "T-2", "head_sha": "abc", "round": 1}
-        assert "mismatch" in (orchestrator._validate_work_report(work, expected_task_id="T-1", expected_round=1) or "")
-
-    def test_round_mismatch(self) -> None:
-        work = {"task_id": "T-1", "head_sha": "abc", "round": 2}
-        assert "mismatch" in (orchestrator._validate_work_report(work, expected_task_id="T-1", expected_round=1) or "")
-
-
-class TestValidateReviewReport:
-    def test_valid_report(self) -> None:
-        review = {"task_id": "T-1", "round": 1, "decision": "approve"}
         assert (
-            orchestrator._validate_review_report(
-                review,
+            orchestrator._validate_report(
+                work,
                 expected_task_id="T-1",
                 expected_round=1,
+                schema="work_report",
             )
             is None
         )
 
-    def test_missing_field(self) -> None:
+    def test_valid_review_report(self) -> None:
+        review = {"task_id": "T-1", "round": 1, "decision": "approve"}
+        assert (
+            orchestrator._validate_report(
+                review,
+                expected_task_id="T-1",
+                expected_round=1,
+                schema="review_report",
+            )
+            is None
+        )
+
+    def test_work_report_missing_field(self) -> None:
         assert "missing required field" in (
-            orchestrator._validate_review_report(
+            orchestrator._validate_report(
                 {},
                 expected_task_id="T-1",
                 expected_round=1,
+                schema="work_report",
             )
             or ""
         )
 
-    def test_invalid_decision(self) -> None:
-        review = {"task_id": "T-1", "round": 1, "decision": "maybe"}
-        assert "must be one of" in (
-            orchestrator._validate_review_report(
-                review,
+    def test_review_report_missing_field(self) -> None:
+        assert "missing required field" in (
+            orchestrator._validate_report(
+                {},
                 expected_task_id="T-1",
                 expected_round=1,
+                schema="review_report",
             )
             or ""
         )
+
+    def test_work_report_wrong_type_int(self) -> None:
+        work = {"task_id": "T-1", "head_sha": "abc", "round": "1"}
+        assert "must be int" in (
+            orchestrator._validate_report(
+                work,
+                expected_task_id="T-1",
+                expected_round=1,
+                schema="work_report",
+            )
+            or ""
+        )
+
+    def test_work_report_empty_string(self) -> None:
+        work = {"task_id": "  ", "head_sha": "abc", "round": 1}
+        assert "non-empty" in (
+            orchestrator._validate_report(
+                work,
+                expected_task_id="T-1",
+                expected_round=1,
+                schema="work_report",
+            )
+            or ""
+        )
+
+    def test_work_report_task_id_mismatch(self) -> None:
+        work = {"task_id": "T-2", "head_sha": "abc", "round": 1}
+        assert "mismatch" in (
+            orchestrator._validate_report(
+                work,
+                expected_task_id="T-1",
+                expected_round=1,
+                schema="work_report",
+            )
+            or ""
+        )
+
+    def test_work_report_round_mismatch(self) -> None:
+        work = {"task_id": "T-1", "head_sha": "abc", "round": 2}
+        assert "mismatch" in (
+            orchestrator._validate_report(
+                work,
+                expected_task_id="T-1",
+                expected_round=1,
+                schema="work_report",
+            )
+            or ""
+        )
+
+    def test_review_report_invalid_decision(self) -> None:
+        review = {"task_id": "T-1", "round": 1, "decision": "maybe"}
+        assert "must be one of" in (
+            orchestrator._validate_report(
+                review,
+                expected_task_id="T-1",
+                expected_round=1,
+                schema="review_report",
+            )
+            or ""
+        )
+
+    def test_review_report_task_id_mismatch(self) -> None:
+        review = {"task_id": "T-2", "round": 1, "decision": "approve"}
+        assert "mismatch" in (
+            orchestrator._validate_report(
+                review,
+                expected_task_id="T-1",
+                expected_round=1,
+                schema="review_report",
+            )
+            or ""
+        )
+
+    def test_work_report_list_fields_must_be_lists(self) -> None:
+        work = {"task_id": "T-1", "head_sha": "abc", "round": 1, "files_changed": "not a list"}
+        assert "must be a list" in (
+            orchestrator._validate_report(
+                work,
+                expected_task_id="T-1",
+                expected_round=1,
+                schema="work_report",
+            )
+            or ""
+        )
+
+    def test_unknown_schema_raises_value_error(self) -> None:
+        with pytest.raises(ValueError, match="Unknown schema"):
+            orchestrator._validate_report(
+                {},
+                expected_task_id="T-1",
+                expected_round=1,
+                schema="unknown",
+            )
 
 
 class TestLoadState:
