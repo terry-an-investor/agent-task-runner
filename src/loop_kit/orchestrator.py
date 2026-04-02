@@ -713,12 +713,28 @@ def _stream_dispatch_stdout_line(
         read_state = {}
         _stream_local.read_state = read_state
 
+    session_state = getattr(_stream_local, "session_state", None)
+    if session_state is None:
+        session_state = {}
+        _stream_local.session_state = session_state
+
     state_key = f"{role}:{backend}"
     line = raw_line.rstrip("\r\n")
     summary = parse_event_fn(role, backend, line)
     if not summary:
         read_state.pop(state_key, None)
         return
+
+    if " Step completed" in summary or " Turn completed" in summary or " Turn started" in summary:
+        read_state.pop(state_key, None)
+        return
+
+    if summary.startswith(f"[{role}] Session:"):
+        session_id = summary.split("Session:", 1)[1].strip()
+        if session_state.get(role) == session_id:
+            read_state.pop(state_key, None)
+            return
+        session_state[role] = session_id
 
     read_summary: str | None = None
     try:
@@ -740,8 +756,11 @@ def _stream_dispatch_stdout_line(
         read_state[state_key] = read_summary
         return
 
+    if read_state.get(state_key) == summary:
+        return
+
     print(summary, flush=True)
-    read_state.pop(state_key, None)
+    read_state[state_key] = summary
 
 
 BackendBuildFn = Callable[[str, str], tuple[list[str], str | None, str | None]]
