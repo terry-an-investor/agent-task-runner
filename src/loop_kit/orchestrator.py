@@ -258,11 +258,18 @@ class _LoopLock:
                 handle.write(b"\0")
                 handle.flush()
             handle.seek(0)
-            _lock_file(handle)
         except OSError as e:
             handle.close()
             raise RuntimeError(f"another orchestrator instance is already running ({self.path})") from e
-        self._handle = handle
+        try:
+            _lock_file(handle)
+            self._handle = handle
+        except OSError as e:
+            handle.close()
+            raise RuntimeError(f"another orchestrator instance is already running ({self.path})") from e
+        except Exception:
+            handle.close()
+            raise
 
     def release(self) -> None:
         handle = self._handle
@@ -293,11 +300,14 @@ def _acquire_run_lock() -> _LoopLock:
     lock.acquire()
     return lock
 
+
 def _heartbeat_path(role: str) -> Path:
     return RUNTIME_DIR / f"{role}.heartbeat.json"
 
+
 def _dispatch_log_path(role: str) -> Path:
     return LOGS_DIR / f"{role}_dispatch.log"
+
 
 def _feed_log_path() -> Path:
     return LOGS_DIR / "feed.jsonl"
@@ -363,6 +373,8 @@ def _read_json_if_exists(path: Path) -> dict | None:
         return json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as e:
         _log(f"Warning: {path.name} has invalid JSON: {e}")
+        return None
+    except OSError:
         return None
 
 def _heartbeat_age_sec(path: Path, now: float | None = None) -> float | None:
@@ -634,51 +646,53 @@ def _codex_event_summary(role: str, backend: str, line: str) -> str | None:
     return None
 
 
-def _stream_dispatch_stdout_line(role: str, backend: str, raw_line: str, *, verbose: bool) -> None:
-    def _extract_read_filename(command_text: str) -> str | None:
-        command = _strip_powershell_wrapper(command_text)
-        if not command:
-            return None
-        try:
-            import shlex
+def _extract_read_filename(command_text: str) -> str | None:
+    command = _strip_powershell_wrapper(command_text)
+    if not command:
+        return None
+    try:
+        import shlex
 
-            tokens = shlex.split(command, posix=False)
-        except ValueError:
-            tokens = command.split()
-        if not tokens:
-            return None
-        if tokens[0] == "&" and len(tokens) > 1:
-            tokens = tokens[1:]
-        if not tokens:
-            return None
-        first = _strip_outer_quotes(tokens[0]).replace("\\", "/").split("/")[-1].lower()
-        if first not in {"get-content", "cat"}:
-            return None
+        tokens = shlex.split(command, posix=False)
+    except ValueError:
+        tokens = command.split()
+    if not tokens:
+        return None
+    if tokens[0] == "&" and len(tokens) > 1:
+        tokens = tokens[1:]
+    if not tokens:
+        return None
+    first = _strip_outer_quotes(tokens[0]).replace("\\", "/").split("/")[-1].lower()
+    if first not in {"get-content", "cat"}:
+        return None
 
-        path_token = ""
-        idx = 1
-        while idx < len(tokens):
-            token = tokens[idx]
-            lowered = token.lower()
-            if first == "get-content" and lowered in {"-path", "-literalpath"}:
-                if idx + 1 < len(tokens):
-                    path_token = tokens[idx + 1]
-                break
-            if lowered.startswith("-"):
-                idx += 1
-                continue
-            path_token = token
+    path_token = ""
+    idx = 1
+    while idx < len(tokens):
+        token = tokens[idx]
+        lowered = token.lower()
+        if first == "get-content" and lowered in {"-path", "-literalpath"}:
+            if idx + 1 < len(tokens):
+                path_token = tokens[idx + 1]
             break
-        if not path_token:
-            return None
-        cleaned = _strip_outer_quotes(path_token).strip().strip("\"'").rstrip(";,")
-        if "|" in cleaned:
-            cleaned = cleaned.split("|", 1)[0].strip()
-        if not cleaned:
-            return None
-        normalized = cleaned.replace("\\", "/").rstrip("/")
-        name = normalized.split("/")[-1] if normalized else ""
-        return name or cleaned
+        if lowered.startswith("-"):
+            idx += 1
+            continue
+        path_token = token
+        break
+    if not path_token:
+        return None
+    cleaned = _strip_outer_quotes(path_token).strip().strip("\"'").rstrip(";,")
+    if "|" in cleaned:
+        cleaned = cleaned.split("|", 1)[0].strip()
+    if not cleaned:
+        return None
+    normalized = cleaned.replace("\\", "/").rstrip("/")
+    name = normalized.split("/")[-1] if normalized else ""
+    return name or cleaned
+
+
+def _stream_dispatch_stdout_line(role: str, backend: str, raw_line: str, *, verbose: bool) -> None:
 
     read_state = getattr(_stream_local, "read_state", None)
     if read_state is None:
@@ -881,9 +895,9 @@ def _report_dispatch_result(
     attempt: int,
     max_attempts: int,
     session_id: str | None = None,
+    stdout_len: int | None = None,
     timeout_sec: int | None = None,
-    include_session_id: bool = False,
-    include_output_lengths: bool = False,
+    interrupted: bool = False,
 ) -> None:
     _write_dispatch_log(role, cmd, result, session_id)
     data = {
@@ -896,11 +910,12 @@ def _report_dispatch_result(
     }
     if timeout_sec is not None:
         data["timeout_sec"] = timeout_sec
-    if include_session_id:
+    if session_id is not None:
         data["session_id"] = session_id
-    if include_output_lengths:
-        data["stdout_len"] = len(result.stdout or "")
-        data["stderr_len"] = len(result.stderr or "")
+    if stdout_len is not None:
+        data["stdout_len"] = stdout_len
+    if interrupted:
+        data["interrupted"] = True
     _feed_event(
         "dispatch_summary",
         level=("info" if timeout_sec is None and result.returncode == 0 else "error"),
@@ -1038,7 +1053,8 @@ def _terminate_subprocess_on_interrupt(proc: subprocess.Popen[str], *, context: 
         proc.wait()
     except OSError:
         pass
-    _log(f"Interrupted by SIGINT; terminated subprocess ({context})")
+    status = "terminated" if is_running else "already exited"
+    _log(f"Interrupted by SIGINT; subprocess {status} ({context})")
 
 
 def _run_auto_dispatch(
@@ -1085,17 +1101,21 @@ def _run_auto_dispatch(
                 proc,
                 context=f"auto-dispatch role={role} backend={backend} attempt={attempt}",
             )
-            _feed_event(
-                "dispatch_summary",
-                level="error",
-                data={
-                    "role": role,
-                    "mode": DISPATCH_BACKEND_NATIVE,
-                    "backend": backend,
-                    "interrupted": True,
-                    "attempt": attempt,
-                    "max_attempts": max_attempts,
-                },
+            _report_dispatch_result(
+                role=role,
+                backend=backend,
+                cmd=cmd,
+                result=_completed_proc(
+                    cmd,
+                    proc.returncode,
+                    "",
+                    "",
+                    default_returncode=130,
+                ),
+                attempt=attempt,
+                max_attempts=max_attempts,
+                session_id=cmd_sid,
+                interrupted=True,
             )
             raise
         if timed_out:
@@ -1140,8 +1160,7 @@ def _run_auto_dispatch(
             attempt=attempt,
             max_attempts=max_attempts,
             session_id=session_id,
-            include_session_id=True,
-            include_output_lengths=True,
+            stdout_len=len(result.stdout or ""),
         )
 
         if result.returncode == 0:
@@ -1221,10 +1240,11 @@ def _dispatch_with_artifact_fallback(
         timeout_sec=timeout_sec,
     )
 
+
 def _read_text_optional(path: Path) -> str | None:
     try:
         return path.read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return None
 
 
@@ -1812,8 +1832,7 @@ def _single_round_subprocess_cmd(
     return cmd
 
 
-def _print_round_header(round_num: int, role: str, config: RunConfig) -> None:
-    _ = config
+def _print_round_header(round_num: int, role: str) -> None:
     title = role.capitalize()
     print(f"\n{'='*60}")
     print(f"  ROUND {round_num}  —  Awaiting {title}")
@@ -1967,7 +1986,7 @@ def _run_single_round(
     _prepare_bus_file(WORK_REPORT, task_id, round_num, "work_report")
     _prepare_bus_file(REVIEW_REPORT, task_id, round_num, "review_report")
 
-    _print_round_header(round_num, "worker", config)
+    _print_round_header(round_num, "worker")
 
     work: dict | None = None
     try:
@@ -2070,7 +2089,7 @@ def _run_single_round(
     state["head_sha"] = head_sha
     _save_single_round_state()
 
-    _print_round_header(round_num, "reviewer", config)
+    _print_round_header(round_num, "reviewer")
 
     review: dict | None = None
     try:
