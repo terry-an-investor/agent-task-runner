@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import builtins
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -164,6 +165,8 @@ def test_main_loop_dir_overrides_all_bus_paths(tmp_path: Path, monkeypatch) -> N
         captured["logs_dir"] = orchestrator.LOGS_DIR
         captured["runtime_dir"] = orchestrator.RUNTIME_DIR
         captured["archive_dir"] = orchestrator.ARCHIVE_DIR
+        captured["context_dir"] = orchestrator._CONTEXT_DIR
+        captured["module_map_file"] = orchestrator._MODULE_MAP_FILE
         captured["state_file"] = orchestrator.STATE_FILE
         captured["task_card"] = orchestrator.TASK_CARD
         captured["fix_list"] = orchestrator.FIX_LIST
@@ -182,6 +185,8 @@ def test_main_loop_dir_overrides_all_bus_paths(tmp_path: Path, monkeypatch) -> N
     assert captured["logs_dir"] == expected_loop / "logs"
     assert captured["runtime_dir"] == expected_loop / "runtime"
     assert captured["archive_dir"] == expected_loop / "archive"
+    assert captured["context_dir"] == expected_loop / "context"
+    assert captured["module_map_file"] == expected_loop / "context" / "module_map.json"
     assert captured["state_file"] == expected_loop / "state.json"
     assert captured["task_card"] == expected_loop / "task_card.json"
     assert captured["fix_list"] == expected_loop / "fix_list.json"
@@ -200,6 +205,24 @@ def test_main_init_creates_prompt_templates_in_loop_dir(tmp_path: Path, monkeypa
     templates_dir = (tmp_path / "my-loop" / "templates").resolve()
     assert (templates_dir / "worker_prompt.txt").exists()
     assert (templates_dir / "reviewer_prompt.txt").exists()
+    module_map_path = (tmp_path / "my-loop" / "context" / "module_map.json").resolve()
+    module_map = json.loads(module_map_path.read_text(encoding="utf-8"))
+    assert module_map["files"] == []
+    assert module_map["total_files"] == 0
+
+
+def test_main_index_dispatches_to_cmd_index(monkeypatch) -> None:
+    called = {"index": False}
+
+    def fake_cmd_index() -> None:
+        called["index"] = True
+
+    monkeypatch.setattr(orchestrator, "cmd_index", fake_cmd_index)
+    monkeypatch.setattr(sys, "argv", ["orchestrator.py", "index"])
+
+    orchestrator.main()
+
+    assert called["index"] is True
 
 
 def test_register_backend_allows_custom_backend_in_run_cli(monkeypatch) -> None:
@@ -1282,6 +1305,7 @@ def _configure_loop_paths(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(orchestrator, "LOCK_FILE", loop_dir / "lock")
     monkeypatch.setattr(orchestrator, "TASK_PACKET", loop_dir / "task_packet.json")
     monkeypatch.setattr(orchestrator, "_CONTEXT_DIR", loop_dir / "context")
+    monkeypatch.setattr(orchestrator, "_MODULE_MAP_FILE", loop_dir / "context" / "module_map.json")
     orchestrator._set_feed_task_id(None)
     (tmp_path / "AGENTS.md").write_text("AGENTS_CONTENT", encoding="utf-8")
     role_dir = tmp_path / "docs" / "roles"
@@ -1302,6 +1326,93 @@ def _configure_loop_paths(monkeypatch, tmp_path: Path) -> None:
 
 def _run_config(task_path: str, **overrides: object) -> orchestrator.RunConfig:
     return orchestrator.RunConfig(task_path=task_path, **overrides)
+
+
+def test_cmd_index_generates_module_map_with_expected_shape(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+    src = tmp_path / "src" / "loop_kit"
+    nested = src / "pkg"
+    nested.mkdir(parents=True, exist_ok=True)
+    alpha_text = (
+        '"""Alpha module docs.\n'
+        "More details.\"\"\"\n\n"
+        "def hello():\n"
+        "    pass\n\n"
+        "class Greeter:\n"
+        "    pass\n"
+    )
+    alpha_path = src / "alpha.py"
+    alpha_path.write_text(alpha_text, encoding="utf-8")
+    beta_text = "async def run():\n    return None\n"
+    beta_path = nested / "beta.py"
+    beta_path.write_text(beta_text, encoding="utf-8")
+
+    orchestrator.cmd_index()
+
+    module_map = json.loads(orchestrator._MODULE_MAP_FILE.read_text(encoding="utf-8"))
+    assert isinstance(module_map.get("generated_at"), str) and module_map["generated_at"]
+    assert module_map["total_files"] == 2
+
+    files = module_map["files"]
+    assert isinstance(files, list)
+    by_path = {entry["path"]: entry for entry in files}
+    assert sorted(by_path) == ["src/loop_kit/alpha.py", "src/loop_kit/pkg/beta.py"]
+
+    alpha = by_path["src/loop_kit/alpha.py"]
+    assert alpha["docstring"] == "Alpha module docs."
+    assert any(item.startswith("def hello:L") for item in alpha["exports"])
+    assert any(item.startswith("class Greeter:L") for item in alpha["exports"])
+    assert alpha["loc"] == len(alpha_text.splitlines())
+    assert alpha["size_bytes"] == alpha_path.stat().st_size
+    assert alpha["last_modified"] == alpha_path.stat().st_mtime_ns
+
+    beta = by_path["src/loop_kit/pkg/beta.py"]
+    assert beta["docstring"] == ""
+    assert beta["exports"] == ["async def run:L1"]
+    assert beta["loc"] == len(beta_text.splitlines())
+    assert beta["size_bytes"] == beta_path.stat().st_size
+    assert beta["last_modified"] == beta_path.stat().st_mtime_ns
+
+
+def test_cmd_index_incremental_reuses_unchanged_entries(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+    src = tmp_path / "src" / "loop_kit"
+    src.mkdir(parents=True, exist_ok=True)
+    alpha_path = src / "alpha.py"
+    beta_path = src / "beta.py"
+    alpha_path.write_text("def alpha():\n    pass\n", encoding="utf-8")
+    beta_path.write_text("def beta():\n    pass\n", encoding="utf-8")
+
+    orchestrator.cmd_index()
+    first_map = json.loads(orchestrator._MODULE_MAP_FILE.read_text(encoding="utf-8"))
+    first_by_path = {entry["path"]: entry for entry in first_map["files"]}
+
+    updated_beta = "def beta():\n    return 1\n"
+    beta_path.write_text(updated_beta, encoding="utf-8")
+    old_beta_mtime = first_by_path["src/loop_kit/beta.py"]["last_modified"]
+    os.utime(beta_path, ns=(old_beta_mtime + 1_000_000_000, old_beta_mtime + 1_000_000_000))
+
+    calls: list[str] = []
+    real_index = orchestrator._index_module_file
+
+    def spy_index(path: Path, rel_path: str, stat_result) -> dict:
+        _ = path
+        _ = stat_result
+        calls.append(rel_path)
+        return real_index(path, rel_path, stat_result)
+
+    monkeypatch.setattr(orchestrator, "_index_module_file", spy_index)
+    orchestrator.cmd_index()
+
+    second_map = json.loads(orchestrator._MODULE_MAP_FILE.read_text(encoding="utf-8"))
+    second_by_path = {entry["path"]: entry for entry in second_map["files"]}
+
+    assert calls == ["src/loop_kit/beta.py"]
+    assert second_by_path["src/loop_kit/alpha.py"] == first_by_path["src/loop_kit/alpha.py"]
+    assert second_by_path["src/loop_kit/beta.py"]["loc"] == len(updated_beta.splitlines())
+    assert second_by_path["src/loop_kit/beta.py"]["last_modified"] != first_by_path["src/loop_kit/beta.py"][
+        "last_modified"
+    ]
 
 
 def test_archive_bus_file_copies_to_round_path(tmp_path: Path, monkeypatch) -> None:

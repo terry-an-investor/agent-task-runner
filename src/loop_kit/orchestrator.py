@@ -3,6 +3,7 @@ PM-driven review loop orchestrator.
 
 Usage:
     loop init                                    # create .loop/ dirs
+    loop index                                   # build offline module map
     loop run --task .loop/task_card.json         # full loop
     loop status                                  # show current state
     loop archive --task-id T-604                 # list archived bus files
@@ -18,6 +19,7 @@ All messages are JSON. Git commits are the single source of truth.
 """
 
 import argparse
+import ast
 import contextlib
 import importlib.metadata
 import importlib.resources
@@ -100,6 +102,7 @@ _CONFIG_FILE = _path("config.json")
 _TASKS_DIR = LOOP_DIR / "tasks"
 TASK_PACKET = _path("task_packet.json")
 _CONTEXT_DIR = LOOP_DIR / "context"
+_MODULE_MAP_FILE = _CONTEXT_DIR / "module_map.json"
 _RESETTABLE_FILES = [
     LOCK_FILE,
     STATE_FILE,
@@ -158,6 +161,7 @@ def _configure_loop_paths(loop_dir: str | Path = ".loop") -> None:
     global _LOGS_DIR_ENSURED_PATH
     global TASK_PACKET
     global _CONTEXT_DIR
+    global _MODULE_MAP_FILE
 
     LOOP_DIR = _resolve_loop_dir(loop_dir)
     LOGS_DIR = LOOP_DIR / "logs"
@@ -175,6 +179,7 @@ def _configure_loop_paths(loop_dir: str | Path = ".loop") -> None:
     _TASKS_DIR = LOOP_DIR / "tasks"
     TASK_PACKET = _path("task_packet.json")
     _CONTEXT_DIR = LOOP_DIR / "context"
+    _MODULE_MAP_FILE = _CONTEXT_DIR / "module_map.json"
     _LOGS_DIR_ENSURED = False
     _LOGS_DIR_ENSURED_PATH = None
 
@@ -2203,6 +2208,128 @@ def _write_template_if_missing(path: Path, content: str) -> bool:
     return True
 
 
+def _empty_module_map() -> dict:
+    return {
+        "files": [],
+        "generated_at": _ts(),
+        "total_files": 0,
+    }
+
+
+def _parse_module_exports_and_docstring(text: str, rel_path: str) -> tuple[list[str], str]:
+    try:
+        tree = ast.parse(text, filename=rel_path)
+    except SyntaxError:
+        return [], ""
+
+    exports: list[str] = []
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef):
+            exports.append(f"def {node.name}:L{node.lineno}")
+        elif isinstance(node, ast.AsyncFunctionDef):
+            exports.append(f"async def {node.name}:L{node.lineno}")
+        elif isinstance(node, ast.ClassDef):
+            exports.append(f"class {node.name}:L{node.lineno}")
+
+    module_docstring = ast.get_docstring(tree) or ""
+    first_line = module_docstring.splitlines()[0].strip() if module_docstring else ""
+    return exports, first_line
+
+
+def _index_module_file(path: Path, rel_path: str, stat_result: os.stat_result) -> dict:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        text = ""
+
+    exports, docstring = _parse_module_exports_and_docstring(text, rel_path)
+    return {
+        "path": rel_path,
+        "exports": exports,
+        "docstring": docstring,
+        "loc": len(text.splitlines()),
+        "size_bytes": stat_result.st_size,
+        "last_modified": stat_result.st_mtime_ns,
+    }
+
+
+def _load_existing_module_map_entries() -> dict[str, dict]:
+    data = _read_json_if_exists(_MODULE_MAP_FILE)
+    if not isinstance(data, dict):
+        return {}
+    raw_files = data.get("files")
+    if not isinstance(raw_files, list):
+        return {}
+
+    entries: dict[str, dict] = {}
+    for item in raw_files:
+        if not isinstance(item, dict):
+            continue
+        rel_path = item.get("path")
+        if not isinstance(rel_path, str) or not rel_path:
+            continue
+        entries[rel_path] = item
+    return entries
+
+
+def _can_reuse_module_entry(entry: object, rel_path: str, *, size_bytes: int, last_modified: int) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    if entry.get("path") != rel_path:
+        return False
+    if entry.get("size_bytes") != size_bytes or entry.get("last_modified") != last_modified:
+        return False
+    exports = entry.get("exports")
+    if not isinstance(exports, list) or not all(isinstance(name, str) for name in exports):
+        return False
+    if not isinstance(entry.get("docstring"), str):
+        return False
+    if not isinstance(entry.get("loc"), int):
+        return False
+    return True
+
+
+def _build_module_entry(path: Path, existing_entries: dict[str, dict]) -> dict | None:
+    try:
+        stat_result = path.stat()
+    except OSError:
+        return None
+
+    rel_path = path.relative_to(ROOT).as_posix()
+    existing = existing_entries.get(rel_path)
+    if _can_reuse_module_entry(
+        existing,
+        rel_path,
+        size_bytes=stat_result.st_size,
+        last_modified=stat_result.st_mtime_ns,
+    ):
+        return dict(existing)
+    return _index_module_file(path, rel_path, stat_result)
+
+
+def cmd_index() -> None:
+    _CONTEXT_DIR.mkdir(parents=True, exist_ok=True)
+    source_dir = ROOT / "src" / "loop_kit"
+    existing_entries = _load_existing_module_map_entries()
+
+    files: list[dict] = []
+    for module_path in sorted(source_dir.rglob("*.py")):
+        if not module_path.is_file():
+            continue
+        entry = _build_module_entry(module_path, existing_entries)
+        if entry is not None:
+            files.append(entry)
+
+    payload = {
+        "files": files,
+        "generated_at": _ts(),
+        "total_files": len(files),
+    }
+    _atomic_write_json(_MODULE_MAP_FILE, payload)
+    _log(f"Module index updated: {_display_path(_MODULE_MAP_FILE)} ({len(files)} files)")
+    print(f"  Indexed: {len(files)} files -> {_display_path(_MODULE_MAP_FILE)}")
+
+
 # ── init ────────────────────────────────────────────────────────────
 def cmd_init() -> None:
     LOOP_DIR.mkdir(exist_ok=True)
@@ -2210,6 +2337,7 @@ def cmd_init() -> None:
     LOGS_DIR.mkdir(exist_ok=True)
     RUNTIME_DIR.mkdir(exist_ok=True)
     ARCHIVE_DIR.mkdir(exist_ok=True)
+    _CONTEXT_DIR.mkdir(exist_ok=True)
     templates_dir = _loop_templates_dir()
     templates_dir.mkdir(exist_ok=True)
     _log(f"Initialized loop directory: {LOOP_DIR}")
@@ -2217,7 +2345,11 @@ def cmd_init() -> None:
     print(f"  Created: {LOGS_DIR}")
     print(f"  Created: {RUNTIME_DIR}")
     print(f"  Created: {ARCHIVE_DIR}")
+    print(f"  Created: {_CONTEXT_DIR}")
     print(f"  Created: {templates_dir}")
+    if not _MODULE_MAP_FILE.exists():
+        _atomic_write_json(_MODULE_MAP_FILE, _empty_module_map())
+        print(f"  Created: {_MODULE_MAP_FILE}")
     # copy example task card if not present
     example = LOOP_DIR / "examples" / "task_card.json"
     if not example.exists():
@@ -3152,6 +3284,7 @@ def main() -> None:
     sub = parser.add_subparsers(dest="cmd")
 
     sub.add_parser("init", parents=[shared], help="Create loop directory structure")
+    sub.add_parser("index", parents=[shared], help="Generate offline module map for src/loop_kit")
 
     sub.add_parser("status", parents=[shared], help="Show current loop state")
 
@@ -3240,6 +3373,8 @@ def main() -> None:
     _configure_loop_paths(args.loop_dir)
     if args.cmd == "init":
         cmd_init()
+    elif args.cmd == "index":
+        cmd_index()
     elif args.cmd == "status":
         cmd_status()
     elif args.cmd == "health":
