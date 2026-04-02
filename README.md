@@ -1,15 +1,15 @@
-# loop-kit
+# agent-task-runner
 
 PM-driven review-loop orchestrator for AI coding agents.
 
-loop-kit runs a multi-round review loop: a **Worker** writes code, a **Reviewer** checks it, and the loop repeats until approval or max rounds. It supports OpenAI Codex and Anthropic Claude as worker/reviewer backends, with automatic dispatch and real-time streaming output.
+agent-task-runner runs a multi-round review loop: a **Worker** writes code, a **Reviewer** checks it, and the loop repeats until approval or max rounds. It supports OpenAI Codex and Anthropic Claude as worker/reviewer backends, with automatic dispatch and real-time streaming output.
 
 ## Quick Start
 
 ```bash
 # Install
-pip install loop-kit
-# or: uv add loop-kit
+pip install agent-task-runner
+# or: uv add agent-task-runner
 
 # Initialize loop directory in your project
 loop init
@@ -143,7 +143,7 @@ Backend discovery uses `shutil.which()` plus known install paths. The backend re
 - **reviewer_prompt.txt** — Reviewer prompt with `{task_id}`, `{round_num}`, `{role_md}`, `{review_report_path}` placeholders
 
 The worker first reads project `AGENTS.md` and `docs/roles/code-writer.md`, and the reviewer first reads project `docs/roles/reviewer.md`.
-If any of those files are missing, loop-kit falls back to built-in defaults in `src/loop_kit/defaults/`.
+If any of those files are missing, agent-task-runner falls back to built-in defaults in `src/loop_kit/defaults/`.
 Project files always override built-in defaults when present.
 
 ## Development
@@ -151,7 +151,7 @@ Project files always override built-in defaults when present.
 ```bash
 # Clone and install editable
 git clone <repo-url>
-cd loop-kit
+cd agent-task-runner
 uv sync
 
 # Run tests

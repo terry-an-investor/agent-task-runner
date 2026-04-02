@@ -3001,7 +3001,7 @@ def main() -> None:
     parser.add_argument(
         "--version",
         action="version",
-        version=f"%(prog)s {importlib.metadata.version('loop-kit')}",
+        version=f"%(prog)s {importlib.metadata.version('agent-task-runner')}",
     )
     shared = argparse.ArgumentParser(add_help=False)
     shared.add_argument(

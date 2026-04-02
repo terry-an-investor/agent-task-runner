@@ -4,7 +4,7 @@ This file provides guidance to Claude Code when working with code in this reposi
 
 ## Project Overview
 
-**loop-kit** is a PM-driven review-loop orchestrator for AI coding agents.
+**agent-task-runner** is a PM-driven review-loop orchestrator for AI coding agents.
 It runs multi-round Worker/Reviewer cycles via file bus in `.loop/`,
 supporting codex, claude, and opencode backends with auto-dispatch.
 
