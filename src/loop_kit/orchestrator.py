@@ -1362,6 +1362,12 @@ def _dispatch_with_artifact_fallback(
             _log(f"{role} dispatch timed out but {artifact_path.name} is present; continuing")
             return data
         raise RuntimeError(str(e)) from e
+    if artifact_path.exists():
+        data = _read_json_if_exists(artifact_path)
+        if isinstance(data, dict):
+            if data.get("task_id") == task_id and data.get("round") == round_num:
+                _log(f"{role} dispatch produced {artifact_path.name} directly; skipping wait")
+                return data
     return _require_dispatch_artifact(
         role=role,
         path=artifact_path,
