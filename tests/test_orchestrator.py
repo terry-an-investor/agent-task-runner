@@ -3114,3 +3114,140 @@ class TestCmdArchiveRestoreTraversal:
         state_file = tmp_path / ".loop" / "state.json"
         assert state_file.exists()
         assert json.loads(state_file.read_text(encoding="utf-8"))["round"] == 1
+
+
+class TestStreamDispatchSuppression:
+    def test_step_turn_completed_suppressed_by_exact_match(self, monkeypatch, capsys) -> None:
+        monkeypatch.setattr(orchestrator, "_stream_local", threading.local())
+        parse_event_fn = orchestrator._require_registered_parse_event("codex")
+
+        for line_str in ["[worker] Step completed", "[worker] Turn completed", "[worker] Turn started"]:
+            orchestrator._stream_dispatch_stdout_line("worker", "codex", line_str + "\n", parse_event_fn, verbose=False)
+
+        assert capsys.readouterr().out == ""
+
+    def test_agent_message_with_turn_started_not_suppressed(self, monkeypatch, capsys) -> None:
+        monkeypatch.setattr(orchestrator, "_stream_local", threading.local())
+
+        line = json.dumps(
+            {
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": "Turn started on this task"},
+            }
+        )
+
+        orchestrator._stream_dispatch_stdout_line(
+            "worker", "codex", line + "\n", orchestrator._codex_event_summary, verbose=False
+        )
+
+        out = capsys.readouterr().out
+        assert "[worker] Message: Turn started on this task" in out
+
+    def test_agent_message_with_step_completed_not_suppressed(self, monkeypatch, capsys) -> None:
+        monkeypatch.setattr(orchestrator, "_stream_local", threading.local())
+
+        line = json.dumps(
+            {
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": "Step completed successfully"},
+            }
+        )
+
+        orchestrator._stream_dispatch_stdout_line(
+            "worker", "codex", line + "\n", orchestrator._codex_event_summary, verbose=False
+        )
+
+        out = capsys.readouterr().out
+        assert "[worker] Message: Step completed successfully" in out
+
+    def test_dedupe_only_applies_to_tool_use_not_messages(self, monkeypatch, capsys) -> None:
+        monkeypatch.setattr(orchestrator, "_stream_local", threading.local())
+
+        msg_line = json.dumps(
+            {
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": "Working on it"},
+            }
+        )
+
+        orchestrator._stream_dispatch_stdout_line(
+            "worker", "codex", msg_line + "\n", orchestrator._codex_event_summary, verbose=False
+        )
+        orchestrator._stream_dispatch_stdout_line(
+            "worker", "codex", msg_line + "\n", orchestrator._codex_event_summary, verbose=False
+        )
+
+        out_lines = [line.strip() for line in capsys.readouterr().out.splitlines() if line.strip()]
+        assert len(out_lines) == 2
+        assert out_lines[0] == "[worker] Message: Working on it"
+        assert out_lines[1] == "[worker] Message: Working on it"
+
+    def test_dedupe_consecutive_identical_running_lines(self, monkeypatch, capsys) -> None:
+        monkeypatch.setattr(orchestrator, "_stream_local", threading.local())
+
+        run_line = json.dumps(
+            {
+                "type": "item.completed",
+                "item": {"type": "command_execution", "command": "git status"},
+            }
+        )
+
+        orchestrator._stream_dispatch_stdout_line(
+            "worker", "codex", run_line + "\n", orchestrator._codex_event_summary, verbose=False
+        )
+        orchestrator._stream_dispatch_stdout_line(
+            "worker", "codex", run_line + "\n", orchestrator._codex_event_summary, verbose=False
+        )
+
+        out_lines = [line.strip() for line in capsys.readouterr().out.splitlines() if line.strip()]
+        assert len(out_lines) == 1
+        assert out_lines[0] == "[worker] Running: git status"
+
+    def test_dedupe_resets_after_different_summary(self, monkeypatch, capsys) -> None:
+        monkeypatch.setattr(orchestrator, "_stream_local", threading.local())
+
+        run_line = json.dumps(
+            {
+                "type": "item.completed",
+                "item": {"type": "command_execution", "command": "git status"},
+            }
+        )
+        msg_line = json.dumps(
+            {
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": "hello"},
+            }
+        )
+
+        orchestrator._stream_dispatch_stdout_line(
+            "worker", "codex", run_line + "\n", orchestrator._codex_event_summary, verbose=False
+        )
+        orchestrator._stream_dispatch_stdout_line(
+            "worker", "codex", msg_line + "\n", orchestrator._codex_event_summary, verbose=False
+        )
+        orchestrator._stream_dispatch_stdout_line(
+            "worker", "codex", run_line + "\n", orchestrator._codex_event_summary, verbose=False
+        )
+
+        out_lines = [line.strip() for line in capsys.readouterr().out.splitlines() if line.strip()]
+        assert len(out_lines) == 3
+        assert "[worker] Running: git status" in out_lines[0]
+        assert "[worker] Message: hello" in out_lines[1]
+        assert "[worker] Running: git status" in out_lines[2]
+
+    def test_session_id_deduplicated_across_roles(self, monkeypatch, capsys) -> None:
+        monkeypatch.setattr(orchestrator, "_stream_local", threading.local())
+
+        line_1 = json.dumps({"type": "thread.started", "thread_id": "tid-999"})
+        line_2 = json.dumps({"type": "thread.started", "thread_id": "tid-999"})
+
+        orchestrator._stream_dispatch_stdout_line(
+            "worker", "codex", line_1 + "\n", orchestrator._codex_event_summary, verbose=False
+        )
+        orchestrator._stream_dispatch_stdout_line(
+            "worker", "codex", line_2 + "\n", orchestrator._codex_event_summary, verbose=False
+        )
+
+        out_lines = [line.strip() for line in capsys.readouterr().out.splitlines() if line.strip()]
+        assert len(out_lines) == 1
+        assert "Session: tid-999" in out_lines[0]

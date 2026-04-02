@@ -725,7 +725,11 @@ def _stream_dispatch_stdout_line(
         read_state.pop(state_key, None)
         return
 
-    if " Step completed" in summary or " Turn completed" in summary or " Turn started" in summary:
+    if summary in (
+        f"[{role}] Step completed",
+        f"[{role}] Turn completed",
+        f"[{role}] Turn started",
+    ):
         read_state.pop(state_key, None)
         return
 
@@ -756,11 +760,15 @@ def _stream_dispatch_stdout_line(
         read_state[state_key] = read_summary
         return
 
-    if read_state.get(state_key) == summary:
+    is_tool_use = summary.startswith((f"[{role}] Running:", f"[{role}] Editing:", f"[{role}] Reading:"))
+    if is_tool_use and read_state.get(state_key) == summary:
         return
 
     print(summary, flush=True)
-    read_state[state_key] = summary
+    if is_tool_use:
+        read_state[state_key] = summary
+    else:
+        read_state.pop(state_key, None)
 
 
 BackendBuildFn = Callable[[str, str], tuple[list[str], str | None, str | None]]
