@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "loop-kit"
+name = "agent-task-runner"
 version = "0.3.0"
 description = "PM-driven review-loop orchestrator for AI coding agents"
 readme = "README.md"
