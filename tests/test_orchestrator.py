@@ -4367,8 +4367,23 @@ class TestKnowledgeLayer:
             json.dumps(
                 {
                     "task_id": "T-612",
-                    "round": 1,
+                    "round": 2,
                     "decision": "approve",
+                    "blocking_issues": [],
+                    "non_blocking_suggestions": [],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        archive_dir = tmp_path / ".loop" / "archive" / "T-612"
+        archive_dir.mkdir(parents=True)
+        (archive_dir / "r2_review_report.json").write_text(
+            json.dumps(
+                {
+                    "task_id": "T-612",
+                    "round": 1,
+                    "decision": "changes_required",
                     "blocking_issues": [
                         {"severity": "high", "file": "src/loop_kit/orchestrator.py", "reason": "retry replace on nt"},
                         {"severity": "medium", "file": "tests/test_orchestrator.py", "reason": "cover stale patterns"},
@@ -4380,7 +4395,7 @@ class TestKnowledgeLayer:
             encoding="utf-8",
         )
 
-        orchestrator._update_knowledge_on_approval("T-612", 1)
+        orchestrator._update_knowledge_on_approval("T-612", 2)
 
         pitfalls_text = (tmp_path / ".loop" / "context" / "pitfalls.md").read_text(encoding="utf-8")
         assert "retry replace on nt" in pitfalls_text

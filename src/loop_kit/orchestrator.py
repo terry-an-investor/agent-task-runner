@@ -2906,14 +2906,31 @@ def _append_pitfalls(lines: list[str]) -> int:
 
 
 def _update_knowledge_on_approval(task_id: str, round_num: int) -> None:
-    review = _read_json_if_exists(REVIEW_REPORT)
-    if not isinstance(review, dict):
-        return
-    if review.get("task_id") != task_id or review.get("round") != round_num:
+    sources: list[dict] = []
+
+    current_review = _read_json_if_exists(REVIEW_REPORT)
+    if (
+        isinstance(current_review, dict)
+        and current_review.get("task_id") == task_id
+        and current_review.get("round") == round_num
+    ):
+        sources.append(current_review)
+
+    archived_review_path = _task_archive_dir(task_id) / f"r{round_num}_review_report.json"
+    archived_review = _read_json_if_exists(archived_review_path)
+    if isinstance(archived_review, dict) and archived_review.get("task_id") == task_id:
+        sources.append(archived_review)
+
+    blocking_issues: list[dict] = []
+    for review in sources:
+        raw_blocking = review.get("blocking_issues", [])
+        items = [item for item in raw_blocking if isinstance(item, dict)] if isinstance(raw_blocking, list) else []
+        if items:
+            blocking_issues = items
+            break
+    if not blocking_issues:
         return
 
-    raw_blocking = review.get("blocking_issues", [])
-    blocking_issues = [item for item in raw_blocking if isinstance(item, dict)] if isinstance(raw_blocking, list) else []
     pitfall_lines = [line for issue in blocking_issues if (line := _issue_to_pitfall_line(issue))]
     appended_pitfalls = _append_pitfalls(pitfall_lines)
 
