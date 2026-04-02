@@ -254,9 +254,7 @@ def test_register_backend_allows_custom_backend_in_run_cli(monkeypatch) -> None:
     assert captured["reviewer_backend"] == "mybackend"
 
 
-def test_register_backend_custom_parse_event_fn_is_used_by_stream_dispatch(
-    monkeypatch, capsys
-) -> None:
+def test_register_backend_custom_parse_event_fn_is_used_by_stream_dispatch(monkeypatch, capsys) -> None:
     monkeypatch.setattr(orchestrator, "_BACKEND_REGISTRY", dict(orchestrator._BACKEND_REGISTRY))
     monkeypatch.setattr(orchestrator, "_stream_local", threading.local())
 
@@ -378,9 +376,7 @@ def test_run_auto_dispatch_timeout_still_triggers_when_stdin_write_blocks(monkey
     assert proc.stdin.closed is True
 
 
-def test_run_auto_dispatch_streams_compact_summaries_in_non_verbose_mode(
-    monkeypatch, capsys
-) -> None:
+def test_run_auto_dispatch_streams_compact_summaries_in_non_verbose_mode(monkeypatch, capsys) -> None:
     monkeypatch.setattr(
         orchestrator,
         "_agent_command",
@@ -462,10 +458,12 @@ def test_run_auto_dispatch_non_verbose_filters_out_non_summary_lines(monkeypatch
 def test_stream_dispatch_stdout_line_uses_codex_registered_parser(monkeypatch, capsys) -> None:
     monkeypatch.setattr(orchestrator, "_stream_local", threading.local())
     parse_event_fn = orchestrator._require_registered_parse_event("codex")
-    line = json.dumps({
-        "type": "item.completed",
-        "item": {"type": "command_execution", "command": "git status --short"},
-    })
+    line = json.dumps(
+        {
+            "type": "item.completed",
+            "item": {"type": "command_execution", "command": "git status --short"},
+        }
+    )
 
     orchestrator._stream_dispatch_stdout_line(
         "worker",
@@ -479,15 +477,15 @@ def test_stream_dispatch_stdout_line_uses_codex_registered_parser(monkeypatch, c
     assert out_lines == ["[worker] Running: git status --short"]
 
 
-def test_stream_dispatch_stdout_line_claude_parser_stub_suppresses_summaries(
-    monkeypatch, capsys
-) -> None:
+def test_stream_dispatch_stdout_line_claude_parser_stub_suppresses_summaries(monkeypatch, capsys) -> None:
     monkeypatch.setattr(orchestrator, "_stream_local", threading.local())
     parse_event_fn = orchestrator._require_registered_parse_event("claude")
-    line = json.dumps({
-        "type": "item.completed",
-        "item": {"type": "command_execution", "command": "git status --short"},
-    })
+    line = json.dumps(
+        {
+            "type": "item.completed",
+            "item": {"type": "command_execution", "command": "git status --short"},
+        }
+    )
 
     orchestrator._stream_dispatch_stdout_line(
         "worker",
@@ -502,20 +500,24 @@ def test_stream_dispatch_stdout_line_claude_parser_stub_suppresses_summaries(
 
 def test_stream_dispatch_stdout_line_collapses_consecutive_reads(monkeypatch, capsys) -> None:
     monkeypatch.setattr(orchestrator, "_stream_local", threading.local())
-    line_1 = json.dumps({
-        "type": "item.completed",
-        "item": {
-            "type": "command_execution",
-            "command": "Get-Content -Path src/loop_kit/orchestrator.py | Select-Object -Skip 0 -First 40",
-        },
-    })
-    line_2 = json.dumps({
-        "type": "item.completed",
-        "item": {
-            "type": "command_execution",
-            "command": "cat src/loop_kit/orchestrator.py | Select-Object -Skip 40 -First 40",
-        },
-    })
+    line_1 = json.dumps(
+        {
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution",
+                "command": "Get-Content -Path src/loop_kit/orchestrator.py | Select-Object -Skip 0 -First 40",
+            },
+        }
+    )
+    line_2 = json.dumps(
+        {
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution",
+                "command": "cat src/loop_kit/orchestrator.py | Select-Object -Skip 40 -First 40",
+            },
+        }
+    )
 
     orchestrator._stream_dispatch_stdout_line(
         "reader",
@@ -536,17 +538,17 @@ def test_stream_dispatch_stdout_line_collapses_consecutive_reads(monkeypatch, ca
     assert out_lines == ["[reader] Reading: orchestrator.py"]
 
 
-def test_stream_dispatch_stdout_line_read_collapse_resets_on_non_summary_line(
-    monkeypatch, capsys
-) -> None:
+def test_stream_dispatch_stdout_line_read_collapse_resets_on_non_summary_line(monkeypatch, capsys) -> None:
     monkeypatch.setattr(orchestrator, "_stream_local", threading.local())
-    read_line = json.dumps({
-        "type": "item.completed",
-        "item": {
-            "type": "command_execution",
-            "command": "Get-Content src/loop_kit/orchestrator.py | Select-Object -Skip 0 -First 40",
-        },
-    })
+    read_line = json.dumps(
+        {
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution",
+                "command": "Get-Content src/loop_kit/orchestrator.py | Select-Object -Skip 0 -First 40",
+            },
+        }
+    )
 
     orchestrator._stream_dispatch_stdout_line(
         "reader",
@@ -577,9 +579,7 @@ def test_stream_dispatch_stdout_line_read_collapse_resets_on_non_summary_line(
     ]
 
 
-def test_run_auto_dispatch_dispatch_log_keeps_full_stdout_when_non_verbose(
-    tmp_path: Path, monkeypatch, capsys
-) -> None:
+def test_run_auto_dispatch_dispatch_log_keeps_full_stdout_when_non_verbose(tmp_path: Path, monkeypatch, capsys) -> None:
     raw_lines = [
         "plain status line\n",
         '{"type":"item.completed","item":{"type":"agent_message","text":"done"}}\n',
@@ -777,9 +777,7 @@ def test_worker_prompt_round2_includes_prior_round_context(monkeypatch) -> None:
             return {"notes": "previous notes", "files_changed": ["tools/orchestrator.py"]}
         if path == orchestrator.REVIEW_REPORT:
             return {
-                "blocking_issues": [
-                    {"severity": "high", "file": "tools/orchestrator.py", "reason": "fix me"}
-                ],
+                "blocking_issues": [{"severity": "high", "file": "tools/orchestrator.py", "reason": "fix me"}],
                 "non_blocking_suggestions": ["suggestion-1"],
             }
         return None
@@ -795,6 +793,141 @@ def test_worker_prompt_round2_includes_prior_round_context(monkeypatch) -> None:
     assert "- tools/orchestrator.py" in prompt
     assert "prior_review_non_blocking:" in prompt
     assert "- suggestion-1" in prompt
+
+
+def test_worker_prompt_round2_skips_agents_md_and_function_index(monkeypatch) -> None:
+    read_calls: list[str] = []
+
+    def fake_read(path: Path) -> str | None:
+        read_calls.append(path.name if path else str(path))
+        if "code-writer.md" in str(path):
+            return "CODE_WRITER_CONTENT"
+        if path == orchestrator._worker_prompt_template_path():
+            return orchestrator.DEFAULT_WORKER_PROMPT_TEMPLATE
+        return None
+
+    def fake_read_json(path: Path) -> dict | None:
+        if path == orchestrator.TASK_CARD:
+            return {"goal": "test", "in_scope": [], "out_of_scope": [], "acceptance_criteria": [], "constraints": []}
+        if path == orchestrator.WORK_REPORT:
+            return {"notes": "prev notes", "files_changed": ["file.py"]}
+        if path == orchestrator.REVIEW_REPORT:
+            return {
+                "blocking_issues": [{"severity": "high", "file": "file.py", "reason": "fix it"}],
+                "non_blocking_suggestions": ["sugg"],
+            }
+        if path == orchestrator.FIX_LIST:
+            return {
+                "task_id": "T-603",
+                "round": 2,
+                "fixes": [{"severity": "high", "file": "file.py", "reason": "fix it"}],
+            }
+        return None
+
+    monkeypatch.setattr(orchestrator, "_read_text_optional", fake_read)
+    monkeypatch.setattr(orchestrator, "_read_json_if_exists", fake_read_json)
+
+    prompt = orchestrator._worker_prompt("T-603", 2)
+
+    assert "AGENTS_CONTENT" not in prompt
+    assert "FUNCTION INDEX" not in prompt
+    assert "CODE_WRITER_CONTENT" in prompt
+    assert "Current task_id: T-603, round: 2." in prompt
+    assert "=== FIX LIST (round 2) ===" in prompt
+    assert "[high] file.py: fix it" in prompt
+    assert "work_report.json" in prompt
+    assert read_calls == ["code-writer.md"]
+
+
+def test_worker_prompt_round1_unchanged_includes_agents_and_function_index(monkeypatch) -> None:
+    read_calls: list[str] = []
+
+    def fake_read(path: Path) -> str | None:
+        read_calls.append(path.name if path else str(path))
+        if path.name == "AGENTS.md":
+            return "AGENTS_CONTENT"
+        if "code-writer.md" in str(path):
+            return "CODE_WRITER_CONTENT"
+        if path == orchestrator._worker_prompt_template_path():
+            return orchestrator.DEFAULT_WORKER_PROMPT_TEMPLATE
+        return None
+
+    def fake_read_json(path: Path) -> dict | None:
+        if path == orchestrator.TASK_CARD:
+            return {"goal": "test", "in_scope": [], "out_of_scope": [], "acceptance_criteria": [], "constraints": []}
+        return None
+
+    monkeypatch.setattr(orchestrator, "_read_text_optional", fake_read)
+    monkeypatch.setattr(orchestrator, "_read_json_if_exists", fake_read_json)
+
+    prompt = orchestrator._worker_prompt("T-603", 1)
+
+    assert "AGENTS_CONTENT" in prompt
+    assert "FUNCTION INDEX" in prompt
+    assert "CODE_WRITER_CONTENT" in prompt
+    assert "=== FIX LIST" not in prompt
+
+
+def test_worker_prompt_round3_slim_prompt(monkeypatch) -> None:
+    def fake_read(path: Path) -> str | None:
+        if "code-writer.md" in str(path):
+            return "CODE_WRITER_CONTENT"
+        if path == orchestrator._worker_prompt_template_path():
+            return orchestrator.DEFAULT_WORKER_PROMPT_TEMPLATE
+        return None
+
+    def fake_read_json(path: Path) -> dict | None:
+        if path == orchestrator.FIX_LIST:
+            return {
+                "task_id": "T-603",
+                "round": 3,
+                "fixes": [
+                    {"severity": "medium", "file": "src/a.py", "reason": "refactor"},
+                    {"severity": "low", "file": "src/b.py", "reason": "typo"},
+                ],
+            }
+        if path == orchestrator.WORK_REPORT:
+            return {"notes": "round 2 notes", "files_changed": ["src/a.py"]}
+        if path == orchestrator.REVIEW_REPORT:
+            return {
+                "blocking_issues": [],
+                "non_blocking_suggestions": ["sugg"],
+            }
+        return None
+
+    monkeypatch.setattr(orchestrator, "_read_text_optional", fake_read)
+    monkeypatch.setattr(orchestrator, "_read_json_if_exists", fake_read_json)
+
+    prompt = orchestrator._worker_prompt("T-603", 3)
+
+    assert "AGENTS_CONTENT" not in prompt
+    assert "FUNCTION INDEX" not in prompt
+    assert "=== FIX LIST (round 3) ===" in prompt
+    assert "[medium] src/a.py: refactor" in prompt
+    assert "[low] src/b.py: typo" in prompt
+
+
+def test_worker_prompt_round2_no_fix_list(monkeypatch) -> None:
+    def fake_read(path: Path) -> str | None:
+        if "code-writer.md" in str(path):
+            return "CODE_WRITER_CONTENT"
+        if path == orchestrator._worker_prompt_template_path():
+            return orchestrator.DEFAULT_WORKER_PROMPT_TEMPLATE
+        return None
+
+    def fake_read_json(path: Path) -> dict | None:
+        if path == orchestrator.FIX_LIST:
+            return None
+        return None
+
+    monkeypatch.setattr(orchestrator, "_read_text_optional", fake_read)
+    monkeypatch.setattr(orchestrator, "_read_json_if_exists", fake_read_json)
+
+    prompt = orchestrator._worker_prompt("T-603", 2)
+
+    assert "AGENTS_CONTENT" not in prompt
+    assert "=== FIX LIST (round 2) ===" in prompt
+    assert "fixes:\n- <none>" in prompt
 
 
 def test_worker_prompt_loads_template_when_file_exists(tmp_path: Path, monkeypatch) -> None:
@@ -834,9 +967,7 @@ def test_worker_prompt_loads_template_when_file_exists(tmp_path: Path, monkeypat
     assert "code-writer.md (Default)" not in prompt
 
 
-def test_worker_prompt_raises_when_template_missing(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_worker_prompt_raises_when_template_missing(tmp_path: Path, monkeypatch) -> None:
     _configure_loop_paths(monkeypatch, tmp_path)
     (tmp_path / "AGENTS.md").write_text("AGENTS_CONTENT", encoding="utf-8")
     role_path = tmp_path / "docs" / "roles" / "code-writer.md"
@@ -883,9 +1014,7 @@ def test_reviewer_prompt_includes_role_doc(monkeypatch) -> None:
     assert "Current task_id: T-603, round: 2." in prompt
 
 
-def test_worker_prompt_uses_default_code_writer_doc_when_project_file_missing(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_worker_prompt_uses_default_code_writer_doc_when_project_file_missing(tmp_path: Path, monkeypatch) -> None:
     _configure_loop_paths(monkeypatch, tmp_path)
     (tmp_path / "docs" / "roles" / "code-writer.md").unlink()
 
@@ -905,9 +1034,7 @@ def test_worker_prompt_uses_default_agents_doc_when_project_file_missing(tmp_pat
     assert "Python target is 3.11+" in prompt
 
 
-def test_worker_prompt_succeeds_when_agents_and_code_writer_docs_missing(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_worker_prompt_succeeds_when_agents_and_code_writer_docs_missing(tmp_path: Path, monkeypatch) -> None:
     _configure_loop_paths(monkeypatch, tmp_path)
     (tmp_path / "AGENTS.md").unlink()
     (tmp_path / "docs" / "roles" / "code-writer.md").unlink()
@@ -1009,9 +1136,7 @@ def test_feed_event_filters_by_task_id(tmp_path: Path, monkeypatch) -> None:
     orchestrator._feed_event("missing_task", data={"x": 3})
 
     entries = [
-        json.loads(line)
-        for line in (tmp_path / "feed.jsonl").read_text(encoding="utf-8").splitlines()
-        if line.strip()
+        json.loads(line) for line in (tmp_path / "feed.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()
     ]
     assert len(entries) == 2
     assert entries[0]["event"] == "same_task"
@@ -1038,16 +1163,20 @@ def test_main_run_parses_artifact_timeout(monkeypatch) -> None:
         captured["verbose"] = config.verbose
 
     monkeypatch.setattr(orchestrator, "cmd_run", fake_cmd_run)
-    monkeypatch.setattr(sys, "argv", [
-        "orchestrator.py",
-        "run",
-        "--artifact-timeout",
-        "123",
-        "--verbose",
-        "--single-round",
-        "--round",
-        "7",
-    ])
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "orchestrator.py",
+            "run",
+            "--artifact-timeout",
+            "123",
+            "--verbose",
+            "--single-round",
+            "--round",
+            "7",
+        ],
+    )
 
     orchestrator.main()
 
@@ -1788,9 +1917,7 @@ def test_outer_loop_spawns_single_round_subprocess(tmp_path: Path, monkeypatch) 
     assert "--require-heartbeat" in cmd
 
 
-def test_outer_loop_streams_single_round_subprocess_stdout_in_real_time(
-    tmp_path: Path, monkeypatch, capsys
-) -> None:
+def test_outer_loop_streams_single_round_subprocess_stdout_in_real_time(tmp_path: Path, monkeypatch, capsys) -> None:
     _configure_loop_paths(monkeypatch, tmp_path)
     task_path = tmp_path / "task_input.json"
     task_path.write_text(
@@ -1920,9 +2047,7 @@ def test_outer_loop_uses_state_as_contract(tmp_path: Path, monkeypatch) -> None:
     assert state["outcome"] == "approved"
 
 
-def test_outer_loop_continues_from_state_without_fresh_review_report(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_outer_loop_continues_from_state_without_fresh_review_report(tmp_path: Path, monkeypatch) -> None:
     _configure_loop_paths(monkeypatch, tmp_path)
 
     task_path = tmp_path / "task_input.json"
@@ -2009,9 +2134,7 @@ def test_cmd_run_resume_uses_existing_state_contract(tmp_path: Path, monkeypatch
     assert resume_state["base_sha"] == "base-sha"
 
 
-def test_cmd_run_resume_done_approved_exits_cleanly(
-    tmp_path: Path, monkeypatch, capsys
-) -> None:
+def test_cmd_run_resume_done_approved_exits_cleanly(tmp_path: Path, monkeypatch, capsys) -> None:
     _configure_loop_paths(monkeypatch, tmp_path)
     task_path = tmp_path / "task_input.json"
     task_path.write_text(
@@ -2027,7 +2150,8 @@ def test_cmd_run_resume_done_approved_exits_cleanly(
     )
     called = {"outer": False}
     monkeypatch.setattr(
-        orchestrator, "_run_multi_round_via_subprocess",
+        orchestrator,
+        "_run_multi_round_via_subprocess",
         lambda **kwargs: called.update({"outer": True}),
     )
 
@@ -2043,9 +2167,7 @@ def test_cmd_run_resume_done_approved_exits_cleanly(
     assert "done/approved" in out
 
 
-def test_cmd_run_resume_failed_state_prints_error_and_exits_3(
-    tmp_path: Path, monkeypatch, capsys
-) -> None:
+def test_cmd_run_resume_failed_state_prints_error_and_exits_3(tmp_path: Path, monkeypatch, capsys) -> None:
     _configure_loop_paths(monkeypatch, tmp_path)
     task_path = tmp_path / "task_input.json"
     task_path.write_text(
@@ -2199,6 +2321,7 @@ class TestTs:
         assert "T" in result
         # verify it parses as a valid timestamp
         from datetime import datetime
+
         datetime.strptime(result, "%Y-%m-%dT%H:%M:%SZ")
 
 
@@ -2232,10 +2355,7 @@ class TestTestsSummary:
 
 class TestExtractCodexThreadId:
     def test_finds_thread_started(self) -> None:
-        stdout = (
-            '{"type":"thread.started","thread_id":"tid_123"}\n'
-            '{"type":"item.completed","item":{}}\n'
-        )
+        stdout = '{"type":"thread.started","thread_id":"tid_123"}\n{"type":"item.completed","item":{}}\n'
         assert orchestrator._extract_codex_thread_id(stdout) == "tid_123"
 
     def test_returns_none_on_no_match(self) -> None:
@@ -2287,89 +2407,102 @@ class TestExtractCommandSummary:
 
 class TestCodexEventSummary:
     def test_command_execution(self) -> None:
-        line = json.dumps({
-            "type": "item.completed",
-            "item": {"type": "command_execution", "command": "npm test"},
-        })
+        line = json.dumps(
+            {
+                "type": "item.completed",
+                "item": {"type": "command_execution", "command": "npm test"},
+            }
+        )
         result = orchestrator._codex_event_summary("worker", "codex", line)
         assert result is not None
         assert result == "[worker] Running: npm test"
 
     def test_agent_message(self) -> None:
-        line = json.dumps({
-            "type": "item.completed",
-            "item": {"type": "agent_message", "text": "I fixed the bug."},
-        })
+        line = json.dumps(
+            {
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": "I fixed the bug."},
+            }
+        )
         result = orchestrator._codex_event_summary("worker", "codex", line)
         assert result is not None
         assert "[worker] Message:" in result
         assert "I fixed the bug." in result
 
     def test_file_change(self) -> None:
-        line = json.dumps({
-            "type": "item.completed",
-            "item": {
-                "type": "file_change",
-                "changes": [
-                    {"path": "src/loop_kit/orchestrator.py"},
-                    {"path": "tests/test_orchestrator.py"},
-                ],
-            },
-        })
+        line = json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "file_change",
+                    "changes": [
+                        {"path": "src/loop_kit/orchestrator.py"},
+                        {"path": "tests/test_orchestrator.py"},
+                    ],
+                },
+            }
+        )
         result = orchestrator._codex_event_summary("worker", "codex", line)
         assert result is not None
         assert result == "[worker] Editing: orchestrator.py, test_orchestrator.py"
 
     def test_top_level_file_change_uses_short_filename(self) -> None:
-        line = json.dumps({
-            "type": "file_change",
-            "changes": [
-                {"path": "src/loop_kit/orchestrator.py"},
-            ],
-        })
+        line = json.dumps(
+            {
+                "type": "file_change",
+                "changes": [
+                    {"path": "src/loop_kit/orchestrator.py"},
+                ],
+            }
+        )
         result = orchestrator._codex_event_summary("worker", "codex", line)
         assert result is not None
         assert result == "[worker] Editing: orchestrator.py"
 
     def test_file_change_keeps_colliding_basenames(self) -> None:
-        line = json.dumps({
-            "type": "item.completed",
-            "item": {
-                "type": "file_change",
-                "changes": [
-                    {"path": "src/api/config.py"},
-                    {"path": "tests/config.py"},
-                ],
-            },
-        })
+        line = json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "file_change",
+                    "changes": [
+                        {"path": "src/api/config.py"},
+                        {"path": "tests/config.py"},
+                    ],
+                },
+            }
+        )
         result = orchestrator._codex_event_summary("worker", "codex", line)
         assert result is not None
         assert result == "[worker] Editing: api/config.py, tests/config.py"
 
     def test_command_execution_strips_powershell_wrapper(self) -> None:
-        line = json.dumps({
-            "type": "item.completed",
-            "item": {
-                "type": "command_execution",
-                "command": (
-                    '"C:\\Program Files\\PowerShell\\7\\pwsh.exe" '
-                    "-Command Get-Content -Path src/loop_kit/orchestrator.py "
-                    "| Select-Object -Skip 40 -First 20"
-                ),
-            },
-        })
+        line = json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "command_execution",
+                    "command": (
+                        '"C:\\Program Files\\PowerShell\\7\\pwsh.exe" '
+                        "-Command Get-Content -Path src/loop_kit/orchestrator.py "
+                        "| Select-Object -Skip 40 -First 20"
+                    ),
+                },
+            }
+        )
         result = orchestrator._codex_event_summary("worker", "codex", line)
         assert result is not None
         assert result == (
-            "[worker] Running: Get-Content -Path src/loop_kit/orchestrator.py "
-            "| Select-Object -Skip 40 -First 20"
+            "[worker] Running: Get-Content -Path src/loop_kit/orchestrator.py | Select-Object -Skip 40 -First 20"
         )
 
     def test_item_started(self) -> None:
-        line = json.dumps({
-            "type": "item.started",
-            "item": {"type": "command_execution"},
-        })
+        line = json.dumps(
+            {
+                "type": "item.started",
+                "item": {"type": "command_execution"},
+            }
+        )
         assert orchestrator._codex_event_summary("worker", "codex", line) is None
 
     def test_non_codex_returns_none(self) -> None:
@@ -2390,21 +2523,15 @@ class TestDispatchFailureHint:
         assert "--dispatch-timeout" in result
 
     def test_auth_hint_codex(self) -> None:
-        result = orchestrator._dispatch_failure_hint(
-            backend="codex", stderr="Error: unauthorized 401"
-        )
+        result = orchestrator._dispatch_failure_hint(backend="codex", stderr="Error: unauthorized 401")
         assert "codex API key" in result
 
     def test_auth_hint_claude(self) -> None:
-        result = orchestrator._dispatch_failure_hint(
-            backend="claude", stderr="auth token expired"
-        )
+        result = orchestrator._dispatch_failure_hint(backend="claude", stderr="auth token expired")
         assert "claude authentication" in result
 
     def test_not_found_hint(self) -> None:
-        result = orchestrator._dispatch_failure_hint(
-            backend="codex", stderr="codex: command not found"
-        )
+        result = orchestrator._dispatch_failure_hint(backend="codex", stderr="codex: command not found")
         assert "executable path" in result
 
     def test_fallback_hint(self) -> None:
@@ -2418,14 +2545,10 @@ class TestDispatchFailureHint:
 class TestWriteDispatchLog:
     def test_writes_structured_log(self, tmp_path: Path, monkeypatch) -> None:
         monkeypatch.setattr(orchestrator, "LOGS_DIR", tmp_path)
-        result = subprocess.CompletedProcess(
-            args=["codex"], returncode=0, stdout="out\n", stderr="err\n"
-        )
+        result = subprocess.CompletedProcess(args=["codex"], returncode=0, stdout="out\n", stderr="err\n")
         result.stdout = "out\n"
         result.stderr = "err\n"
-        orchestrator._write_dispatch_log(
-            "worker", ["codex", "exec"], result, "sid-123"
-        )
+        orchestrator._write_dispatch_log("worker", ["codex", "exec"], result, "sid-123")
         log = (tmp_path / "worker_dispatch.log").read_text(encoding="utf-8")
         assert "role=worker" in log
         assert "returncode=0" in log
@@ -2448,16 +2571,12 @@ class TestResolveExeFromCandidates:
     def test_finds_existing_file(self, tmp_path: Path) -> None:
         exe = tmp_path / "mybin"
         exe.write_text("")
-        result = orchestrator._resolve_exe_from_candidates(
-            backend="test", candidates=[None, str(exe)]
-        )
+        result = orchestrator._resolve_exe_from_candidates(backend="test", candidates=[None, str(exe)])
         assert result == str(exe)
 
     def test_raises_when_none_found(self) -> None:
         with pytest.raises(RuntimeError, match="Cannot find executable"):
-            orchestrator._resolve_exe_from_candidates(
-                backend="test", candidates=[None, "/nonexistent/path"]
-            )
+            orchestrator._resolve_exe_from_candidates(backend="test", candidates=[None, "/nonexistent/path"])
 
 
 class TestParDispatchRemoval:
@@ -2551,6 +2670,7 @@ class TestRoleIsAlive:
         hb.write_text("{}", encoding="utf-8")
         # make it old
         import os
+
         old_time = hb.stat().st_mtime - 100
         os.utime(hb, (old_time, old_time))
         alive, reason = orchestrator._role_is_alive("worker", 30)
@@ -2592,31 +2712,28 @@ class TestValidateWorkReport:
 
     def test_empty_string(self) -> None:
         work = {"task_id": "  ", "head_sha": "abc", "round": 1}
-        assert "non-empty" in (
-            orchestrator._validate_work_report(work, expected_task_id="T-1", expected_round=1) or ""
-        )
+        assert "non-empty" in (orchestrator._validate_work_report(work, expected_task_id="T-1", expected_round=1) or "")
 
     def test_task_id_mismatch(self) -> None:
         work = {"task_id": "T-2", "head_sha": "abc", "round": 1}
-        assert "mismatch" in (
-            orchestrator._validate_work_report(work, expected_task_id="T-1", expected_round=1) or ""
-        )
+        assert "mismatch" in (orchestrator._validate_work_report(work, expected_task_id="T-1", expected_round=1) or "")
 
     def test_round_mismatch(self) -> None:
         work = {"task_id": "T-1", "head_sha": "abc", "round": 2}
-        assert "mismatch" in (
-            orchestrator._validate_work_report(work, expected_task_id="T-1", expected_round=1) or ""
-        )
+        assert "mismatch" in (orchestrator._validate_work_report(work, expected_task_id="T-1", expected_round=1) or "")
 
 
 class TestValidateReviewReport:
     def test_valid_report(self) -> None:
         review = {"task_id": "T-1", "round": 1, "decision": "approve"}
-        assert orchestrator._validate_review_report(
-            review,
-            expected_task_id="T-1",
-            expected_round=1,
-        ) is None
+        assert (
+            orchestrator._validate_review_report(
+                review,
+                expected_task_id="T-1",
+                expected_round=1,
+            )
+            is None
+        )
 
     def test_missing_field(self) -> None:
         assert "missing required field" in (
@@ -2624,7 +2741,8 @@ class TestValidateReviewReport:
                 {},
                 expected_task_id="T-1",
                 expected_round=1,
-            ) or ""
+            )
+            or ""
         )
 
     def test_invalid_decision(self) -> None:
@@ -2634,7 +2752,8 @@ class TestValidateReviewReport:
                 review,
                 expected_task_id="T-1",
                 expected_round=1,
-            ) or ""
+            )
+            or ""
         )
 
 
@@ -2647,9 +2766,7 @@ class TestLoadState:
 
     def test_loads_existing(self, tmp_path: Path, monkeypatch) -> None:
         _configure_loop_paths(monkeypatch, tmp_path)
-        orchestrator.STATE_FILE.write_text(
-            json.dumps({"state": "done", "round": 3}), encoding="utf-8"
-        )
+        orchestrator.STATE_FILE.write_text(json.dumps({"state": "done", "round": 3}), encoding="utf-8")
         state = orchestrator._load_state()
         assert state["state"] == "done"
         assert state["round"] == 3
@@ -2706,9 +2823,7 @@ class TestArchiveTaskSummary:
 class TestCmdStatus:
     def test_prints_state_and_file_markers(self, tmp_path: Path, monkeypatch, capsys) -> None:
         _configure_loop_paths(monkeypatch, tmp_path)
-        orchestrator.STATE_FILE.write_text(
-            json.dumps({"state": "done", "round": 1}), encoding="utf-8"
-        )
+        orchestrator.STATE_FILE.write_text(json.dumps({"state": "done", "round": 1}), encoding="utf-8")
         orchestrator.TASK_CARD.write_text("{}", encoding="utf-8")
         orchestrator.cmd_status()
         out = capsys.readouterr().out
@@ -2923,9 +3038,11 @@ class TestCmdExtractDiffValidation:
 
     def test_rejects_invalid_head(self, monkeypatch, capsys) -> None:
         calls: list[str] = []
+
         def fake_valid_ref(r):
             calls.append(r)
             return r == "HEAD"
+
         monkeypatch.setattr(orchestrator, "_is_valid_ref", fake_valid_ref)
         with pytest.raises(SystemExit) as exc:
             orchestrator.cmd_extract_diff("HEAD", "nonexistent")

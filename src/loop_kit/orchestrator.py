@@ -1526,7 +1526,44 @@ def _read_text_with_default(project_path: Path, default_filename: str) -> str:
     )
 
 
+def _render_fix_list_section(round_num: int) -> str:
+    fix_list = _read_json_if_exists(FIX_LIST)
+    if not isinstance(fix_list, dict):
+        return "- <none>"
+    fixes = fix_list.get("fixes", [])
+    if not isinstance(fixes, list) or not fixes:
+        return "- <none>"
+    lines = []
+    for issue in fixes:
+        if not isinstance(issue, dict):
+            continue
+        severity = issue.get("severity", "?")
+        file = issue.get("file", "")
+        reason = issue.get("reason", "")
+        lines.append(f"- [{severity}] {file}: {reason}")
+    return "\n".join(lines) if lines else "- <none>"
+
+
 def _worker_prompt(task_id: str, round_num: int) -> str:
+    if round_num > 1:
+        role_text = _read_text_with_default(
+            ROOT / "docs" / "roles" / "code-writer.md",
+            "code_writer_md_default.txt",
+        )
+        fix_list_section = _render_fix_list_section(round_num)
+        prior_context = _render_prior_round_context_section(round_num)
+        return (
+            "Role: code-writer worker for PM loop.\n"
+            f"Current task_id: {task_id}, round: {round_num}.\n"
+            f"Execute the contract below and only finish after writing {_display_path(WORK_REPORT)}.\n\n"
+            "=== BEGIN docs/roles/code-writer.md ===\n"
+            f"{role_text}\n"
+            "=== END docs/roles/code-writer.md ===\n\n"
+            f"=== FIX LIST (round {round_num}) ===\n"
+            f"fixes:\n{fix_list_section}\n\n"
+            f"{prior_context if prior_context else ''}"
+        )
+
     agents_text = _read_text_with_default(
         ROOT / "AGENTS.md",
         "agents_md_default.txt",
