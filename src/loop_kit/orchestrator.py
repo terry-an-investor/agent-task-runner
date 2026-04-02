@@ -2349,10 +2349,6 @@ def _run_single_round(
         )
         return
 
-    _log(f"Worker done. head_sha={head_sha}")
-    print(f"  Worker completed: {head_sha[:8]}")
-    print(f"  Files changed: {', '.join(work.get('files_changed', []))}")
-
     try:
         diff = _diff(base_sha, head_sha)
         commits = _log_oneline(base_sha, head_sha)
@@ -2362,6 +2358,10 @@ def _run_single_round(
             message=f"Failed to compare commits for base={base_sha} head={head_sha}: {e}",
         )
         return
+
+    _log(f"Worker done. head_sha={head_sha}")
+    print(f"  Worker completed: {head_sha[:8]}")
+    print(f"  Files changed: {', '.join(work.get('files_changed', []))}")
 
     review_request = {
         "task_id": task_id,
