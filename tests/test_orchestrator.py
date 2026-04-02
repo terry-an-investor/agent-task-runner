@@ -57,6 +57,7 @@ class _FakeProc:
         self.kill_called = False
         self.terminate_called = False
         self.wait_called = False
+        self.wait_timeouts: list[float | None] = []
 
     def poll(self) -> int | None:
         self._poll_calls += 1
@@ -81,8 +82,9 @@ class _FakeProc:
             close()
         self.returncode = -15
 
-    def wait(self) -> int:
+    def wait(self, timeout: float | None = None) -> int:
         self.wait_called = True
+        self.wait_timeouts.append(timeout)
         if self.returncode is None:
             self.returncode = self._returncode
         return self.returncode
@@ -418,6 +420,22 @@ def test_run_auto_dispatch_timeout_still_triggers_when_stdin_write_blocks(monkey
     assert proc.wait_called is True
     assert isinstance(proc.stdin, _BlockingStdin)
     assert proc.stdin.closed is True
+
+
+def test_collect_streamed_text_output_waits_with_timeout_on_stream_exception() -> None:
+    proc = _FakeProc(stdout_lines=["line-1\n"], poll_ready_after=999_999)
+
+    def fail_callback(_raw_line: str) -> None:
+        raise RuntimeError("stream boom")
+
+    with pytest.raises(RuntimeError, match="stream boom"):
+        orchestrator._collect_streamed_text_output(
+            proc,
+            stdout_line_callback=fail_callback,
+        )
+
+    assert proc.wait_called is True
+    assert proc.wait_timeouts == [1]
 
 
 def test_run_auto_dispatch_streams_compact_summaries_in_non_verbose_mode(monkeypatch, capsys) -> None:
@@ -2174,6 +2192,86 @@ def test_outer_loop_streams_single_round_subprocess_stdout_in_real_time(tmp_path
     out = capsys.readouterr().out
     assert "__line_1__" in out
     assert "__line_2__" in out
+
+
+def test_outer_loop_terminates_live_subprocess_when_stream_collection_raises(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+
+    task_path = tmp_path / "task_input.json"
+    task_path.write_text(
+        json.dumps({"task_id": "T-614", "goal": "cleanup on stream failure"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(orchestrator, "_current_sha", lambda: "base-sha")
+    monkeypatch.setattr(orchestrator, "_log", lambda msg: None)
+
+    proc = _FakeProc(stdout_lines=[], poll_ready_after=999_999)
+    monkeypatch.setattr(orchestrator.subprocess, "Popen", lambda cmd, **kwargs: proc)
+
+    def fake_collect_streamed_text_output(*args, **kwargs):
+        _ = (args, kwargs)
+        raise RuntimeError("stream read failed")
+
+    monkeypatch.setattr(orchestrator, "_collect_streamed_text_output", fake_collect_streamed_text_output)
+
+    with pytest.raises(RuntimeError, match="stream read failed"):
+        orchestrator.cmd_run(
+            _run_config(str(task_path)),
+            single_round=False,
+            round_num=None,
+        )
+
+    assert proc.terminate_called is True
+    assert proc.wait_called is True
+    assert proc.wait_timeouts == [2]
+
+
+def test_outer_loop_cleans_live_subprocess_between_rounds(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+
+    task_path = tmp_path / "task_input.json"
+    task_path.write_text(
+        json.dumps({"task_id": "T-614", "goal": "cleanup between rounds"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(orchestrator, "_current_sha", lambda: "base-sha")
+    monkeypatch.setattr(orchestrator, "_log", lambda msg: None)
+    monkeypatch.setattr(orchestrator, "_collect_streamed_text_output", lambda *args, **kwargs: ("", "", 0))
+
+    procs = [
+        _FakeProc(stdout_lines=[], poll_ready_after=999_999),
+        _FakeProc(stdout_lines=[], poll_ready_after=999_999),
+    ]
+    popen_calls: list[list[str]] = []
+
+    def fake_subprocess_popen(cmd, **kwargs):
+        _ = kwargs
+        popen_calls.append(cmd)
+        round_num = int(cmd[cmd.index("--round") + 1])
+        state = orchestrator._load_state()
+        if round_num == 1:
+            state["state"] = orchestrator.STATE_AWAITING_WORK
+            state["round"] = 2
+        else:
+            state["state"] = orchestrator.STATE_DONE
+            state["outcome"] = "approved"
+            state["head_sha"] = "head-sha"
+            state["round"] = round_num
+        orchestrator._save_state(state)
+        return procs[len(popen_calls) - 1]
+
+    monkeypatch.setattr(orchestrator.subprocess, "Popen", fake_subprocess_popen)
+
+    orchestrator.cmd_run(
+        _run_config(str(task_path), max_rounds=2),
+        single_round=False,
+        round_num=None,
+    )
+
+    assert len(popen_calls) == 2
+    assert procs[0].terminate_called is True
+    assert procs[0].wait_called is True
+    assert procs[0].wait_timeouts == [2]
 
 
 def test_outer_loop_uses_state_as_contract(tmp_path: Path, monkeypatch) -> None:

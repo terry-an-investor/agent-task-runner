@@ -1314,13 +1314,20 @@ def _collect_streamed_text_output(
     stderr_thread.start()
 
     if proc.stdout is not None:
+        stream_error = False
         try:
             for raw_line in proc.stdout:
                 stdout_chunks.append(raw_line)
                 if stdout_line_callback is not None:
                     stdout_line_callback(raw_line)
+        except Exception:
+            stream_error = True
+            raise
         finally:
             _close_pipe(proc.stdout)
+            if stream_error:
+                with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+                    proc.wait(timeout=1)
 
     returncode = proc.wait()
     stderr_thread.join()
@@ -3402,20 +3409,36 @@ def _run_multi_round_via_subprocess(
                 round_num=round_num,
             )
             _log(f"Launching single-round subprocess: {' '.join(cmd)}")
-            proc = subprocess.Popen(
-                cmd,
-                cwd=str(ROOT),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-            )
-            current_proc = proc
-            stdout, stderr, returncode = _collect_streamed_text_output(
-                proc,
-                stdout_line_callback=lambda raw_line: print(raw_line, end="", flush=True),
-            )
-            current_proc = None
+            if current_proc is not None and current_proc.poll() is None:
+                with contextlib.suppress(OSError):
+                    current_proc.terminate()
+                with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+                    current_proc.wait(timeout=2)
+                current_proc = None
+
+            proc: subprocess.Popen[str] | None = None
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    cwd=str(ROOT),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                )
+                current_proc = proc
+                stdout, stderr, returncode = _collect_streamed_text_output(
+                    proc,
+                    stdout_line_callback=lambda raw_line: print(raw_line, end="", flush=True),
+                )
+            finally:
+                if proc is not None and proc.poll() is None:
+                    with contextlib.suppress(OSError):
+                        proc.terminate()
+                    with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+                        proc.wait(timeout=2)
+                if current_proc is proc:
+                    current_proc = None
 
             if _interrupted_event.is_set():
                 interrupted = True
@@ -3495,6 +3518,11 @@ def _run_multi_round_via_subprocess(
             )
             return
     finally:
+        if current_proc is not None and current_proc.poll() is None:
+            with contextlib.suppress(OSError):
+                current_proc.terminate()
+            with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+                current_proc.wait(timeout=2)
         signal.signal(signal.SIGINT, old_sigint)
 
     if interrupted:
