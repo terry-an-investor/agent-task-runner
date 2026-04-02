@@ -19,6 +19,7 @@ All messages are JSON. Git commits are the single source of truth.
 
 import argparse
 import contextlib
+import importlib.metadata
 import importlib.resources
 import json
 import os
@@ -65,6 +66,13 @@ DEFAULT_REVIEWER_BACKEND = BACKEND_CODEX
 DEFAULT_DISPATCH_BACKEND = DISPATCH_BACKEND_NATIVE
 DISPATCH_STREAM_POLL_SEC = 0.1
 _WAIT_SAFETY_CAP_SEC = 86400  # 24h absolute cap in _wait_for_file
+EXIT_OK = 0
+EXIT_GENERAL_ERROR = 1
+EXIT_TIMEOUT = 2
+EXIT_VALIDATION_ERROR = 3
+EXIT_DIRTY_WORKTREE = 4
+EXIT_LOCK_FAILURE = 5
+EXIT_INTERRUPTED = 130
 _FEED_TASK_ID: str | None = None
 _LOGS_DIR_ENSURED = False
 _LOGS_DIR_ENSURED_PATH: str | None = None
@@ -1666,7 +1674,7 @@ def _enforce_clean_worktree_or_exit(*, allow_dirty: bool) -> None:
         print("Proceeding because --allow-dirty is set.", file=sys.stderr)
         return
     print("Refusing to start. Re-run with --allow-dirty to bypass.", file=sys.stderr)
-    sys.exit(4)
+    sys.exit(EXIT_DIRTY_WORKTREE)
 
 def _validate_work_report(
     work: dict,
@@ -1690,6 +1698,13 @@ def _validate_work_report(
             return f"work_report field '{field_name}' must be {typ.__name__}, got {type(value).__name__}"
         if typ is str and not value.strip():
             return f"work_report field '{field_name}' must be non-empty"
+
+    for list_field in ("files_changed", "tests"):
+        if list_field in work and not isinstance(work[list_field], list):
+            return (
+                f"work_report field '{list_field}' must be a list, "
+                f"got {type(work[list_field]).__name__}"
+            )
 
     if work["task_id"] != expected_task_id:
         return (
@@ -1812,7 +1827,7 @@ def _wait_for_file(
         elapsed += POLL_INTERVAL_SEC
 
 
-def _fail_with_state(state: dict, outcome: str, message: str, exit_code: int = 1) -> None:
+def _fail_with_state(state: dict, outcome: str, message: str, exit_code: int = EXIT_GENERAL_ERROR) -> None:
     _log(message)
     print(f"  Error: {message}", file=sys.stderr)
     state["state"] = STATE_DONE
@@ -1907,13 +1922,13 @@ def cmd_archive(task_id: str, restore: str | None = None) -> None:
     src = (archive_dir / restore_name).resolve()
     if not src.is_relative_to(archive_dir.resolve()):
         print("Error: restore path escapes archive directory", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(EXIT_GENERAL_ERROR)
     if not src.exists():
         print(
             f"Error: archive file not found for task_id={task_id}: {src}",
             file=sys.stderr,
         )
-        sys.exit(1)
+        sys.exit(EXIT_GENERAL_ERROR)
     target_name = _restore_target_name_from_archive(src.stem)
     dest = LOOP_DIR / target_name
     shutil.copy2(src, dest)
@@ -1924,14 +1939,14 @@ def cmd_extract_diff(base: str, head: str) -> None:
     for ref in (base, head):
         if not _is_valid_ref(ref):
             print(f"Error: invalid git ref: {ref!r}", file=sys.stderr)
-            sys.exit(1)
+            sys.exit(EXIT_GENERAL_ERROR)
     print(_diff(base, head))
 
 def cmd_heartbeat(role: str, interval: int) -> None:
     role = role.lower().strip()
     if role not in {"worker", "reviewer"}:
         print(f"Error: invalid role: {role}", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(EXIT_GENERAL_ERROR)
     LOOP_DIR.mkdir(exist_ok=True)
     RUNTIME_DIR.mkdir(exist_ok=True)
     hb = _heartbeat_path(role)
@@ -1952,7 +1967,7 @@ def cmd_heartbeat(role: str, interval: int) -> None:
     except KeyboardInterrupt:
         _log(f"Heartbeat stopped for role={role}")
         print("\n  Heartbeat stopped.")
-        sys.exit(0)
+        sys.exit(EXIT_OK)
 
 def cmd_health(ttl: int) -> None:
     for role in ("worker", "reviewer"):
@@ -1965,18 +1980,18 @@ def _load_task_card(task_path: str) -> tuple[Path, dict, str]:
     tp = Path(task_path)
     if not tp.exists():
         print(f"Error: task card not found: {tp}", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(EXIT_GENERAL_ERROR)
     try:
         task_card = json.loads(tp.read_text(encoding="utf-8"))
     except json.JSONDecodeError as e:
         print(f"Error: task card at {tp} contains invalid JSON: {e}", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(EXIT_GENERAL_ERROR)
     except OSError as e:
         print(f"Error: unable to read task card at {tp}: {e}", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(EXIT_GENERAL_ERROR)
     if not isinstance(task_card, dict):
         print(f"Error: task card must be a JSON object: {tp}", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(EXIT_GENERAL_ERROR)
     task_id = task_card.get("task_id", "UNKNOWN")
     return tp, task_card, task_id
 
@@ -2125,7 +2140,7 @@ def _run_single_round(
         _archive_state_for_round(task_id_from_card, round_num)
         _save_state(state)
 
-    def _fail_single_round(outcome: str, message: str, exit_code: int = 3) -> None:
+    def _fail_single_round(outcome: str, message: str, exit_code: int = EXIT_VALIDATION_ERROR) -> None:
         _archive_state_for_round(task_id_from_card, round_num)
         _fail_with_state(
             state,
@@ -2142,7 +2157,7 @@ def _run_single_round(
                     "single-round requires existing state contract for round>1: "
                     f"task_id={state_task_id!r} base_sha={state_base_sha!r}"
                 ),
-                exit_code=3,
+                exit_code=EXIT_VALIDATION_ERROR,
             )
             return
         state_task_id = task_id_from_card
@@ -2166,7 +2181,7 @@ def _run_single_round(
                 "task_id mismatch between state.json and task card: "
                 f"state={state_task_id!r} task={task_id_from_card!r}"
             ),
-            exit_code=3,
+            exit_code=EXIT_VALIDATION_ERROR,
         )
         return
 
@@ -2206,7 +2221,7 @@ def _run_single_round(
         _fail_single_round(
             outcome="worker_dispatch_failed",
             message=str(e),
-            exit_code=3,
+            exit_code=EXIT_VALIDATION_ERROR,
         )
         return
 
@@ -2229,7 +2244,7 @@ def _run_single_round(
         state["outcome"] = "worker_timeout"
         state["error"] = "Worker timed out"
         _save_single_round_state()
-        sys.exit(2)
+        sys.exit(EXIT_TIMEOUT)
 
     report_error = _validate_work_report(
         work,
@@ -2240,7 +2255,7 @@ def _run_single_round(
         _fail_single_round(
             outcome="invalid_work_report",
             message=report_error,
-            exit_code=3,
+            exit_code=EXIT_VALIDATION_ERROR,
         )
         return
 
@@ -2252,7 +2267,7 @@ def _run_single_round(
                 "Worker reported no code changes: head_sha equals base_sha "
                 f"({head_sha}). task_id={task_id} round={round_num}"
             ),
-            exit_code=3,
+            exit_code=EXIT_VALIDATION_ERROR,
         )
         return
 
@@ -2309,7 +2324,7 @@ def _run_single_round(
         _fail_single_round(
             outcome="reviewer_dispatch_failed",
             message=str(e),
-            exit_code=3,
+            exit_code=EXIT_VALIDATION_ERROR,
         )
         return
 
@@ -2330,7 +2345,7 @@ def _run_single_round(
         state["outcome"] = "reviewer_timeout"
         state["error"] = "Reviewer timed out"
         _save_single_round_state()
-        sys.exit(2)
+        sys.exit(EXIT_TIMEOUT)
 
     review_error = _validate_review_report(
         review,
@@ -2341,7 +2356,7 @@ def _run_single_round(
         _fail_single_round(
             outcome="invalid_review_report",
             message=review_error,
-            exit_code=3,
+            exit_code=EXIT_VALIDATION_ERROR,
         )
         return
 
@@ -2476,7 +2491,7 @@ def _run_multi_round_via_subprocess(
                     "state.json is missing required resume contract "
                     "(task_id/base_sha/round). Re-run without --resume."
                 ),
-                exit_code=3,
+                exit_code=EXIT_VALIDATION_ERROR,
             )
             return
         _, task_card, task_id_from_card = _load_task_card(str(TASK_CARD))
@@ -2488,7 +2503,7 @@ def _run_multi_round_via_subprocess(
                     "task_id mismatch between state.json and task card during resume: "
                     f"state={state_task_id!r} task={task_id_from_card!r}"
                 ),
-                exit_code=3,
+                exit_code=EXIT_VALIDATION_ERROR,
             )
             return
         task_id = state_task_id
@@ -2573,7 +2588,7 @@ def _run_multi_round_via_subprocess(
                     state,
                     outcome="single_round_failed",
                     message=f"single-round subprocess failed for round={round_num} rc={result.returncode}",
-                    exit_code=3,
+                    exit_code=EXIT_VALIDATION_ERROR,
                 )
                 return
 
@@ -2591,7 +2606,7 @@ def _run_multi_round_via_subprocess(
                         f"expected task_id={task_id} base_sha={base_sha}, "
                         f"got task_id={state.get('task_id')} base_sha={state.get('base_sha')}"
                     ),
-                    exit_code=3,
+                    exit_code=EXIT_VALIDATION_ERROR,
                 )
                 return
 
@@ -2633,7 +2648,7 @@ def _run_multi_round_via_subprocess(
                     "single-round subprocess exited 0 but did not produce a valid state transition: "
                     f"state={state.get('state')!r} outcome={state.get('outcome')!r} round={state.get('round')!r}"
                 ),
-                exit_code=3,
+                exit_code=EXIT_VALIDATION_ERROR,
             )
             return
     finally:
@@ -2644,7 +2659,7 @@ def _run_multi_round_via_subprocess(
             _load_state(),
             outcome="interrupted",
             message="User interrupted (SIGINT)",
-            exit_code=130,
+            exit_code=EXIT_INTERRUPTED,
         )
 
     state = _load_state()
@@ -2654,7 +2669,7 @@ def _run_multi_round_via_subprocess(
     print(f"\n  MAX ROUNDS ({config.max_rounds}) reached without approval.")
     print(f"  Last review decision: {last_decision}")
     print("  PM should re-evaluate task scope or split the task.")
-    sys.exit(1)
+    sys.exit(EXIT_GENERAL_ERROR)
 
 
 def cmd_run(
@@ -2671,7 +2686,7 @@ def cmd_run(
             lock = _acquire_run_lock()
         except RuntimeError as e:
             print(f"Error: {e}", file=sys.stderr)
-            sys.exit(5)
+            sys.exit(EXIT_LOCK_FAILURE)
     try:
         # Single-round subprocesses are spawned by the parent loop which already
         # validated the worktree — skip redundant check to avoid duplicate warnings.
@@ -2680,12 +2695,12 @@ def cmd_run(
 
         if resume and single_round:
             print("Error: --resume cannot be combined with --single-round", file=sys.stderr)
-            sys.exit(1)
+            sys.exit(EXIT_GENERAL_ERROR)
 
         if single_round:
             if round_num is None or round_num < 1:
                 print("Error: --single-round requires --round N (N >= 1)", file=sys.stderr)
-                sys.exit(1)
+                sys.exit(EXIT_GENERAL_ERROR)
             _run_single_round(
                 config=config,
                 round_num=round_num,
@@ -2695,7 +2710,7 @@ def cmd_run(
 
         if round_num is not None:
             print("Error: --round is only valid together with --single-round", file=sys.stderr)
-            sys.exit(1)
+            sys.exit(EXIT_GENERAL_ERROR)
 
         resume_state: dict | None = None
         if resume:
@@ -2716,7 +2731,7 @@ def cmd_run(
                     file=sys.stderr,
                 )
                 print("Re-run without --resume to start a fresh run.", file=sys.stderr)
-                sys.exit(3)
+                sys.exit(EXIT_VALIDATION_ERROR)
 
         _run_multi_round_via_subprocess(
             config=config,
@@ -2732,6 +2747,11 @@ def cmd_run(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="PM-driven review loop orchestrator",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {importlib.metadata.version('loop-kit')}",
     )
     shared = argparse.ArgumentParser(add_help=False)
     shared.add_argument(
