@@ -229,8 +229,9 @@ def test_register_backend_allows_custom_backend_in_run_cli(monkeypatch) -> None:
         single_round: bool,
         round_num: int | None,
         resume: bool = False,
+        reset: bool = False,
     ) -> None:
-        _ = (single_round, round_num, resume)
+        _ = (single_round, round_num, resume, reset)
         captured["worker_backend"] = config.worker_backend
         captured["reviewer_backend"] = config.reviewer_backend
 
@@ -1192,7 +1193,9 @@ def test_main_run_parses_artifact_timeout(monkeypatch) -> None:
         single_round: bool,
         round_num: int | None,
         resume: bool = False,
+        reset: bool = False,
     ) -> None:
+        _ = reset
         captured["artifact_timeout"] = config.artifact_timeout
         captured["single_round"] = single_round
         captured["round_num"] = round_num
@@ -1232,8 +1235,9 @@ def test_main_run_parses_dispatch_retry_flags(monkeypatch) -> None:
         single_round: bool,
         round_num: int | None,
         resume: bool = False,
+        reset: bool = False,
     ) -> None:
-        _ = (single_round, round_num, resume)
+        _ = (single_round, round_num, resume, reset)
         captured["dispatch_retries"] = config.dispatch_retries
         captured["dispatch_retry_base_sec"] = config.dispatch_retry_base_sec
 

@@ -94,6 +94,11 @@ WORK_REPORT = _path("work_report.json")
 REVIEW_REQ = _path("review_request.json")
 REVIEW_REPORT = _path("review_report.json")
 LOCK_FILE = _path("lock")
+_SUMMARY_FILE = _path("summary.json")
+_RESETTABLE_FILES = [
+    LOCK_FILE, STATE_FILE, _SUMMARY_FILE,
+    WORK_REPORT, REVIEW_REPORT, REVIEW_REQ, FIX_LIST,
+]
 
 
 @dataclass(slots=True)
@@ -1789,6 +1794,31 @@ def _dirty_tracked_paths() -> list[str]:
     return sorted(set(dirty))
 
 
+def _reset_bus() -> None:
+    """Remove stale bus files from a previous run."""
+    removed = 0
+    for f in _RESETTABLE_FILES:
+        if f.is_file():
+            f.unlink()
+            removed += 1
+    if removed:
+        _log(f"Reset: removed {removed} stale bus file(s)")
+
+
+def _sync_task_card(task_path: str) -> None:
+    """Copy external task card to .loop/task_card.json if it lives elsewhere."""
+    src = Path(task_path)
+    if not src.is_file():
+        return
+    try:
+        if src.resolve() == TASK_CARD.resolve():
+            return
+    except OSError:
+        pass
+    TASK_CARD.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+    _log(f"Synced task card: {src} -> {TASK_CARD}")
+
+
 def _enforce_clean_worktree_or_exit(*, allow_dirty: bool) -> None:
     dirty = _dirty_tracked_paths()
     if not dirty:
@@ -2793,6 +2823,7 @@ def cmd_run(
     single_round: bool,
     round_num: int | None,
     resume: bool = False,
+    reset: bool = False,
 ) -> None:
     lock: _LoopLock | None = None
     # Single-round subprocesses are spawned by the parent loop which already
@@ -2804,6 +2835,10 @@ def cmd_run(
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(EXIT_LOCK_FAILURE)
     try:
+        if reset and not single_round:
+            _reset_bus()
+            _sync_task_card(config.task_path)
+
         # Single-round subprocesses are spawned by the parent loop which already
         # validated the worktree — skip redundant check to avoid duplicate warnings.
         if not single_round:
@@ -2956,6 +2991,7 @@ def main() -> None:
     run_p.add_argument("--round", type=int, help="Round number for --single-round mode")
     run_p.add_argument("--allow-dirty", action="store_true", help="Allow run to start with dirty tracked git files")
     run_p.add_argument("--resume", action="store_true", help="Resume from .loop/state.json contract")
+    run_p.add_argument("--reset", action="store_true", help="Clear stale bus files and sync task card before starting")
     run_p.add_argument("--verbose", action="store_true", help="Stream full backend stdout lines during auto-dispatch")
 
     args = parser.parse_args()
@@ -2998,6 +3034,7 @@ def main() -> None:
             single_round=args.single_round,
             round_num=args.round,
             resume=args.resume,
+            reset=args.reset,
         )
     else:
         parser.print_help()
