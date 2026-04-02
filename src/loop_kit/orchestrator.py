@@ -1463,8 +1463,7 @@ def _dispatch_with_artifact_fallback(
         raise RuntimeError(str(e)) from e
     if artifact_path.exists():
         data = _read_json_if_exists(artifact_path)
-        if isinstance(data, dict):
-            if data.get("task_id") == task_id and data.get("round") == round_num:
+        if isinstance(data, dict) and data.get("task_id") == task_id and data.get("round") == round_num:
                 _log(f"{role} dispatch produced {artifact_path.name} directly; skipping wait")
                 return data
     return _require_dispatch_artifact(
@@ -1514,11 +1513,7 @@ def _function_index(path: Path) -> str:
         if stripped.startswith(("def ", "async def ", "class ")):
             entries.append(f"- L{line_no}: {stripped}")
 
-    if not entries:
-        result = "- <none>"
-    else:
-        result = "\n".join(entries)
-
+    result = "- <none>" if not entries else "\n".join(entries)
     _function_index_cache = (key, result)
     return result
 
