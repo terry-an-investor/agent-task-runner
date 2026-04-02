@@ -28,6 +28,7 @@ loop = "loop_kit.cli:main"
 dev = [
     "pytest>=7",
     "pytest-timeout>=2",
+    "ruff>=0.11",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -40,4 +41,12 @@ testpaths = ["tests"]
 dev = [
     "pytest>=9.0.2",
     "pytest-timeout>=2.4.0",
+    "ruff>=0.11",
 ]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]

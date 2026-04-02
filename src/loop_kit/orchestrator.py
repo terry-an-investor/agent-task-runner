@@ -18,6 +18,7 @@ All messages are JSON. Git commits are the single source of truth.
 """
 
 import argparse
+import contextlib
 import json
 import os
 import shutil
@@ -25,13 +26,13 @@ import signal
 import subprocess
 import sys
 import threading
-import types
 import time
+import types
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable
 
 if os.name == "nt":
     import msvcrt
@@ -189,10 +190,8 @@ def _close_pipe(pipe: object | None) -> None:
         return
     close = getattr(pipe, "close", None)
     if callable(close):
-        try:
+        with contextlib.suppress(OSError):
             close()
-        except OSError:
-            pass
 
 
 def _completed_proc(
@@ -251,7 +250,7 @@ class _LoopLock:
 
     def acquire(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        handle = open(self.path, "a+b")
+        handle = open(self.path, "a+b")  # noqa: SIM115
         try:
             handle.seek(0, os.SEEK_END)
             if handle.tell() == 0:
@@ -314,7 +313,7 @@ def _feed_log_path() -> Path:
 
 # ── logging ─────────────────────────────────────────────────────────
 def _ts() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def _set_feed_task_id(task_id: str | None) -> None:
     global _FEED_TASK_ID
@@ -326,7 +325,7 @@ def _ensure_logs_dir() -> None:
     current_logs_dir = _normalized_abs(LOGS_DIR)
     if (
         _LOGS_DIR_ENSURED
-        and _LOGS_DIR_ENSURED_PATH == current_logs_dir
+        and current_logs_dir == _LOGS_DIR_ENSURED_PATH
         and LOGS_DIR.is_dir()
     ):
         return
@@ -572,7 +571,7 @@ def _shorten_paths(paths: list[str]) -> list[str]:
             has_collision = False
             for index in indexes:
                 parts = path_parts[index]
-                if not parts:
+                if not parts:  # noqa: SIM108
                     candidate = shortened[index]
                 else:
                     candidate = "/".join(parts[-min(depth, len(parts)) :])
@@ -697,7 +696,7 @@ def _stream_dispatch_stdout_line(role: str, backend: str, raw_line: str, *, verb
     read_state = getattr(_stream_local, "read_state", None)
     if read_state is None:
         read_state = {}
-        setattr(_stream_local, "read_state", read_state)
+        _stream_local.read_state = read_state
 
     state_key = f"{role}:{backend}"
     line = raw_line.rstrip("\r\n")
@@ -808,7 +807,11 @@ def _build_codex_command(exe: str, prompt: str) -> tuple[list[str], str | None, 
         "--json",
         "--dangerously-bypass-approvals-and-sandbox",
         "-C", str(ROOT),
-        "Execute the context provided via stdin.  Follow the instructions embedded in it and only finish after the required output artifact is written.",
+        (
+            "Execute the context provided via stdin.  Follow the instructions"
+            " embedded in it and only finish after the required output artifact"
+            " is written."
+        ),
     ], None, prompt)
 
 
@@ -1045,14 +1048,10 @@ def _terminate_subprocess_on_interrupt(proc: subprocess.Popen[str], *, context: 
         is_running = False
 
     if is_running:
-        try:
+        with contextlib.suppress(OSError):
             proc.terminate()
-        except OSError:
-            pass
-    try:
+    with contextlib.suppress(OSError):
         proc.wait()
-    except OSError:
-        pass
     status = "terminated" if is_running else "already exited"
     _log(f"Interrupted by SIGINT; subprocess {status} ({context})")
 
@@ -1441,7 +1440,7 @@ def _save_state(state: dict) -> None:
 def _git(*args: str, timeout: float | None = DEFAULT_GIT_TIMEOUT_SEC) -> str:
     try:
         result = subprocess.run(
-            ["git", "-C", str(ROOT)] + list(args),
+            ["git", "-C", str(ROOT), *args],
             capture_output=True, text=True, encoding="utf-8", timeout=timeout,
         )
     except subprocess.TimeoutExpired as exc:
@@ -1524,17 +1523,17 @@ def _validate_work_report(
         "head_sha": str,
         "round": int,
     }
-    for field, typ in required_types.items():
-        if field not in work:
-            return f"work_report.json missing required field '{field}'"
-        value = work[field]
+    for field_name, typ in required_types.items():
+        if field_name not in work:
+            return f"work_report.json missing required field '{field_name}'"
+        value = work[field_name]
         if typ is int:
             if type(value) is not int:
-                return f"work_report field '{field}' must be int, got {type(value).__name__}"
+                return f"work_report field '{field_name}' must be int, got {type(value).__name__}"
         elif not isinstance(value, typ):
-            return f"work_report field '{field}' must be {typ.__name__}, got {type(value).__name__}"
+            return f"work_report field '{field_name}' must be {typ.__name__}, got {type(value).__name__}"
         if typ is str and not value.strip():
-            return f"work_report field '{field}' must be non-empty"
+            return f"work_report field '{field_name}' must be non-empty"
 
     if work["task_id"] != expected_task_id:
         return (
@@ -2302,10 +2301,8 @@ def _run_multi_round_via_subprocess(
         interrupted = True
         if current_proc is not None and current_proc.poll() is None:
             _log(f"SIGINT received during round {round_num}; terminating subprocess")
-            try:
+            with contextlib.suppress(OSError):
                 current_proc.terminate()
-            except OSError:
-                pass
 
     old_sigint = signal.signal(signal.SIGINT, _outer_sigint_handler)
 

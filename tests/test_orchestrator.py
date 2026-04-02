@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import builtins
 import json
 import subprocess
 import sys
 import threading
-import builtins
 from pathlib import Path
 
 import pytest
@@ -269,8 +269,6 @@ def test_run_auto_dispatch_passes_stdin_text_to_subprocess(monkeypatch) -> None:
 
 
 def test_run_auto_dispatch_timeout_kills_and_waits_process(monkeypatch) -> None:
-    captured: dict[str, object] = {}
-
     monkeypatch.setattr(
         orchestrator,
         "_agent_command",
@@ -1774,7 +1772,10 @@ def test_cmd_run_resume_done_approved_exits_cleanly(
         encoding="utf-8",
     )
     called = {"outer": False}
-    monkeypatch.setattr(orchestrator, "_run_multi_round_via_subprocess", lambda **kwargs: called.update({"outer": True}))
+    monkeypatch.setattr(
+        orchestrator, "_run_multi_round_via_subprocess",
+        lambda **kwargs: called.update({"outer": True}),
+    )
 
     orchestrator.cmd_run(
         _run_config(str(task_path)),
@@ -1943,7 +1944,7 @@ class TestTs:
         assert result.endswith("Z")
         assert "T" in result
         # verify it parses as a valid timestamp
-        from datetime import datetime, timezone
+        from datetime import datetime
         datetime.strptime(result, "%Y-%m-%dT%H:%M:%SZ")
 
 
@@ -2038,7 +2039,7 @@ class TestCodexEventSummary:
         })
         result = orchestrator._codex_event_summary("worker", "codex", line)
         assert result is not None
-        assert "[worker] Running: npm test" == result
+        assert result == "[worker] Running: npm test"
 
     def test_agent_message(self) -> None:
         line = json.dumps({
@@ -2063,7 +2064,7 @@ class TestCodexEventSummary:
         })
         result = orchestrator._codex_event_summary("worker", "codex", line)
         assert result is not None
-        assert "[worker] Editing: orchestrator.py, test_orchestrator.py" == result
+        assert result == "[worker] Editing: orchestrator.py, test_orchestrator.py"
 
     def test_top_level_file_change_uses_short_filename(self) -> None:
         line = json.dumps({
@@ -2074,7 +2075,7 @@ class TestCodexEventSummary:
         })
         result = orchestrator._codex_event_summary("worker", "codex", line)
         assert result is not None
-        assert "[worker] Editing: orchestrator.py" == result
+        assert result == "[worker] Editing: orchestrator.py"
 
     def test_file_change_keeps_colliding_basenames(self) -> None:
         line = json.dumps({
@@ -2089,7 +2090,7 @@ class TestCodexEventSummary:
         })
         result = orchestrator._codex_event_summary("worker", "codex", line)
         assert result is not None
-        assert "[worker] Editing: api/config.py, tests/config.py" == result
+        assert result == "[worker] Editing: api/config.py, tests/config.py"
 
     def test_command_execution_strips_powershell_wrapper(self) -> None:
         line = json.dumps({
@@ -2105,10 +2106,10 @@ class TestCodexEventSummary:
         })
         result = orchestrator._codex_event_summary("worker", "codex", line)
         assert result is not None
-        assert (
+        assert result == (
             "[worker] Running: Get-Content -Path src/loop_kit/orchestrator.py "
             "| Select-Object -Skip 40 -First 20"
-        ) == result
+        )
 
     def test_item_started(self) -> None:
         line = json.dumps({
@@ -2295,7 +2296,7 @@ class TestRoleIsAlive:
         hb.parent.mkdir(parents=True, exist_ok=True)
         hb.write_text("{}", encoding="utf-8")
         # make it old
-        import os, time
+        import os
         old_time = hb.stat().st_mtime - 100
         os.utime(hb, (old_time, old_time))
         alive, reason = orchestrator._role_is_alive("worker", 30)
