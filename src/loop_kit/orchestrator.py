@@ -3013,7 +3013,7 @@ def main() -> None:
     run_p.add_argument(
         "--auto-dispatch",
         action="store_true",
-        default=False,
+        default=None,
         help="Automatically invoke worker/reviewer backends each round",
     )
     run_p.add_argument(

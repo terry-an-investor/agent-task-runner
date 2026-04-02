@@ -3313,6 +3313,149 @@ class TestConfigureLoopPathsGlobals:
         orchestrator._configure_loop_paths(".loop")
 
 
+class TestAutoDispatchConfig:
+    def test_auto_dispatch_from_config_when_cli_flag_omitted(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        config_path = tmp_path / ".loop" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text('{"auto_dispatch": true}', encoding="utf-8")
+
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["orchestrator.py", "run", "--loop-dir", ".loop"],
+        )
+
+        captured: dict[str, bool] = {}
+
+        def fake_cmd_run(
+            config: orchestrator.RunConfig,
+            single_round: bool,
+            round_num: int | None,
+            resume: bool = False,
+            reset: bool = False,
+        ) -> None:
+            _ = (single_round, round_num, resume, reset)
+            captured["auto_dispatch"] = config.auto_dispatch
+
+        monkeypatch.setattr(orchestrator, "cmd_run", fake_cmd_run)
+
+        orchestrator.main()
+
+        assert captured["auto_dispatch"] is True
+
+    def test_auto_dispatch_cli_flag_overrides_config(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        config_path = tmp_path / ".loop" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text('{"auto_dispatch": false}', encoding="utf-8")
+
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["orchestrator.py", "run", "--loop-dir", ".loop", "--auto-dispatch"],
+        )
+
+        captured: dict[str, bool] = {}
+
+        def fake_cmd_run(
+            config: orchestrator.RunConfig,
+            single_round: bool,
+            round_num: int | None,
+            resume: bool = False,
+            reset: bool = False,
+        ) -> None:
+            _ = (single_round, round_num, resume, reset)
+            captured["auto_dispatch"] = config.auto_dispatch
+
+        monkeypatch.setattr(orchestrator, "cmd_run", fake_cmd_run)
+
+        orchestrator.main()
+
+        assert captured["auto_dispatch"] is True
+
+    def test_auto_dispatch_builtin_default_when_no_cli_no_config(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["orchestrator.py", "run", "--loop-dir", ".loop"],
+        )
+
+        captured: dict[str, bool] = {}
+
+        def fake_cmd_run(
+            config: orchestrator.RunConfig,
+            single_round: bool,
+            round_num: int | None,
+            resume: bool = False,
+            reset: bool = False,
+        ) -> None:
+            _ = (single_round, round_num, resume, reset)
+            captured["auto_dispatch"] = config.auto_dispatch
+
+        monkeypatch.setattr(orchestrator, "cmd_run", fake_cmd_run)
+
+        orchestrator.main()
+
+        assert captured["auto_dispatch"] is False
+
+
 class TestResetDefault:
     def test_task_card_in_resettable_files(self) -> None:
         assert orchestrator.TASK_CARD in orchestrator._RESETTABLE_FILES
+
+    def test_reset_default_off_no_reset_flag(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        orchestrator.TASK_CARD.write_text('{"task_id":"T-001"}', encoding="utf-8")
+
+        captured: dict[str, bool] = {}
+
+        def fake_cmd_run(
+            config: orchestrator.RunConfig,
+            single_round: bool,
+            round_num: int | None,
+            resume: bool = False,
+            reset: bool = False,
+        ) -> None:
+            _ = (config, single_round, round_num, resume)
+            captured["reset"] = reset
+
+        monkeypatch.setattr(orchestrator, "cmd_run", fake_cmd_run)
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["orchestrator.py", "run", "--task", str(orchestrator.TASK_CARD)],
+        )
+
+        orchestrator.main()
+
+        assert captured["reset"] is False
+
+    def test_reset_opt_in_with_flag(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        orchestrator.TASK_CARD.write_text('{"task_id":"T-001"}', encoding="utf-8")
+
+        captured: dict[str, bool] = {}
+
+        def fake_cmd_run(
+            config: orchestrator.RunConfig,
+            single_round: bool,
+            round_num: int | None,
+            resume: bool = False,
+            reset: bool = False,
+        ) -> None:
+            _ = (config, single_round, round_num, resume)
+            captured["reset"] = reset
+
+        monkeypatch.setattr(orchestrator, "cmd_run", fake_cmd_run)
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["orchestrator.py", "run", "--task", str(orchestrator.TASK_CARD), "--reset"],
+        )
+
+        orchestrator.main()
+
+        assert captured["reset"] is True
