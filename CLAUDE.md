@@ -6,7 +6,7 @@ This file provides guidance to Claude Code when working with code in this reposi
 
 **loop-kit** is a PM-driven review-loop orchestrator for AI coding agents.
 It runs multi-round Worker/Reviewer cycles via file bus in `.loop/`,
-supporting codex and claude backends with auto-dispatch.
+supporting codex, claude, and opencode backends with auto-dispatch.
 
 ## Architecture
 
@@ -56,7 +56,7 @@ mock `subprocess` for dispatch tests. Keep tests focused and independent.
 - **Non-trivial tasks**: act as the **PM/orchestrator**. Create a task card
   and run `loop run --auto-dispatch` to delegate to the worker backend.
   Do not write the code yourself.
-- Commit after completing a set of changes. Write clear, descriptive messages.
+- Commit after completing a set of changes. Write clear, descriptive messages. Any self-made changes must be committed — no silent uncommitted edits.
 
 ## Known Gotchas
 
