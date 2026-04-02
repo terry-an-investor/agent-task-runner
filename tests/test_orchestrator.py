@@ -816,6 +816,8 @@ def test_worker_prompt_loads_template_when_file_exists(tmp_path: Path, monkeypat
     assert "AGENTS_CONTENT" in prompt
     assert "CODE_WRITER_CONTENT" in prompt
     assert "goal: Use custom template" in prompt
+    assert "AGENTS.md (Default)" not in prompt
+    assert "code-writer.md (Default)" not in prompt
 
 
 def test_worker_prompt_raises_when_template_missing(
@@ -867,42 +869,83 @@ def test_reviewer_prompt_includes_role_doc(monkeypatch) -> None:
     assert "Current task_id: T-603, round: 2." in prompt
 
 
-def test_worker_prompt_raises_when_code_writer_role_doc_missing(
+def test_worker_prompt_uses_default_code_writer_doc_when_project_file_missing(
     tmp_path: Path, monkeypatch
 ) -> None:
     _configure_loop_paths(monkeypatch, tmp_path)
     (tmp_path / "docs" / "roles" / "code-writer.md").unlink()
 
-    with pytest.raises(RuntimeError) as exc:
-        orchestrator._worker_prompt("T-613", 1)
+    prompt = orchestrator._worker_prompt("T-613", 1)
 
-    message = str(exc.value)
-    assert "Missing required code-writer role doc" in message
-    assert "Create this file and re-run" in message
+    assert "code-writer.md (Default)" in prompt
+    assert "You are the implementation worker." in prompt
 
 
-def test_worker_prompt_raises_when_agents_doc_missing(tmp_path: Path, monkeypatch) -> None:
+def test_worker_prompt_uses_default_agents_doc_when_project_file_missing(tmp_path: Path, monkeypatch) -> None:
     _configure_loop_paths(monkeypatch, tmp_path)
     (tmp_path / "AGENTS.md").unlink()
 
-    with pytest.raises(RuntimeError) as exc:
-        orchestrator._worker_prompt("T-613", 1)
+    prompt = orchestrator._worker_prompt("T-613", 1)
 
-    message = str(exc.value)
-    assert "Missing required AGENTS.md" in message
-    assert "Create this file and re-run" in message
+    assert "AGENTS.md (Default)" in prompt
+    assert "Python target is 3.11+" in prompt
 
 
-def test_reviewer_prompt_raises_when_role_doc_missing(tmp_path: Path, monkeypatch) -> None:
+def test_worker_prompt_succeeds_when_agents_and_code_writer_docs_missing(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+    (tmp_path / "AGENTS.md").unlink()
+    (tmp_path / "docs" / "roles" / "code-writer.md").unlink()
+
+    prompt = orchestrator._worker_prompt("T-613", 1)
+
+    assert "AGENTS.md (Default)" in prompt
+    assert "code-writer.md (Default)" in prompt
+
+
+def test_reviewer_prompt_uses_default_role_doc_when_project_file_missing(tmp_path: Path, monkeypatch) -> None:
     _configure_loop_paths(monkeypatch, tmp_path)
     (tmp_path / "docs" / "roles" / "reviewer.md").unlink()
 
-    with pytest.raises(RuntimeError) as exc:
-        orchestrator._reviewer_prompt("T-613", 1)
+    prompt = orchestrator._reviewer_prompt("T-613", 1)
 
-    message = str(exc.value)
-    assert "Missing required reviewer role doc" in message
-    assert "Create this file and re-run" in message
+    assert "reviewer.md (Default)" in prompt
+    assert "reviewer agent in the PM loop" in prompt
+
+
+def test_default_prompt_context_files_are_non_empty_and_practical() -> None:
+    defaults_dir = Path(orchestrator.__file__).resolve().parent / "defaults"
+    expectations = {
+        "agents_md_default.txt": ["Python", "_", "pytest"],
+        "code_writer_md_default.txt": ["task_card", "commit", "work_report.json"],
+        "reviewer_md_default.txt": ["review_request", "acceptance", "review_report.json"],
+    }
+
+    for filename, keywords in expectations.items():
+        text = (defaults_dir / filename).read_text(encoding="utf-8")
+        assert len(text.strip()) >= 200
+        for keyword in keywords:
+            assert keyword in text
+
+
+def test_read_text_with_default_prefers_project_file(tmp_path: Path) -> None:
+    project_path = tmp_path / "AGENTS.md"
+    project_path.write_text("PROJECT_AGENTS_OVERRIDE", encoding="utf-8")
+
+    result = orchestrator._read_text_with_default(project_path, "agents_md_default.txt")
+
+    assert result == "PROJECT_AGENTS_OVERRIDE"
+
+
+def test_read_text_with_default_uses_packaged_default_when_project_file_missing(
+    tmp_path: Path,
+) -> None:
+    project_path = tmp_path / "AGENTS.md"
+
+    result = orchestrator._read_text_with_default(project_path, "agents_md_default.txt")
+
+    assert "AGENTS.md (Default)" in result
 
 
 def test_log_writes_jsonl_feed_entry(tmp_path: Path, monkeypatch) -> None:

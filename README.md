@@ -142,7 +142,9 @@ Backend discovery uses `shutil.which()` plus known install paths. The backend re
 - **worker_prompt.txt** — Worker prompt with `{task_id}`, `{round_num}`, `{agents_md}`, `{role_md}`, `{task_card_section}`, `{prior_context_section}`, `{work_report_path}` placeholders
 - **reviewer_prompt.txt** — Reviewer prompt with `{task_id}`, `{round_num}`, `{role_md}`, `{review_report_path}` placeholders
 
-The worker also reads `AGENTS.md` and `docs/roles/code-writer.md` from the project root. The reviewer reads `docs/roles/reviewer.md`.
+The worker first reads project `AGENTS.md` and `docs/roles/code-writer.md`, and the reviewer first reads project `docs/roles/reviewer.md`.
+If any of those files are missing, loop-kit falls back to built-in defaults in `src/loop_kit/defaults/`.
+Project files always override built-in defaults when present.
 
 ## Development
 

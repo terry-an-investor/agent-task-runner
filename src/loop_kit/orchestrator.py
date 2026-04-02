@@ -19,6 +19,7 @@ All messages are JSON. Git commits are the single source of truth.
 
 import argparse
 import contextlib
+import importlib.resources
 import json
 import os
 import shutil
@@ -1399,9 +1400,38 @@ def _read_required_text(path: Path, *, label: str) -> str:
     )
 
 
+def _read_text_with_default(project_path: Path, default_filename: str) -> str:
+    project_text = _read_text_optional(project_path)
+    if project_text:
+        return project_text
+
+    fallback_path = Path(__file__).resolve().parent / "defaults" / default_filename
+    default_text: str | None = None
+
+    try:
+        default_resource = importlib.resources.files("loop_kit.defaults").joinpath(default_filename)
+        default_text = default_resource.read_text(encoding="utf-8")
+    except (FileNotFoundError, ModuleNotFoundError, OSError):
+        default_text = _read_text_optional(fallback_path)
+
+    if default_text:
+        return default_text
+
+    raise RuntimeError(
+        "Missing default prompt context content: "
+        f"{default_filename} (project override missing at {_display_path(project_path)})."
+    )
+
+
 def _worker_prompt(task_id: str, round_num: int) -> str:
-    agents_text = _read_required_text(ROOT / "AGENTS.md", label="AGENTS.md")
-    role_text = _read_required_text(ROOT / "docs" / "roles" / "code-writer.md", label="code-writer role doc")
+    agents_text = _read_text_with_default(
+        ROOT / "AGENTS.md",
+        "agents_md_default.txt",
+    )
+    role_text = _read_text_with_default(
+        ROOT / "docs" / "roles" / "code-writer.md",
+        "code_writer_md_default.txt",
+    )
     orchestrator_path = ROOT / "src" / "loop_kit" / "orchestrator.py"
     task_card = _read_json_if_exists(TASK_CARD)
     task_card_section = _render_task_card_section(task_card if isinstance(task_card, dict) else {})
@@ -1424,7 +1454,10 @@ def _worker_prompt(task_id: str, round_num: int) -> str:
 
 
 def _reviewer_prompt(task_id: str, round_num: int) -> str:
-    role_text = _read_required_text(ROOT / "docs" / "roles" / "reviewer.md", label="reviewer role doc")
+    role_text = _read_text_with_default(
+        ROOT / "docs" / "roles" / "reviewer.md",
+        "reviewer_md_default.txt",
+    )
     context = {
         "task_id": task_id,
         "round_num": str(round_num),
