@@ -159,6 +159,11 @@ def test_agent_command_unknown_backend_lists_available_backends() -> None:
     assert "codex" in message
 
 
+def test_coerce_confidence_bool_values() -> None:
+    assert orchestrator._coerce_confidence(True) == 1.0
+    assert orchestrator._coerce_confidence(False) == 0.0
+
+
 def test_main_loop_dir_overrides_all_bus_paths(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(orchestrator, "ROOT", tmp_path)
     captured: dict[str, Path] = {}

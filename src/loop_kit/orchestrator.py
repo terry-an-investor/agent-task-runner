@@ -1618,7 +1618,7 @@ def _to_utc_iso8601(value: datetime) -> str:
 def _coerce_confidence(value: object, *, default: float = 0.0) -> float:
     raw: float
     if isinstance(value, bool):
-        raw = default
+        raw = 1.0 if value else 0.0
     elif isinstance(value, int | float):
         raw = float(value)
     elif isinstance(value, str):
