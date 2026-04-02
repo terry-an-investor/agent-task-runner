@@ -107,6 +107,48 @@ class _BlockingStdin:
         self._released.set()
 
 
+class _FakeEvent:
+    def __init__(self, *, initially_set: bool = False) -> None:
+        self._is_set = initially_set
+        self.set_called = False
+        self.wait_calls: list[float | None] = []
+
+    def is_set(self) -> bool:
+        return self._is_set
+
+    def set(self) -> None:
+        self.set_called = True
+        self._is_set = True
+
+    def wait(self, timeout: float | None = None) -> bool:
+        self.wait_calls.append(timeout)
+        self._is_set = True
+        return True
+
+
+class _FakeThread:
+    def __init__(
+        self,
+        *,
+        target=None,
+        args: tuple[object, ...] = (),
+        daemon: bool | None = None,
+        name: str | None = None,
+    ) -> None:
+        self.target = target
+        self.args = args
+        self.daemon = daemon
+        self.name = name
+        self.started = False
+        self.join_timeouts: list[float | None] = []
+
+    def start(self) -> None:
+        self.started = True
+
+    def join(self, timeout: float | None = None) -> None:
+        self.join_timeouts.append(timeout)
+
+
 def test_agent_command_codex_uses_stdin_and_short_cli_instruction(monkeypatch) -> None:
     monkeypatch.setattr(orchestrator, "_resolve_backend_exe", lambda backend: f"{backend}.exe")
     long_prompt = "PROMPT-LINE-" * 200
@@ -824,6 +866,220 @@ def test_run_auto_dispatch_permanent_error_fails_fast_without_retrying(monkeypat
     assert "authentication failed" in str(exc.value)
     assert len(popen_calls) == 1
     assert sleep_calls == []
+
+
+def test_run_auto_dispatch_heartbeat_writer_writes_expected_payload(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+    stop_event = _FakeEvent()
+
+    orchestrator._run_auto_dispatch_heartbeat_writer(
+        role="worker",
+        stop_event=stop_event,
+        interval_sec=18.0,
+        task_id="T-617",
+        round_num=3,
+    )
+
+    heartbeat_data = json.loads(orchestrator._heartbeat_path("worker").read_text(encoding="utf-8"))
+    assert heartbeat_data["task_id"] == "T-617"
+    assert heartbeat_data["round_num"] == 3
+    assert heartbeat_data["role"] == "worker"
+    assert isinstance(heartbeat_data["timestamp"], str)
+    assert stop_event.wait_calls == [18.0]
+
+
+def test_stop_auto_dispatch_heartbeat_sets_event_and_joins_thread(monkeypatch) -> None:
+    stop_event = _FakeEvent()
+    thread = _FakeThread(daemon=True)
+    monkeypatch.setattr(orchestrator, "_AUTO_DISPATCH_HEARTBEATS", {"worker": (stop_event, thread)})
+
+    orchestrator._stop_auto_dispatch_heartbeat("worker")
+
+    assert stop_event.set_called is True
+    assert thread.join_timeouts == [orchestrator._AUTO_DISPATCH_HEARTBEAT_JOIN_TIMEOUT_SEC]
+    assert orchestrator._AUTO_DISPATCH_HEARTBEATS == {}
+
+
+def test_start_auto_dispatch_heartbeat_replaces_existing_thread_and_sets_daemon(monkeypatch) -> None:
+    old_event = _FakeEvent()
+    old_thread = _FakeThread(daemon=True)
+    new_event = _FakeEvent()
+    created_threads: list[_FakeThread] = []
+    monkeypatch.setattr(orchestrator, "_AUTO_DISPATCH_HEARTBEATS", {"worker": (old_event, old_thread)})
+    monkeypatch.setattr(orchestrator.threading, "Event", lambda: new_event)
+
+    def fake_thread_ctor(*args, **kwargs):
+        _ = args
+        thread = _FakeThread(
+            target=kwargs.get("target"),
+            args=kwargs.get("args", ()),
+            daemon=kwargs.get("daemon"),
+            name=kwargs.get("name"),
+        )
+        created_threads.append(thread)
+        return thread
+
+    monkeypatch.setattr(orchestrator.threading, "Thread", fake_thread_ctor)
+
+    orchestrator._start_auto_dispatch_heartbeat(
+        "worker",
+        heartbeat_ttl_sec=40,
+        task_id="T-617",
+        round_num=1,
+    )
+
+    assert old_event.set_called is True
+    assert old_thread.join_timeouts == [orchestrator._AUTO_DISPATCH_HEARTBEAT_JOIN_TIMEOUT_SEC]
+    assert len(created_threads) == 1
+    created = created_threads[0]
+    assert created.daemon is True
+    assert created.started is True
+    assert created.args[0] == "worker"
+    assert created.args[1] is new_event
+    assert created.args[2] == pytest.approx(20.0)
+    assert created.args[3] == "T-617"
+    assert created.args[4] == 1
+    assert orchestrator._AUTO_DISPATCH_HEARTBEATS["worker"] == (new_event, created)
+
+
+def test_run_auto_dispatch_heartbeat_lifecycle_started_and_stopped(monkeypatch) -> None:
+    start_calls: list[tuple[str, dict[str, object]]] = []
+    stop_calls: list[str] = []
+    monkeypatch.setattr(
+        orchestrator,
+        "_agent_command",
+        lambda backend, prompt: (["codex.exe", "exec", "short instruction"], None, "STDIN_PAYLOAD"),
+    )
+    monkeypatch.setattr(orchestrator, "_log", lambda msg: None)
+    monkeypatch.setattr(orchestrator, "_feed_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(orchestrator, "_write_dispatch_log", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        orchestrator,
+        "_start_auto_dispatch_heartbeat",
+        lambda role, **kwargs: start_calls.append((role, kwargs)),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_stop_auto_dispatch_heartbeat",
+        lambda role: stop_calls.append(role),
+    )
+    monkeypatch.setattr(
+        orchestrator.subprocess,
+        "Popen",
+        lambda cmd, **kwargs: _FakeProc(stdout_lines=['{"type":"thread.started","thread_id":"tid-1"}\n']),
+    )
+
+    orchestrator._run_auto_dispatch(
+        "worker",
+        "codex",
+        "ignored",
+        30,
+        heartbeat_enabled=True,
+        heartbeat_ttl_sec=44,
+        task_id="T-617",
+        round_num=2,
+    )
+
+    assert start_calls == [
+        (
+            "worker",
+            {
+                "heartbeat_ttl_sec": 44,
+                "task_id": "T-617",
+                "round_num": 2,
+            },
+        )
+    ]
+    assert stop_calls == ["worker"]
+
+
+def test_run_auto_dispatch_heartbeat_stops_on_failure(monkeypatch) -> None:
+    stop_calls: list[str] = []
+    monkeypatch.setattr(
+        orchestrator,
+        "_agent_command",
+        lambda backend, prompt: (["codex.exe", "exec", "short instruction"], None, "STDIN_PAYLOAD"),
+    )
+    monkeypatch.setattr(orchestrator, "_log", lambda msg: None)
+    monkeypatch.setattr(orchestrator, "_feed_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(orchestrator, "_write_dispatch_log", lambda *args, **kwargs: None)
+    monkeypatch.setattr(orchestrator, "_start_auto_dispatch_heartbeat", lambda role, **kwargs: None)
+    monkeypatch.setattr(orchestrator, "_stop_auto_dispatch_heartbeat", lambda role: stop_calls.append(role))
+    monkeypatch.setattr(
+        orchestrator.subprocess,
+        "Popen",
+        lambda cmd, **kwargs: _FakeProc(stdout_lines=[], stderr_lines=["authentication failed\n"], returncode=1),
+    )
+
+    with pytest.raises(RuntimeError, match="permanent error, not retrying"):
+        orchestrator._run_auto_dispatch(
+            "worker",
+            "codex",
+            "ignored",
+            30,
+            dispatch_retries=2,
+            dispatch_retry_base_sec=5,
+            heartbeat_enabled=True,
+            task_id="T-617",
+            round_num=2,
+        )
+
+    assert stop_calls == ["worker"]
+
+
+def test_auto_dispatch_role_only_enables_heartbeat_when_required(monkeypatch) -> None:
+    captured: list[dict[str, object]] = []
+
+    def fake_run_auto_dispatch(*, heartbeat_enabled: bool, **kwargs) -> None:
+        _ = kwargs
+        captured.append({"heartbeat_enabled": heartbeat_enabled})
+
+    def fake_dispatch_with_artifact_fallback(
+        *,
+        role: str,
+        dispatch_call,
+        artifact_path: Path,
+        task_id: str,
+        round_num: int,
+        timeout_sec: int = orchestrator.DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC,
+    ) -> dict:
+        _ = (role, artifact_path, task_id, round_num, timeout_sec)
+        dispatch_call()
+        return {"task_id": task_id, "round": round_num}
+
+    monkeypatch.setattr(orchestrator, "_run_auto_dispatch", fake_run_auto_dispatch)
+    monkeypatch.setattr(orchestrator, "_dispatch_with_artifact_fallback", fake_dispatch_with_artifact_fallback)
+
+    config_with_hb = orchestrator.RunConfig(
+        auto_dispatch=True,
+        require_heartbeat=True,
+    )
+    config_without_hb = orchestrator.RunConfig(
+        auto_dispatch=True,
+        require_heartbeat=False,
+    )
+
+    orchestrator._auto_dispatch_role(
+        role="worker",
+        prompt="prompt",
+        config=config_with_hb,
+        task_id="T-617",
+        round_num=1,
+        artifact_path=Path("unused.json"),
+    )
+    orchestrator._auto_dispatch_role(
+        role="worker",
+        prompt="prompt",
+        config=config_without_hb,
+        task_id="T-617",
+        round_num=1,
+        artifact_path=Path("unused.json"),
+    )
+
+    assert captured == [
+        {"heartbeat_enabled": True},
+        {"heartbeat_enabled": False},
+    ]
 
 
 def test_worker_prompt_round1_includes_task_card_section(monkeypatch) -> None:

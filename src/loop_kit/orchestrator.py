@@ -83,6 +83,9 @@ _FEED_TASK_ID: str | None = None
 _LOGS_DIR_ENSURED = False
 _LOGS_DIR_ENSURED_PATH: str | None = None
 _stream_local = threading.local()
+_AUTO_DISPATCH_HEARTBEATS: dict[str, tuple[threading.Event, threading.Thread]] = {}
+_AUTO_DISPATCH_HEARTBEAT_LOCK = threading.Lock()
+_AUTO_DISPATCH_HEARTBEAT_JOIN_TIMEOUT_SEC = 2.0
 
 
 class DispatchTimeoutError(RuntimeError):
@@ -484,6 +487,80 @@ def _role_is_alive(role: str, ttl_sec: int) -> tuple[bool, str]:
     data = _read_json_if_exists(hb)
     pid = data.get("pid") if isinstance(data, dict) else "?"
     return True, f"{role} alive (pid={pid}, age={age:.1f}s)"
+
+
+def _auto_dispatch_heartbeat_payload(
+    role: str,
+    task_id: str | None,
+    round_num: int | None,
+) -> dict[str, object]:
+    return {
+        "task_id": task_id,
+        "round_num": round_num,
+        "role": role,
+        "timestamp": _ts(),
+    }
+
+
+def _run_auto_dispatch_heartbeat_writer(
+    role: str,
+    stop_event: threading.Event,
+    interval_sec: float,
+    task_id: str | None,
+    round_num: int | None,
+) -> None:
+    hb = _heartbeat_path(role)
+    hb.parent.mkdir(parents=True, exist_ok=True)
+    sleep_sec = max(1.0, float(interval_sec))
+    while not stop_event.is_set():
+        payload = _auto_dispatch_heartbeat_payload(
+            role=role,
+            task_id=task_id,
+            round_num=round_num,
+        )
+        hb.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        stop_event.wait(sleep_sec)
+
+
+def _stop_auto_dispatch_heartbeat(role: str) -> None:
+    with _AUTO_DISPATCH_HEARTBEAT_LOCK:
+        active = _AUTO_DISPATCH_HEARTBEATS.pop(role, None)
+    if active is None:
+        return
+    stop_event, thread = active
+    stop_event.set()
+    thread.join(timeout=_AUTO_DISPATCH_HEARTBEAT_JOIN_TIMEOUT_SEC)
+
+
+def _start_auto_dispatch_heartbeat(
+    role: str,
+    *,
+    heartbeat_ttl_sec: int,
+    task_id: str | None,
+    round_num: int | None,
+) -> None:
+    _stop_auto_dispatch_heartbeat(role)
+    interval_sec = max(1.0, float(heartbeat_ttl_sec) / 2.0)
+    stop_event = threading.Event()
+    thread = threading.Thread(
+        target=_run_auto_dispatch_heartbeat_writer,
+        args=(role, stop_event, interval_sec, task_id, round_num),
+        daemon=True,
+        name=f"loop-kit-{role}-heartbeat",
+    )
+    with _AUTO_DISPATCH_HEARTBEAT_LOCK:
+        _AUTO_DISPATCH_HEARTBEATS[role] = (stop_event, thread)
+    try:
+        thread.start()
+    except Exception:
+        with _AUTO_DISPATCH_HEARTBEAT_LOCK:
+            current = _AUTO_DISPATCH_HEARTBEATS.get(role)
+            if current is not None and current[0] is stop_event:
+                _AUTO_DISPATCH_HEARTBEATS.pop(role, None)
+        raise
 
 
 def _extract_codex_thread_id(stdout: str) -> str | None:
@@ -1379,65 +1456,103 @@ def _run_auto_dispatch(
     verbose: bool = False,
     dispatch_retries: int = DEFAULT_DISPATCH_RETRIES,
     dispatch_retry_base_sec: int = DEFAULT_DISPATCH_RETRY_BASE_SEC,
+    heartbeat_enabled: bool = False,
+    heartbeat_ttl_sec: int = DEFAULT_HEARTBEAT_TTL_SEC,
+    task_id: str | None = None,
+    round_num: int | None = None,
 ) -> None:
     parse_event_fn = _require_registered_parse_event(backend)
     retry_count = max(0, int(dispatch_retries))
     retry_base_sec = max(1, int(dispatch_retry_base_sec))
     max_attempts = retry_count + 1
     _log(f"Auto-dispatch start: role={role} backend={backend} retries={retry_count} retry_base_sec={retry_base_sec}")
-    attempt = 0
-    while attempt < max_attempts:
-        attempt += 1
-        cmd, cmd_sid, stdin_text = _agent_command(backend, prompt)
-        proc = subprocess.Popen(
-            cmd,
-            cwd=str(ROOT),
-            stdin=(subprocess.PIPE if stdin_text is not None else None),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
+    if heartbeat_enabled:
+        _start_auto_dispatch_heartbeat(
+            role,
+            heartbeat_ttl_sec=heartbeat_ttl_sec,
+            task_id=task_id,
+            round_num=round_num,
         )
-        try:
-            stdout, stderr, returncode, timed_out = _collect_streamed_process_output(
-                proc,
-                role=role,
-                backend=backend,
-                parse_event_fn=parse_event_fn,
-                stdin_text=stdin_text,
-                timeout_sec=timeout_sec,
-                verbose=verbose,
+    attempt = 0
+    try:
+        while attempt < max_attempts:
+            attempt += 1
+            cmd, cmd_sid, stdin_text = _agent_command(backend, prompt)
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(ROOT),
+                stdin=(subprocess.PIPE if stdin_text is not None else None),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
             )
-        except KeyboardInterrupt:
-            _terminate_subprocess_on_interrupt(
-                proc,
-                context=f"auto-dispatch role={role} backend={backend} attempt={attempt}",
-            )
-            _report_dispatch_result(
-                role=role,
-                backend=backend,
-                cmd=cmd,
-                result=_completed_proc(
+            try:
+                stdout, stderr, returncode, timed_out = _collect_streamed_process_output(
+                    proc,
+                    role=role,
+                    backend=backend,
+                    parse_event_fn=parse_event_fn,
+                    stdin_text=stdin_text,
+                    timeout_sec=timeout_sec,
+                    verbose=verbose,
+                )
+            except KeyboardInterrupt:
+                _terminate_subprocess_on_interrupt(
+                    proc,
+                    context=f"auto-dispatch role={role} backend={backend} attempt={attempt}",
+                )
+                _report_dispatch_result(
+                    role=role,
+                    backend=backend,
+                    cmd=cmd,
+                    result=_completed_proc(
+                        cmd,
+                        proc.returncode,
+                        "",
+                        "",
+                        default_returncode=130,
+                    ),
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    session_id=cmd_sid,
+                    interrupted=True,
+                )
+                raise
+            if timed_out:
+                result = _completed_proc(
                     cmd,
-                    proc.returncode,
-                    "",
-                    "",
-                    default_returncode=130,
-                ),
-                attempt=attempt,
-                max_attempts=max_attempts,
-                session_id=cmd_sid,
-                interrupted=True,
-            )
-            raise
-        if timed_out:
+                    returncode,
+                    stdout,
+                    stderr,
+                    default_returncode=-9,
+                )
+                _report_dispatch_result(
+                    role=role,
+                    backend=backend,
+                    cmd=cmd,
+                    result=result,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    session_id=cmd_sid,
+                    timeout_sec=timeout_sec,
+                )
+                raise DispatchTimeoutError(
+                    f"{role} dispatch timeout after {timeout_sec}s (backend={backend})."
+                    + _dispatch_failure_hint(backend=backend, stderr=stderr or "", timeout=True)
+                )
             result = _completed_proc(
                 cmd,
                 returncode,
                 stdout,
                 stderr,
-                default_returncode=-9,
             )
+
+            session_id = cmd_sid
+            if backend == BACKEND_CODEX:
+                parsed = _extract_codex_thread_id(result.stdout or "")
+                if parsed:
+                    session_id = parsed
             _report_dispatch_result(
                 role=role,
                 backend=backend,
@@ -1445,58 +1560,36 @@ def _run_auto_dispatch(
                 result=result,
                 attempt=attempt,
                 max_attempts=max_attempts,
-                session_id=cmd_sid,
-                timeout_sec=timeout_sec,
+                session_id=session_id,
+                stdout_len=len(result.stdout or ""),
             )
-            raise DispatchTimeoutError(
-                f"{role} dispatch timeout after {timeout_sec}s (backend={backend})."
-                + _dispatch_failure_hint(backend=backend, stderr=stderr or "", timeout=True)
-            )
-        result = _completed_proc(
-            cmd,
-            returncode,
-            stdout,
-            stderr,
-        )
 
-        session_id = cmd_sid
-        if backend == BACKEND_CODEX:
-            parsed = _extract_codex_thread_id(result.stdout or "")
-            if parsed:
-                session_id = parsed
-        _report_dispatch_result(
-            role=role,
-            backend=backend,
-            cmd=cmd,
-            result=result,
-            attempt=attempt,
-            max_attempts=max_attempts,
-            session_id=session_id,
-            stdout_len=len(result.stdout or ""),
-        )
+            if result.returncode == 0:
+                _log(f"Auto-dispatch done: role={role} backend={backend} attempts={attempt}")
+                return
 
-        if result.returncode == 0:
-            _log(f"Auto-dispatch done: role={role} backend={backend} attempts={attempt}")
-            return
-
-        stderr_text = (result.stderr or "").strip()
-        if _is_permanent_dispatch_error(stderr_text):
-            raise RuntimeError(
-                f"{role} dispatch failed with permanent error (backend={backend}, rc={result.returncode}): "
-                f"{stderr_text} — permanent error, not retrying."
-                + _dispatch_failure_hint(backend=backend, stderr=stderr_text)
+            stderr_text = (result.stderr or "").strip()
+            if _is_permanent_dispatch_error(stderr_text):
+                raise RuntimeError(
+                    f"{role} dispatch failed with permanent error (backend={backend}, rc={result.returncode}): "
+                    f"{stderr_text} — permanent error, not retrying."
+                    + _dispatch_failure_hint(backend=backend, stderr=stderr_text)
+                )
+            if attempt >= max_attempts:
+                raise RuntimeError(
+                    f"{role} dispatch failed (backend={backend}, rc={result.returncode}) "
+                    f"after {attempt} attempts: {stderr_text}"
+                    + _dispatch_failure_hint(backend=backend, stderr=stderr_text)
+                )
+            retry_delay = min(MAX_DISPATCH_RETRY_DELAY_SEC, retry_base_sec * (2 ** (attempt - 1)))
+            _log(
+                f"{role} dispatch failed (backend={backend}, rc={result.returncode}) on attempt "
+                f"{attempt}/{max_attempts}; retrying in {retry_delay}s"
             )
-        if attempt >= max_attempts:
-            raise RuntimeError(
-                f"{role} dispatch failed (backend={backend}, rc={result.returncode}) "
-                f"after {attempt} attempts: {stderr_text}" + _dispatch_failure_hint(backend=backend, stderr=stderr_text)
-            )
-        retry_delay = min(MAX_DISPATCH_RETRY_DELAY_SEC, retry_base_sec * (2 ** (attempt - 1)))
-        _log(
-            f"{role} dispatch failed (backend={backend}, rc={result.returncode}) on attempt "
-            f"{attempt}/{max_attempts}; retrying in {retry_delay}s"
-        )
-        time.sleep(retry_delay)
+            time.sleep(retry_delay)
+    finally:
+        if heartbeat_enabled:
+            _stop_auto_dispatch_heartbeat(role)
 
 
 def _require_dispatch_artifact(
@@ -2878,6 +2971,10 @@ def _auto_dispatch_role(
             verbose=config.verbose,
             dispatch_retries=config.dispatch_retries,
             dispatch_retry_base_sec=config.dispatch_retry_base_sec,
+            heartbeat_enabled=config.require_heartbeat,
+            heartbeat_ttl_sec=config.heartbeat_ttl,
+            task_id=task_id,
+            round_num=round_num,
         ),
         artifact_path=artifact_path,
         task_id=task_id,
