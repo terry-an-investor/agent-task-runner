@@ -33,6 +33,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
+
 ROOT = Path.cwd()
 LOOP_DIR = ROOT / ".loop"
 LOGS_DIR = LOOP_DIR / "logs"
@@ -60,10 +65,7 @@ _WAIT_SAFETY_CAP_SEC = 86400  # 24h absolute cap in _wait_for_file
 _FEED_TASK_ID: str | None = None
 _LOGS_DIR_ENSURED = False
 _LOGS_DIR_ENSURED_PATH: str | None = None
-
-
-def hello() -> str:
-    return "hello from loop-kit"
+_stream_local = threading.local()
 
 
 class DispatchTimeoutError(RuntimeError):
@@ -172,6 +174,43 @@ def _archive_bus_file(path: Path, task_id: str, round_num: int, suffix: str) -> 
     return dest
 
 
+def _prepare_bus_file(path: Path, task_id: str, round_num: int, suffix: str) -> None:
+    _archive_bus_file(path, task_id, round_num, suffix)
+    path.unlink(missing_ok=True)
+
+
+def _clean_stale_state(state: dict, *keys: str) -> None:
+    for key in keys:
+        state.pop(key, None)
+
+
+def _close_pipe(pipe: object | None) -> None:
+    if pipe is None:
+        return
+    close = getattr(pipe, "close", None)
+    if callable(close):
+        try:
+            close()
+        except OSError:
+            pass
+
+
+def _completed_proc(
+    cmd: list[str],
+    returncode: int | None,
+    stdout: str,
+    stderr: str,
+    *,
+    default_returncode: int = 1,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess(
+        cmd,
+        returncode if returncode is not None else default_returncode,
+        stdout,
+        stderr,
+    )
+
+
 def _archive_task_summary(task_id: str) -> Path | None:
     summary_path = LOOP_DIR / "summary.json"
     if not summary_path.exists():
@@ -191,6 +230,20 @@ def _archive_state_for_round(task_id: str, round_num: int) -> Path | None:
     return _archive_bus_file(STATE_FILE, task_id, round_num, "state")
 
 
+def _lock_file(handle) -> None:
+    if os.name == "nt":
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+    else:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _unlock_file(handle) -> None:
+    if os.name == "nt":
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 class _LoopLock:
     def __init__(self, path: Path):
         self.path = path
@@ -205,14 +258,7 @@ class _LoopLock:
                 handle.write(b"\0")
                 handle.flush()
             handle.seek(0)
-            if os.name == "nt":
-                import msvcrt
-
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _lock_file(handle)
         except OSError as e:
             handle.close()
             raise RuntimeError(f"another orchestrator instance is already running ({self.path})") from e
@@ -225,14 +271,7 @@ class _LoopLock:
         self._handle = None
         try:
             handle.seek(0)
-            if os.name == "nt":
-                import msvcrt
-
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            _unlock_file(handle)
         finally:
             handle.close()
 
@@ -473,74 +512,78 @@ def _strip_powershell_wrapper(command_text: str) -> str:
     return inner or _strip_outer_quotes(stripped)
 
 
-def _codex_event_summary(role: str, backend: str, line: str) -> str | None:
-    if backend != BACKEND_CODEX:
-        return None
+def _clean_path_text(path_text: str) -> str:
+    cleaned = path_text.strip().strip("\"'")
+    if "|" in cleaned:
+        cleaned = cleaned.split("|", 1)[0].strip()
+    return cleaned.rstrip(";,")
 
-    def _clean_path_text(path_text: str) -> str:
-        cleaned = path_text.strip().strip("\"'")
-        if "|" in cleaned:
-            cleaned = cleaned.split("|", 1)[0].strip()
-        return cleaned.rstrip(";,")
 
-    def _path_parts(path_text: str) -> list[str]:
-        cleaned = _clean_path_text(path_text)
-        if not cleaned:
-            return []
-        normalized = cleaned.replace("\\", "/").strip()
-        return [part for part in normalized.split("/") if part and part != "."]
+def _path_parts(path_text: str) -> list[str]:
+    cleaned = _clean_path_text(path_text)
+    if not cleaned:
+        return []
+    normalized = cleaned.replace("\\", "/").strip()
+    return [part for part in normalized.split("/") if part and part != "."]
 
-    def _short_filename(path_text: str) -> str:
-        cleaned = _clean_path_text(path_text)
-        if not cleaned:
-            return ""
-        parts = _path_parts(cleaned)
-        name = parts[-1] if parts else Path(cleaned).name
-        return name or cleaned
 
-    def _shorten_paths(paths: list[str]) -> list[str]:
-        path_parts: list[list[str]] = []
-        shortened: list[str] = []
-        indexes_by_name: dict[str, list[int]] = {}
+def _short_filename(path_text: str) -> str:
+    cleaned = _clean_path_text(path_text)
+    if not cleaned:
+        return ""
+    parts = _path_parts(cleaned)
+    name = parts[-1] if parts else Path(cleaned).name
+    return name or cleaned
 
-        for path_text in paths:
-            parts = _path_parts(path_text)
-            name = parts[-1] if parts else _short_filename(path_text)
-            if not name:
-                continue
-            index = len(shortened)
-            shortened.append(name)
-            path_parts.append(parts)
-            indexes_by_name.setdefault(name, []).append(index)
 
-        for indexes in indexes_by_name.values():
-            if len(indexes) < 2:
-                continue
-            depth = 2
-            while True:
-                seen: set[str] = set()
-                has_collision = False
-                for index in indexes:
-                    parts = path_parts[index]
-                    if not parts:
-                        candidate = shortened[index]
-                    else:
-                        candidate = "/".join(parts[-min(depth, len(parts)) :])
-                    if candidate in seen:
-                        has_collision = True
-                        break
-                    seen.add(candidate)
-                if not has_collision:
-                    break
-                if all(len(path_parts[index]) <= depth for index in indexes):
-                    break
-                depth += 1
+def _shorten_paths(paths: list[str]) -> list[str]:
+    path_parts: list[list[str]] = []
+    shortened: list[str] = []
+    indexes_by_name: dict[str, list[int]] = {}
+
+    for path_text in paths:
+        parts = _path_parts(path_text)
+        name = parts[-1] if parts else _short_filename(path_text)
+        if not name:
+            continue
+        index = len(shortened)
+        shortened.append(name)
+        path_parts.append(parts)
+        indexes_by_name.setdefault(name, []).append(index)
+
+    for indexes in indexes_by_name.values():
+        if len(indexes) < 2:
+            continue
+        depth = 2
+        while True:
+            seen: set[str] = set()
+            has_collision = False
             for index in indexes:
                 parts = path_parts[index]
                 if not parts:
-                    continue
-                shortened[index] = "/".join(parts[-min(depth, len(parts)) :])
-        return shortened
+                    candidate = shortened[index]
+                else:
+                    candidate = "/".join(parts[-min(depth, len(parts)) :])
+                if candidate in seen:
+                    has_collision = True
+                    break
+                seen.add(candidate)
+            if not has_collision:
+                break
+            if all(len(path_parts[index]) <= depth for index in indexes):
+                break
+            depth += 1
+        for index in indexes:
+            parts = path_parts[index]
+            if not parts:
+                continue
+            shortened[index] = "/".join(parts[-min(depth, len(parts)) :])
+    return shortened
+
+
+def _codex_event_summary(role: str, backend: str, line: str) -> str | None:
+    if backend != BACKEND_CODEX:
+        return None
 
     try:
         payload = json.loads(line)
@@ -637,15 +680,10 @@ def _stream_dispatch_stdout_line(role: str, backend: str, raw_line: str, *, verb
         name = normalized.split("/")[-1] if normalized else ""
         return name or cleaned
 
-    state_local = getattr(_stream_dispatch_stdout_line, "_state_local", None)
-    if state_local is None:
-        state_local = threading.local()
-        setattr(_stream_dispatch_stdout_line, "_state_local", state_local)
-
-    read_state = getattr(state_local, "read_state", None)
+    read_state = getattr(_stream_local, "read_state", None)
     if read_state is None:
         read_state = {}
-        setattr(state_local, "read_state", read_state)
+        setattr(_stream_local, "read_state", read_state)
 
     state_key = f"{role}:{backend}"
     line = raw_line.rstrip("\r\n")
@@ -834,6 +872,42 @@ def _dispatch_failure_hint(*, backend: str, stderr: str, timeout: bool = False) 
     return " Remediation: " + " ".join(hints)
 
 
+def _report_dispatch_result(
+    *,
+    role: str,
+    backend: str,
+    cmd: list[str],
+    result: subprocess.CompletedProcess[str],
+    attempt: int,
+    max_attempts: int,
+    session_id: str | None = None,
+    timeout_sec: int | None = None,
+    include_session_id: bool = False,
+    include_output_lengths: bool = False,
+) -> None:
+    _write_dispatch_log(role, cmd, result, session_id)
+    data = {
+        "role": role,
+        "mode": DISPATCH_BACKEND_NATIVE,
+        "backend": backend,
+        "returncode": result.returncode,
+        "attempt": attempt,
+        "max_attempts": max_attempts,
+    }
+    if timeout_sec is not None:
+        data["timeout_sec"] = timeout_sec
+    if include_session_id:
+        data["session_id"] = session_id
+    if include_output_lengths:
+        data["stdout_len"] = len(result.stdout or "")
+        data["stderr_len"] = len(result.stderr or "")
+    _feed_event(
+        "dispatch_summary",
+        level=("info" if timeout_sec is None and result.returncode == 0 else "error"),
+        data=data,
+    )
+
+
 def _collect_streamed_process_output(
     proc: subprocess.Popen[str],
     *,
@@ -846,16 +920,6 @@ def _collect_streamed_process_output(
     stdout_chunks: list[str] = []
     stderr_chunks: list[str] = []
     stdin_thread: threading.Thread | None = None
-
-    def _close_pipe(pipe) -> None:
-        if pipe is None:
-            return
-        close = getattr(pipe, "close", None)
-        if callable(close):
-            try:
-                close()
-            except OSError:
-                pass
 
     def _write_stdin() -> None:
         if stdin_text is None or proc.stdin is None:
@@ -930,16 +994,6 @@ def _collect_streamed_text_output(
     stdout_chunks: list[str] = []
     stderr_chunks: list[str] = []
 
-    def _close_pipe(pipe) -> None:
-        if pipe is None:
-            return
-        close = getattr(pipe, "close", None)
-        if callable(close):
-            try:
-                close()
-            except OSError:
-                pass
-
     def _read_stderr() -> None:
         if proc.stderr is None:
             return
@@ -967,14 +1021,7 @@ def _collect_streamed_text_output(
 
 
 def _terminate_subprocess_on_interrupt(proc: subprocess.Popen[str], *, context: str) -> None:
-    stdin = getattr(proc, "stdin", None)
-    if stdin is not None:
-        close_stdin = getattr(stdin, "close", None)
-        if callable(close_stdin):
-            try:
-                close_stdin()
-            except OSError:
-                pass
+    _close_pipe(getattr(proc, "stdin", None))
 
     is_running = False
     try:
@@ -1052,33 +1099,30 @@ def _run_auto_dispatch(
             )
             raise
         if timed_out:
-            result = subprocess.CompletedProcess(
+            result = _completed_proc(
                 cmd,
-                returncode if returncode is not None else -9,
+                returncode,
                 stdout,
                 stderr,
+                default_returncode=-9,
             )
-            _write_dispatch_log(role, cmd, result, cmd_sid)
-            _feed_event(
-                "dispatch_summary",
-                level="error",
-                data={
-                    "role": role,
-                    "mode": DISPATCH_BACKEND_NATIVE,
-                    "backend": backend,
-                    "timeout_sec": timeout_sec,
-                    "returncode": result.returncode,
-                    "attempt": attempt,
-                    "max_attempts": max_attempts,
-                },
+            _report_dispatch_result(
+                role=role,
+                backend=backend,
+                cmd=cmd,
+                result=result,
+                attempt=attempt,
+                max_attempts=max_attempts,
+                session_id=cmd_sid,
+                timeout_sec=timeout_sec,
             )
             raise DispatchTimeoutError(
                 f"{role} dispatch timeout after {timeout_sec}s (backend={backend})."
                 + _dispatch_failure_hint(backend=backend, stderr=stderr or "", timeout=True)
             )
-        result = subprocess.CompletedProcess(
+        result = _completed_proc(
             cmd,
-            returncode if returncode is not None else 1,
+            returncode,
             stdout,
             stderr,
         )
@@ -1088,21 +1132,16 @@ def _run_auto_dispatch(
             parsed = _extract_codex_thread_id(result.stdout or "")
             if parsed:
                 session_id = parsed
-        _write_dispatch_log(role, cmd, result, session_id)
-        _feed_event(
-            "dispatch_summary",
-            level=("info" if result.returncode == 0 else "error"),
-            data={
-                "role": role,
-                "mode": DISPATCH_BACKEND_NATIVE,
-                "backend": backend,
-                "returncode": result.returncode,
-                "session_id": session_id,
-                "stdout_len": len(result.stdout or ""),
-                "stderr_len": len(result.stderr or ""),
-                "attempt": attempt,
-                "max_attempts": max_attempts,
-            },
+        _report_dispatch_result(
+            role=role,
+            backend=backend,
+            cmd=cmd,
+            result=result,
+            attempt=attempt,
+            max_attempts=max_attempts,
+            session_id=session_id,
+            include_session_id=True,
+            include_output_lengths=True,
         )
 
         if result.returncode == 0:
@@ -1528,20 +1567,16 @@ def _wait_for_file(
                 _log(f"Stopping wait: {reason}")
                 return None
         if path.exists():
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-            except json.JSONDecodeError as e:
-                _log(f"{path.name} has invalid JSON: {e}")
-            else:
+            stat = path.stat()
+            signature = (stat.st_mtime_ns, stat.st_size)
+            data = _read_json_if_exists(path)
+            if isinstance(data, dict):
                 task_id = data.get("task_id")
                 report_has_round = "round" in data
                 round_num = data.get("round")
                 if expected_task_id is not None and task_id != expected_task_id:
-                    stat = path.stat()
-                    last_ignored_signature = (stat.st_mtime_ns, stat.st_size)
+                    last_ignored_signature = signature
                 elif expected_round is not None and report_has_round and round_num != expected_round:
-                    stat = path.stat()
-                    signature = (stat.st_mtime_ns, stat.st_size)
                     if signature != last_ignored_signature:
                         _log(f"Ignoring stale {path.name}: expected round={expected_round}, got {round_num!r}")
                         last_ignored_signature = signature
@@ -1777,6 +1812,79 @@ def _single_round_subprocess_cmd(
     return cmd
 
 
+def _print_round_header(round_num: int, role: str, config: RunConfig) -> None:
+    _ = config
+    title = role.capitalize()
+    print(f"\n{'='*60}")
+    print(f"  ROUND {round_num}  —  Awaiting {title}")
+    print(f"{'='*60}")
+    if role == "worker":
+        print(f"  Task card: {TASK_CARD}")
+        if round_num == 1:
+            print("  Send task_card.json to Worker.")
+        else:
+            print("  Send fix_list.json to Worker.")
+    elif role == "reviewer":
+        print(f"  Review request: {REVIEW_REQ}")
+
+
+def _auto_dispatch_role(
+    role: str,
+    prompt: str,
+    config: RunConfig,
+    task_id: str,
+    round_num: int,
+    artifact_path: Path,
+) -> dict | None:
+    if not config.auto_dispatch:
+        return None
+    backend = config.worker_backend if role == "worker" else config.reviewer_backend
+    return _dispatch_with_artifact_fallback(
+        role=role,
+        dispatch_call=lambda: _run_auto_dispatch(
+            role=role,
+            backend=backend,
+            prompt=prompt,
+            timeout_sec=config.dispatch_timeout,
+            verbose=config.verbose,
+            dispatch_retries=config.dispatch_retries,
+            dispatch_retry_base_sec=config.dispatch_retry_base_sec,
+        ),
+        artifact_path=artifact_path,
+        task_id=task_id,
+        round_num=round_num,
+        timeout_sec=config.artifact_timeout,
+    )
+
+
+def _wait_for_role_result(
+    role: str,
+    artifact_path: Path,
+    config: RunConfig,
+    task_id: str,
+    round_num: int,
+) -> dict | None:
+    return _wait_for_file(
+        artifact_path,
+        f"{role.capitalize()} result",
+        timeout_sec=config.timeout,
+        expected_task_id=task_id,
+        expected_round=round_num,
+        expected_role=role if config.require_heartbeat else None,
+        heartbeat_ttl_sec=config.heartbeat_ttl,
+        show_manual_hint=not config.auto_dispatch,
+    )
+
+
+def _print_blocking_issues(items: list[object]) -> None:
+    print(f"  Blocking issues: {len(items)}")
+    for issue in items:
+        print(
+            f"    - [{issue.get('severity','?')}] {issue.get('file','')}: "
+            f"{issue.get('reason','')}"
+        )
+
+
 def _run_single_round(
     *,
     config: RunConfig,
@@ -1847,8 +1955,7 @@ def _run_single_round(
     _log(f"Goal: {task_card.get('goal', '<no goal>')}")
     _log(f"Single-round state contract: task_id={task_id} base_sha={base_sha}")
 
-    for stale_key in ("outcome", "failed_at", "error"):
-        state.pop(stale_key, None)
+    _clean_stale_state(state, "outcome", "failed_at", "error")
     if not isinstance(state.get("round_details"), list):
         state["round_details"] = []
     state["started_at"] = _ts()
@@ -1857,57 +1964,36 @@ def _run_single_round(
     _save_single_round_state()
 
     worker_prompt = _worker_prompt(task_id, round_num)
-    _archive_bus_file(WORK_REPORT, task_id, round_num, "work_report")
-    WORK_REPORT.unlink(missing_ok=True)
-    _archive_bus_file(REVIEW_REPORT, task_id, round_num, "review_report")
-    REVIEW_REPORT.unlink(missing_ok=True)
+    _prepare_bus_file(WORK_REPORT, task_id, round_num, "work_report")
+    _prepare_bus_file(REVIEW_REPORT, task_id, round_num, "review_report")
 
-    print(f"\n{'='*60}")
-    print(f"  ROUND {round_num}  —  Awaiting Worker")
-    print(f"{'='*60}")
-    print(f"  Task card: {TASK_CARD}")
-    if round_num == 1:
-        print("  Send task_card.json to Worker.")
-    else:
-        print("  Send fix_list.json to Worker.")
+    _print_round_header(round_num, "worker", config)
 
     work: dict | None = None
-    if config.auto_dispatch:
-        try:
-            work = _dispatch_with_artifact_fallback(
-                role="worker",
-                dispatch_call=lambda: _run_auto_dispatch(
-                    role="worker",
-                    backend=config.worker_backend,
-                    prompt=worker_prompt,
-                    timeout_sec=config.dispatch_timeout,
-                    verbose=config.verbose,
-                    dispatch_retries=config.dispatch_retries,
-                    dispatch_retry_base_sec=config.dispatch_retry_base_sec,
-                ),
-                artifact_path=WORK_REPORT,
-                task_id=task_id,
-                round_num=round_num,
-                timeout_sec=config.artifact_timeout,
-            )
-        except RuntimeError as e:
-            _fail_single_round(
-                outcome="worker_dispatch_failed",
-                message=str(e),
-                exit_code=3,
-            )
-            return
+    try:
+        work = _auto_dispatch_role(
+            role="worker",
+            prompt=worker_prompt,
+            config=config,
+            task_id=task_id,
+            round_num=round_num,
+            artifact_path=WORK_REPORT,
+        )
+    except RuntimeError as e:
+        _fail_single_round(
+            outcome="worker_dispatch_failed",
+            message=str(e),
+            exit_code=3,
+        )
+        return
 
     if work is None:
-        work = _wait_for_file(
-            WORK_REPORT,
-            "Worker result",
-            timeout_sec=config.timeout,
-            expected_task_id=task_id,
-            expected_round=round_num,
-            expected_role="worker" if config.require_heartbeat else None,
-            heartbeat_ttl_sec=config.heartbeat_ttl,
-            show_manual_hint=not config.auto_dispatch,
+        work = _wait_for_role_result(
+            role="worker",
+            artifact_path=WORK_REPORT,
+            config=config,
+            task_id=task_id,
+            round_num=round_num,
         )
     if work is None:
         if config.require_heartbeat:
@@ -1978,55 +2064,39 @@ def _run_single_round(
         json.dumps(review_request, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
-    _archive_bus_file(REVIEW_REPORT, task_id, round_num, "review_report")
-    REVIEW_REPORT.unlink(missing_ok=True)
+    _prepare_bus_file(REVIEW_REPORT, task_id, round_num, "review_report")
 
     state["state"] = STATE_AWAITING_REVIEW
     state["head_sha"] = head_sha
     _save_single_round_state()
 
-    print(f"\n{'='*60}")
-    print(f"  ROUND {round_num}  —  Awaiting Reviewer")
-    print(f"{'='*60}")
-    print(f"  Review request: {REVIEW_REQ}")
+    _print_round_header(round_num, "reviewer", config)
 
     review: dict | None = None
-    if config.auto_dispatch:
-        try:
-            review = _dispatch_with_artifact_fallback(
-                role="reviewer",
-                dispatch_call=lambda: _run_auto_dispatch(
-                    role="reviewer",
-                    backend=config.reviewer_backend,
-                    prompt=_reviewer_prompt(task_id, round_num),
-                    timeout_sec=config.dispatch_timeout,
-                    verbose=config.verbose,
-                    dispatch_retries=config.dispatch_retries,
-                    dispatch_retry_base_sec=config.dispatch_retry_base_sec,
-                ),
-                artifact_path=REVIEW_REPORT,
-                task_id=task_id,
-                round_num=round_num,
-                timeout_sec=config.artifact_timeout,
-            )
-        except RuntimeError as e:
-            _fail_single_round(
-                outcome="reviewer_dispatch_failed",
-                message=str(e),
-                exit_code=3,
-            )
-            return
+    try:
+        review = _auto_dispatch_role(
+            role="reviewer",
+            prompt=_reviewer_prompt(task_id, round_num),
+            config=config,
+            task_id=task_id,
+            round_num=round_num,
+            artifact_path=REVIEW_REPORT,
+        )
+    except RuntimeError as e:
+        _fail_single_round(
+            outcome="reviewer_dispatch_failed",
+            message=str(e),
+            exit_code=3,
+        )
+        return
 
     if review is None:
-        review = _wait_for_file(
-            REVIEW_REPORT,
-            "Reviewer result",
-            timeout_sec=config.timeout,
-            expected_task_id=task_id,
-            expected_round=round_num,
-            expected_role="reviewer" if config.require_heartbeat else None,
-            heartbeat_ttl_sec=config.heartbeat_ttl,
-            show_manual_hint=not config.auto_dispatch,
+        review = _wait_for_role_result(
+            role="reviewer",
+            artifact_path=REVIEW_REPORT,
+            config=config,
+            task_id=task_id,
+            round_num=round_num,
         )
     if review is None:
         if config.require_heartbeat:
@@ -2106,15 +2176,9 @@ def _run_single_round(
         json.dumps(fix_list, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
-    _archive_bus_file(WORK_REPORT, task_id, round_num, "work_report")
-    WORK_REPORT.unlink(missing_ok=True)
+    _prepare_bus_file(WORK_REPORT, task_id, round_num, "work_report")
 
-    print(f"  Blocking issues: {len(blocking_items)}")
-    for issue in blocking_items:
-        print(
-            f"    - [{issue.get('severity','?')}] {issue.get('file','')}: "
-            f"{issue.get('reason','')}"
-        )
+    _print_blocking_issues(blocking_items)
     print(f"  Fix list written to {FIX_LIST}")
 
     state["state"] = STATE_AWAITING_WORK
@@ -2145,8 +2209,7 @@ def _run_multi_round_via_subprocess(
         _log(f"Base SHA: {base_sha}")
 
         state = _load_state()
-        for stale_key in ("outcome", "failed_at", "error", "head_sha", "round_details"):
-            state.pop(stale_key, None)
+        _clean_stale_state(state, "outcome", "failed_at", "error", "head_sha", "round_details")
         state.update(
             {
                 "state": STATE_AWAITING_WORK,
@@ -2198,8 +2261,7 @@ def _run_multi_round_via_subprocess(
         _set_feed_task_id(task_id)
         _log(f"Resuming task: {task_id}")
         _log(f"Resume contract: base_sha={base_sha} round={start_round}")
-        for stale_key in ("outcome", "failed_at", "error", "head_sha"):
-            state.pop(stale_key, None)
+        _clean_stale_state(state, "outcome", "failed_at", "error", "head_sha")
         if not isinstance(state.get("round_details"), list):
             state["round_details"] = []
         state["state"] = STATE_AWAITING_WORK
@@ -2207,10 +2269,8 @@ def _run_multi_round_via_subprocess(
         state["started_at"] = _ts()
         _save_state(state)
 
-    _archive_bus_file(WORK_REPORT, task_id, start_round, "work_report")
-    WORK_REPORT.unlink(missing_ok=True)
-    _archive_bus_file(REVIEW_REPORT, task_id, start_round, "review_report")
-    REVIEW_REPORT.unlink(missing_ok=True)
+    _prepare_bus_file(WORK_REPORT, task_id, start_round, "work_report")
+    _prepare_bus_file(REVIEW_REPORT, task_id, start_round, "review_report")
     for role in ("worker", "reviewer"):
         _dispatch_log_path(role).unlink(missing_ok=True)
 
@@ -2264,9 +2324,9 @@ def _run_multi_round_via_subprocess(
                 _log(f"Round {round_num} subprocess terminated by SIGINT")
                 break
 
-            result = subprocess.CompletedProcess(
+            result = _completed_proc(
                 cmd,
-                returncode if returncode is not None else 1,
+                returncode,
                 stdout,
                 stderr,
             )
@@ -2317,12 +2377,7 @@ def _run_multi_round_via_subprocess(
                     and fix_list.get("round") == round_num + 1
                 ):
                     blocking = fix_list.get("fixes", [])
-                    print(f"  Blocking issues: {len(blocking)}")
-                    for issue in blocking:
-                        print(
-                            f"    - [{issue.get('severity','?')}] {issue.get('file','')}: "
-                            f"{issue.get('reason','')}"
-                        )
+                    _print_blocking_issues(blocking)
                 else:
                     _log(
                         "State indicates changes_required, but fix_list.json is missing/stale; "

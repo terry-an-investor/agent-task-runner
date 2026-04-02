@@ -12,10 +12,6 @@ import pytest
 from loop_kit import orchestrator
 
 
-def test_hello_returns_greeting() -> None:
-    assert orchestrator.hello() == "hello from loop-kit"
-
-
 class _FakeStdin:
     def __init__(self) -> None:
         self.value = ""
@@ -415,7 +411,7 @@ def test_run_auto_dispatch_non_verbose_filters_out_non_summary_lines(monkeypatch
 
 
 def test_stream_dispatch_stdout_line_collapses_consecutive_reads(monkeypatch, capsys) -> None:
-    monkeypatch.delattr(orchestrator._stream_dispatch_stdout_line, "_state_local", raising=False)
+    monkeypatch.setattr(orchestrator, "_stream_local", threading.local())
     line_1 = json.dumps({
         "type": "item.completed",
         "item": {
@@ -441,7 +437,7 @@ def test_stream_dispatch_stdout_line_collapses_consecutive_reads(monkeypatch, ca
 def test_stream_dispatch_stdout_line_read_collapse_resets_on_non_summary_line(
     monkeypatch, capsys
 ) -> None:
-    monkeypatch.delattr(orchestrator._stream_dispatch_stdout_line, "_state_local", raising=False)
+    monkeypatch.setattr(orchestrator, "_stream_local", threading.local())
     read_line = json.dumps({
         "type": "item.completed",
         "item": {
@@ -491,7 +487,7 @@ def test_run_auto_dispatch_dispatch_log_keeps_full_stdout_when_non_verbose(
 
 
 def test_run_auto_dispatch_does_not_collapse_reads_across_dispatch_runs(monkeypatch, capsys) -> None:
-    monkeypatch.delattr(orchestrator._stream_dispatch_stdout_line, "_state_local", raising=False)
+    monkeypatch.setattr(orchestrator, "_stream_local", threading.local())
     monkeypatch.setattr(
         orchestrator,
         "_agent_command",
