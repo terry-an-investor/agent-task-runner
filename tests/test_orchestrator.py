@@ -3068,6 +3068,10 @@ class TestDispatchFailureHint:
         result = orchestrator._dispatch_failure_hint(backend="codex", stderr="Error: unauthorized 401")
         assert "Authentication failed for codex. Check your API key / token configuration." in result
 
+    def test_auth_token_expired_hint(self) -> None:
+        result = orchestrator._dispatch_failure_hint(backend="codex", stderr="Error: auth token expired")
+        assert "Authentication failed for codex. Check your API key / token configuration." in result
+
     def test_not_found_hint(self) -> None:
         result = orchestrator._dispatch_failure_hint(backend="codex", stderr="codex: command not found")
         assert "Backend codex not found. Run `codex --version` to verify installation." in result

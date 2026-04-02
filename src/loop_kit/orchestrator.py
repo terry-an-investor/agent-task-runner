@@ -1252,7 +1252,19 @@ def _dispatch_failure_hint(
     effective_timeout_sec = DEFAULT_DISPATCH_TIMEOUT_SEC if timeout_sec is None else timeout_sec
     if any(token in lowered for token in ("command not found", "not recognized")):
         hints.append(f"Backend {backend} not found. Run `{backend} --version` to verify installation.")
-    if any(token in lowered for token in ("authentication", "api key", "unauthorized", "401", "403")):
+    if any(
+        token in lowered
+        for token in (
+            "authentication",
+            "auth token",
+            "token expired",
+            "auth failed",
+            "api key",
+            "unauthorized",
+            "401",
+            "403",
+        )
+    ):
         hints.append(f"Authentication failed for {backend}. Check your API key / token configuration.")
     if any(token in lowered for token in ("rate limit", "429", "quota")):
         hints.append(f"{backend} rate limit hit. Wait a moment or increase --dispatch-timeout.")
