@@ -49,7 +49,7 @@ ARCHIVE_DIR = LOOP_DIR / "archive"
 STATE_FILE = LOOP_DIR / "state.json"
 
 DEFAULT_MAX_ROUNDS = 3
-POLL_INTERVAL_SEC = 5
+POLL_INTERVAL_SEC = 1
 DEFAULT_HEARTBEAT_TTL_SEC = 30
 DEFAULT_DISPATCH_TIMEOUT_SEC = 600
 DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC = 90
@@ -86,6 +86,7 @@ class DispatchTimeoutError(RuntimeError):
 # ── file paths ──────────────────────────────────────────────────────
 def _path(name: str) -> Path:
     return LOOP_DIR / name
+
 
 TASK_CARD = _path("task_card.json")
 FIX_LIST = _path("fix_list.json")
@@ -321,27 +322,27 @@ def _dispatch_log_path(role: str) -> Path:
 def _feed_log_path() -> Path:
     return LOGS_DIR / "feed.jsonl"
 
+
 # ── logging ─────────────────────────────────────────────────────────
 def _ts() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
 
 def _set_feed_task_id(task_id: str | None) -> None:
     global _FEED_TASK_ID
     _FEED_TASK_ID = task_id
 
+
 def _ensure_logs_dir() -> None:
     global _LOGS_DIR_ENSURED
     global _LOGS_DIR_ENSURED_PATH
     current_logs_dir = _normalized_abs(LOGS_DIR)
-    if (
-        _LOGS_DIR_ENSURED
-        and current_logs_dir == _LOGS_DIR_ENSURED_PATH
-        and LOGS_DIR.is_dir()
-    ):
+    if _LOGS_DIR_ENSURED and current_logs_dir == _LOGS_DIR_ENSURED_PATH and LOGS_DIR.is_dir():
         return
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     _LOGS_DIR_ENSURED = True
     _LOGS_DIR_ENSURED_PATH = current_logs_dir
+
 
 def _feed_event(event: str, *, level: str = "info", data: dict | None = None) -> None:
     if _FEED_TASK_ID and data and data.get("task_id") not in (None, _FEED_TASK_ID):
@@ -359,6 +360,7 @@ def _feed_event(event: str, *, level: str = "info", data: dict | None = None) ->
     with open(_feed_log_path(), "a", encoding="utf-8") as f:
         f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
+
 def _log(msg: str) -> None:
     ts = _ts()
     line = f"[{ts}] {msg}"
@@ -375,6 +377,7 @@ def _log(msg: str) -> None:
 def _normalized_abs(path: Path) -> str:
     return os.path.normcase(str(path.resolve()))
 
+
 def _read_json_if_exists(path: Path) -> dict | None:
     if not path.exists():
         return None
@@ -386,12 +389,14 @@ def _read_json_if_exists(path: Path) -> dict | None:
     except OSError:
         return None
 
+
 def _heartbeat_age_sec(path: Path, now: float | None = None) -> float | None:
     if not path.exists():
         return None
     if now is None:
         now = time.time()
     return max(0.0, now - path.stat().st_mtime)
+
 
 def _role_is_alive(role: str, ttl_sec: int) -> tuple[bool, str]:
     hb = _heartbeat_path(role)
@@ -403,6 +408,7 @@ def _role_is_alive(role: str, ttl_sec: int) -> tuple[bool, str]:
     data = _read_json_if_exists(hb)
     pid = data.get("pid") if isinstance(data, dict) else "?"
     return True, f"{role} alive (pid={pid}, age={age:.1f}s)"
+
 
 def _extract_codex_thread_id(stdout: str) -> str | None:
     for raw in stdout.splitlines():
@@ -624,11 +630,7 @@ def _codex_event_summary(role: str, backend: str, line: str) -> str | None:
         return f"[{role}] Turn completed"
     if payload_type == "file_change":
         paths = _shorten_paths(_extract_file_paths(payload))
-        return (
-            f"[{role}] Editing: {_summarize_paths(paths)}"
-            if paths
-            else f"[{role}] Editing files"
-        )
+        return f"[{role}] Editing: {_summarize_paths(paths)}" if paths else f"[{role}] Editing files"
     if payload_type not in ("item.started", "item.completed"):
         return None
     item = payload.get("item")
@@ -647,11 +649,7 @@ def _codex_event_summary(role: str, backend: str, line: str) -> str | None:
         return f"[{role}] Message: {_truncate_summary_text(message)}" if message else f"[{role}] Message"
     if item_type == "file_change":
         paths = _shorten_paths(_extract_file_paths(item))
-        return (
-            f"[{role}] Editing: {_summarize_paths(paths)}"
-            if paths
-            else f"[{role}] Editing files"
-        )
+        return f"[{role}] Editing: {_summarize_paths(paths)}" if paths else f"[{role}] Editing files"
     return None
 
 
@@ -775,8 +773,7 @@ def _require_registered_backend(
     spec = _BACKEND_REGISTRY.get(key)
     if spec is None:
         raise ValueError(
-            f"Unsupported backend: {backend}. "
-            f"Registered backends: {', '.join(_available_backends()) or '<none>'}"
+            f"Unsupported backend: {backend}. Registered backends: {', '.join(_available_backends()) or '<none>'}"
         )
     return spec
 
@@ -829,33 +826,45 @@ def _resolve_claude_exe(backend: str) -> str:
 
 
 def _build_codex_command(exe: str, prompt: str) -> tuple[list[str], str | None, str | None]:
-    return ([
-        exe, "exec",
-        "--json",
-        "--dangerously-bypass-approvals-and-sandbox",
-        "-C", str(ROOT),
-        (
-            "Execute the context provided via stdin.  Follow the instructions"
-            " embedded in it and only finish after the required output artifact"
-            " is written."
-        ),
-    ], None, prompt)
+    return (
+        [
+            exe,
+            "exec",
+            "--json",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "-C",
+            str(ROOT),
+            (
+                "Execute the context provided via stdin.  Follow the instructions"
+                " embedded in it and only finish after the required output artifact"
+                " is written."
+            ),
+        ],
+        None,
+        prompt,
+    )
 
 
 def _build_claude_command(exe: str, prompt: str) -> tuple[list[str], str | None, str | None]:
     sid = str(uuid.uuid4())
-    return ([
-        exe,
-        "-p",
-        "--dangerously-skip-permissions",
-        "--session-id", sid,
-        prompt,
-    ], sid, None)
+    return (
+        [
+            exe,
+            "-p",
+            "--dangerously-skip-permissions",
+            "--session-id",
+            sid,
+            prompt,
+        ],
+        sid,
+        None,
+    )
 
 
 def _resolve_backend_exe(backend: str) -> str:
     _, resolve_exe_fn, _ = _require_registered_backend(backend)
     return resolve_exe_fn(backend.strip().lower())
+
 
 def _agent_command(backend: str, prompt: str) -> tuple[list[str], str | None, str | None]:
     """Return (cmd, session_id, stdin_text).
@@ -892,15 +901,21 @@ def _resolve_opencode_exe(backend: str) -> str:
 
 
 def _build_opencode_command(exe: str, prompt: str) -> tuple[list[str], str | None, str | None]:
-    return ([
-        exe, "run",
-        "--format", "json",
-        (
-            "Execute the context provided via stdin.  Follow the instructions"
-            " embedded in it and only finish after the required output artifact"
-            " is written."
-        ),
-    ], None, prompt)
+    return (
+        [
+            exe,
+            "run",
+            "--format",
+            "json",
+            (
+                "Execute the context provided via stdin.  Follow the instructions"
+                " embedded in it and only finish after the required output artifact"
+                " is written."
+            ),
+        ],
+        None,
+        prompt,
+    )
 
 
 def _opencode_parse_event(role: str, backend: str, line: str) -> str | None:
@@ -986,6 +1001,7 @@ def _write_dispatch_log(
             if not result.stderr.endswith("\n"):
                 f.write("\n")
         f.write("-" * 60 + "\n")
+
 
 def _dispatch_failure_hint(*, backend: str, stderr: str, timeout: bool = False) -> str:
     hints: list[str] = []
@@ -1189,10 +1205,7 @@ def _run_auto_dispatch(
     retry_count = max(0, int(dispatch_retries))
     retry_base_sec = max(1, int(dispatch_retry_base_sec))
     max_attempts = retry_count + 1
-    _log(
-        f"Auto-dispatch start: role={role} backend={backend} retries={retry_count} "
-        f"retry_base_sec={retry_base_sec}"
-    )
+    _log(f"Auto-dispatch start: role={role} backend={backend} retries={retry_count} retry_base_sec={retry_base_sec}")
     attempt = 0
     while attempt < max_attempts:
         attempt += 1
@@ -1291,8 +1304,7 @@ def _run_auto_dispatch(
         if attempt >= max_attempts:
             raise RuntimeError(
                 f"{role} dispatch failed (backend={backend}, rc={result.returncode}) "
-                f"after {attempt} attempts: {stderr_text}"
-                + _dispatch_failure_hint(backend=backend, stderr=stderr_text)
+                f"after {attempt} attempts: {stderr_text}" + _dispatch_failure_hint(backend=backend, stderr=stderr_text)
             )
         retry_delay = min(MAX_DISPATCH_RETRY_DELAY_SEC, retry_base_sec * (2 ** (attempt - 1)))
         _log(
@@ -1300,6 +1312,7 @@ def _run_auto_dispatch(
             f"{attempt}/{max_attempts}; retrying in {retry_delay}s"
         )
         time.sleep(retry_delay)
+
 
 def _require_dispatch_artifact(
     role: str,
@@ -1336,10 +1349,7 @@ def _dispatch_with_artifact_fallback(
     try:
         dispatch_call()
     except DispatchTimeoutError as e:
-        _log(
-            f"{role} dispatch timed out; checking {artifact_path.name} "
-            f"for task_id={task_id} round={round_num}"
-        )
+        _log(f"{role} dispatch timed out; checking {artifact_path.name} for task_id={task_id} round={round_num}")
         data = _wait_for_file(
             path=artifact_path,
             description=f"{role} post-timeout artifact check",
@@ -1472,8 +1482,7 @@ def _render_prompt_template(
     template_text = _read_text_optional(template_path)
     if template_text is None:
         raise RuntimeError(
-            f"Missing required prompt template: {_display_path(template_path)}. "
-            "Run 'loop init' to create it."
+            f"Missing required prompt template: {_display_path(template_path)}. Run 'loop init' to create it."
         )
     try:
         return template_text.format(**context)
@@ -1485,10 +1494,7 @@ def _read_required_text(path: Path, *, label: str) -> str:
     text = _read_text_optional(path)
     if text:
         return text
-    raise RuntimeError(
-        f"Missing required {label}: {_display_path(path)}. "
-        "Create this file and re-run."
-    )
+    raise RuntimeError(f"Missing required {label}: {_display_path(path)}. Create this file and re-run.")
 
 
 def _read_text_with_default(project_path: Path, default_filename: str) -> str:
@@ -1563,11 +1569,13 @@ def _reviewer_prompt(task_id: str, round_num: int) -> str:
         context=context,
     )
 
+
 # ── state ───────────────────────────────────────────────────────────
-STATE_IDLE            = "idle"
-STATE_AWAITING_WORK   = "awaiting_work"
+STATE_IDLE = "idle"
+STATE_AWAITING_WORK = "awaiting_work"
 STATE_AWAITING_REVIEW = "awaiting_review"
-STATE_DONE            = "done"
+STATE_DONE = "done"
+
 
 def _load_state() -> dict:
     default_state = {"state": STATE_IDLE, "round": 0, "task_id": None}
@@ -1586,36 +1594,40 @@ def _load_state() -> dict:
         return default_state.copy()
     return data
 
+
 def _atomic_write_json(path: Path, data: object) -> None:
     """Write *data* as JSON to *path* atomically (write-then-rename)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     try:
-        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n",
-                       encoding="utf-8")
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         tmp.replace(path)
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
 
+
 def _save_state(state: dict) -> None:
     _atomic_write_json(STATE_FILE, state)
+
 
 # ── git helpers ─────────────────────────────────────────────────────
 def _git(*args: str, timeout: float | None = DEFAULT_GIT_TIMEOUT_SEC) -> str:
     try:
         result = subprocess.run(
             ["git", "-C", str(ROOT), *args],
-            capture_output=True, text=True, encoding="utf-8", timeout=timeout,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=timeout,
         )
     except subprocess.TimeoutExpired as exc:
         timeout_value = exc.timeout if exc.timeout is not None else timeout
-        raise RuntimeError(
-            f"git {' '.join(args)} timed out after {timeout_value}s"
-        ) from exc
+        raise RuntimeError(f"git {' '.join(args)} timed out after {timeout_value}s") from exc
     if result.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} failed: {result.stderr.strip()}")
     return result.stdout.strip()
+
 
 def _is_valid_ref(ref: str) -> bool:
     """Check that *ref* is a valid git rev (no argument injection)."""
@@ -1625,17 +1637,22 @@ def _is_valid_ref(ref: str) -> bool:
     except RuntimeError:
         return False
 
+
 def _current_sha() -> str:
     return _git("rev-parse", "HEAD")
+
 
 def _diff(base: str, head: str) -> str:
     return _git("diff", f"{base}..{head}")
 
+
 def _log_oneline(base: str, head: str) -> str:
     return _git("log", "--oneline", f"{base}..{head}")
 
+
 def _is_git_repo_root(path: Path) -> bool:
     return (path / ".git").exists() or (path / ".git").is_file()
+
 
 def _parse_porcelain_path(raw: str) -> str:
     text = raw.strip()
@@ -1644,6 +1661,7 @@ def _parse_porcelain_path(raw: str) -> str:
     if text.startswith('"') and text.endswith('"') and len(text) >= 2:
         text = text[1:-1]
     return text.replace("\\", "/")
+
 
 def _dirty_tracked_paths() -> list[str]:
     if not _is_git_repo_root(ROOT):
@@ -1663,6 +1681,7 @@ def _dirty_tracked_paths() -> list[str]:
         dirty.append(path)
     return sorted(set(dirty))
 
+
 def _enforce_clean_worktree_or_exit(*, allow_dirty: bool) -> None:
     dirty = _dirty_tracked_paths()
     if not dirty:
@@ -1676,6 +1695,7 @@ def _enforce_clean_worktree_or_exit(*, allow_dirty: bool) -> None:
         return
     print("Refusing to start. Re-run with --allow-dirty to bypass.", file=sys.stderr)
     sys.exit(EXIT_DIRTY_WORKTREE)
+
 
 def _validate_work_report(
     work: dict,
@@ -1702,21 +1722,12 @@ def _validate_work_report(
 
     for list_field in ("files_changed", "tests"):
         if list_field in work and not isinstance(work[list_field], list):
-            return (
-                f"work_report field '{list_field}' must be a list, "
-                f"got {type(work[list_field]).__name__}"
-            )
+            return f"work_report field '{list_field}' must be a list, got {type(work[list_field]).__name__}"
 
     if work["task_id"] != expected_task_id:
-        return (
-            "work_report field 'task_id' mismatch: "
-            f"expected {expected_task_id!r}, got {work['task_id']!r}"
-        )
+        return f"work_report field 'task_id' mismatch: expected {expected_task_id!r}, got {work['task_id']!r}"
     if work["round"] != expected_round:
-        return (
-            "work_report field 'round' mismatch: "
-            f"expected {expected_round}, got {work['round']!r}"
-        )
+        return f"work_report field 'round' mismatch: expected {expected_round}, got {work['round']!r}"
     return None
 
 
@@ -1750,16 +1761,11 @@ def _validate_review_report(
             f"got {review['decision']!r}"
         )
     if review["task_id"] != expected_task_id:
-        return (
-            "review_report field 'task_id' mismatch: "
-            f"expected {expected_task_id!r}, got {review['task_id']!r}"
-        )
+        return f"review_report field 'task_id' mismatch: expected {expected_task_id!r}, got {review['task_id']!r}"
     if review["round"] != expected_round:
-        return (
-            "review_report field 'round' mismatch: "
-            f"expected {expected_round}, got {review['round']!r}"
-        )
+        return f"review_report field 'round' mismatch: expected {expected_round}, got {review['round']!r}"
     return None
+
 
 def _tests_summary(tests: object) -> dict:
     if not isinstance(tests, list):
@@ -1775,6 +1781,7 @@ def _tests_summary(tests: object) -> dict:
             summary["other"] += 1
     return summary
 
+
 # ── polling ─────────────────────────────────────────────────────────
 def _wait_for_file(
     path: Path,
@@ -1789,8 +1796,7 @@ def _wait_for_file(
     """Poll until *path* appears. Returns parsed JSON or None on timeout."""
     _log(f"Waiting for {path.name} ({description}) ...")
     if show_manual_hint:
-        print(f"\n  >>> Tell the {'Worker' if 'work' in path.name else 'Reviewer'} "
-              f"to process their input file. <<<\n")
+        print(f"\n  >>> Tell the {'Worker' if 'work' in path.name else 'Reviewer'} to process their input file. <<<\n")
     elapsed = 0
     last_ignored_signature: tuple[int, int] | None = None
     while True:
@@ -1865,14 +1871,22 @@ def cmd_init() -> None:
     # copy example task card if not present
     example = LOOP_DIR / "examples" / "task_card.json"
     if not example.exists():
-        example.write_text(json.dumps({
-            "task_id": "T-001",
-            "goal": "<one-sentence goal>",
-            "in_scope": ["<file or module>"],
-            "out_of_scope": [],
-            "acceptance_criteria": ["<measurable criterion>"],
-            "constraints": []
-        }, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        example.write_text(
+            json.dumps(
+                {
+                    "task_id": "T-001",
+                    "goal": "<one-sentence goal>",
+                    "in_scope": ["<file or module>"],
+                    "out_of_scope": [],
+                    "acceptance_criteria": ["<measurable criterion>"],
+                    "constraints": [],
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         print(f"  Created: {example}")
     worker_template = _worker_prompt_template_path()
     if _write_template_if_missing(worker_template, DEFAULT_WORKER_PROMPT_TEMPLATE + "\n"):
@@ -1880,6 +1894,7 @@ def cmd_init() -> None:
     reviewer_template = _reviewer_prompt_template_path()
     if _write_template_if_missing(reviewer_template, DEFAULT_REVIEWER_PROMPT_TEMPLATE + "\n"):
         print(f"  Created: {reviewer_template}")
+
 
 # ── status ──────────────────────────────────────────────────────────
 def cmd_status() -> None:
@@ -1935,6 +1950,7 @@ def cmd_archive(task_id: str, restore: str | None = None) -> None:
     shutil.copy2(src, dest)
     print(f"Restored {src.name} -> {dest}")
 
+
 # ── extract-diff ────────────────────────────────────────────────────
 def cmd_extract_diff(base: str, head: str) -> None:
     for ref in (base, head):
@@ -1942,6 +1958,7 @@ def cmd_extract_diff(base: str, head: str) -> None:
             print(f"Error: invalid git ref: {ref!r}", file=sys.stderr)
             sys.exit(EXIT_GENERAL_ERROR)
     print(_diff(base, head))
+
 
 def cmd_heartbeat(role: str, interval: int) -> None:
     role = role.lower().strip()
@@ -1962,19 +1979,20 @@ def cmd_heartbeat(role: str, interval: int) -> None:
                 "updated_at": _ts(),
                 "cwd": str(ROOT),
             }
-            hb.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
-                          encoding="utf-8")
+            hb.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
             time.sleep(max(1, interval))
     except KeyboardInterrupt:
         _log(f"Heartbeat stopped for role={role}")
         print("\n  Heartbeat stopped.")
         sys.exit(EXIT_OK)
 
+
 def cmd_health(ttl: int) -> None:
     for role in ("worker", "reviewer"):
         alive, reason = _role_is_alive(role, ttl)
         status = "alive" if alive else "dead"
         print(f"  {role}: {status}  ({reason})")
+
 
 # ── main run loop ───────────────────────────────────────────────────
 def _load_task_card(task_path: str) -> tuple[Path, dict, str]:
@@ -2054,9 +2072,9 @@ def _single_round_subprocess_cmd(
 
 def _print_round_header(round_num: int, role: str) -> None:
     title = role.capitalize()
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"  ROUND {round_num}  —  Awaiting {title}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     if role == "worker":
         print(f"  Task card: {TASK_CARD}")
         if round_num == 1:
@@ -2118,10 +2136,7 @@ def _wait_for_role_result(
 def _print_blocking_issues(items: list[object]) -> None:
     print(f"  Blocking issues: {len(items)}")
     for issue in items:
-        print(
-            f"    - [{issue.get('severity','?')}] {issue.get('file','')}: "
-            f"{issue.get('reason','')}"
-        )
+        print(f"    - [{issue.get('severity', '?')}] {issue.get('file', '')}: {issue.get('reason', '')}")
 
 
 def _run_single_round(
@@ -2179,8 +2194,7 @@ def _run_single_round(
         _fail_single_round(
             outcome="state_task_mismatch",
             message=(
-                "task_id mismatch between state.json and task card: "
-                f"state={state_task_id!r} task={task_id_from_card!r}"
+                f"task_id mismatch between state.json and task card: state={state_task_id!r} task={task_id_from_card!r}"
             ),
             exit_code=EXIT_VALIDATION_ERROR,
         )
@@ -2373,7 +2387,8 @@ def _run_single_round(
         "review_decision": decision,
     }
     round_details = [
-        item for item in state.get("round_details", [])
+        item
+        for item in state.get("round_details", [])
         if not (isinstance(item, dict) and item.get("round") == round_num)
     ]
     round_details.append(round_detail)
@@ -2383,10 +2398,10 @@ def _run_single_round(
         state["state"] = STATE_DONE
         state["outcome"] = "approved"
         _save_single_round_state()
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"  APPROVED at round {round_num}")
         print(f"  base: {base_sha[:8]}  head: {head_sha[:8]}")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
 
         summary = LOOP_DIR / "summary.json"
         summary.write_text(
@@ -2489,8 +2504,7 @@ def _run_multi_round_via_subprocess(
                 state,
                 outcome="invalid_resume_state",
                 message=(
-                    "state.json is missing required resume contract "
-                    "(task_id/base_sha/round). Re-run without --resume."
+                    "state.json is missing required resume contract (task_id/base_sha/round). Re-run without --resume."
                 ),
                 exit_code=EXIT_VALIDATION_ERROR,
             )
@@ -2545,9 +2559,9 @@ def _run_multi_round_via_subprocess(
             if interrupted:
                 break
 
-            print(f"\n{'='*60}")
+            print(f"\n{'=' * 60}")
             print(f"  ROUND {round_num}/{config.max_rounds}  —  Single-Round Subprocess")
-            print(f"{'='*60}")
+            print(f"{'=' * 60}")
             _archive_bus_file(STATE_FILE, task_id, round_num, "state")
 
             cmd = _single_round_subprocess_cmd(
@@ -2616,10 +2630,7 @@ def _run_multi_round_via_subprocess(
                 _log(f"Task approved via state contract at round={round_num}")
                 return
 
-            if (
-                state.get("state") == STATE_AWAITING_WORK
-                and state.get("round") == round_num + 1
-            ):
+            if state.get("state") == STATE_AWAITING_WORK and state.get("round") == round_num + 1:
                 last_decision = "changes_required"
                 if (
                     isinstance(fix_list, dict)
@@ -2636,10 +2647,7 @@ def _run_multi_round_via_subprocess(
                 if isinstance(review, dict):
                     decision = review.get("decision")
                     if decision not in (None, "changes_required"):
-                        _log(
-                            f"Ignoring stale review_report decision={decision!r}; "
-                            "state.json is authoritative."
-                        )
+                        _log(f"Ignoring stale review_report decision={decision!r}; state.json is authoritative.")
                 continue
 
             _fail_with_state(
@@ -2767,13 +2775,13 @@ def main() -> None:
     sub.add_parser("status", parents=[shared], help="Show current loop state")
 
     health_p = sub.add_parser("health", parents=[shared], help="Show worker/reviewer heartbeat health")
-    health_p.add_argument("--ttl", type=int, default=DEFAULT_HEARTBEAT_TTL_SEC,
-                          help="Heartbeat freshness threshold in seconds")
+    health_p.add_argument(
+        "--ttl", type=int, default=DEFAULT_HEARTBEAT_TTL_SEC, help="Heartbeat freshness threshold in seconds"
+    )
 
     hb_p = sub.add_parser("heartbeat", parents=[shared], help="Write role heartbeat continuously")
     hb_p.add_argument("--role", choices=["worker", "reviewer"], required=True)
-    hb_p.add_argument("--interval", type=int, default=5,
-                      help="Heartbeat write interval in seconds")
+    hb_p.add_argument("--interval", type=int, default=5, help="Heartbeat write interval in seconds")
 
     diff_p = sub.add_parser("extract-diff", parents=[shared], help="Print git diff between two commits")
     diff_p.add_argument("base")
@@ -2787,43 +2795,61 @@ def main() -> None:
     )
 
     run_p = sub.add_parser("run", parents=[shared], help="Run the full PM-controlled review loop")
-    run_p.add_argument("--task", default=None,
-                       help="Path to task card JSON")
-    run_p.add_argument("--max-rounds", type=int, default=DEFAULT_MAX_ROUNDS,
-                       help="Maximum review rounds (default: 3)")
-    run_p.add_argument("--timeout", type=int, default=0,
-                       help="Per-phase timeout in seconds (0=unlimited)")
-    run_p.add_argument("--require-heartbeat", action="store_true",
-                       help="Require fresh worker/reviewer heartbeat while waiting")
-    run_p.add_argument("--heartbeat-ttl", type=int, default=DEFAULT_HEARTBEAT_TTL_SEC,
-                       help="Heartbeat freshness threshold in seconds")
-    run_p.add_argument("--auto-dispatch", action="store_true",
-                       help="Automatically invoke worker/reviewer backends each round")
-    run_p.add_argument("--dispatch-backend", choices=[DISPATCH_BACKEND_NATIVE],
-                       default=DEFAULT_DISPATCH_BACKEND,
-                       help="Dispatch transport: native subprocess calls")
-    run_p.add_argument("--worker-backend", default=DEFAULT_WORKER_BACKEND,
-                       help="Backend used for auto worker dispatch (native mode)")
-    run_p.add_argument("--reviewer-backend", default=DEFAULT_REVIEWER_BACKEND,
-                       help="Backend used for auto reviewer dispatch (native mode)")
-    run_p.add_argument("--dispatch-timeout", type=int, default=DEFAULT_DISPATCH_TIMEOUT_SEC,
-                       help="Per-dispatch timeout in seconds (default: 600, 0=unlimited)")
-    run_p.add_argument("--dispatch-retries", type=int, default=DEFAULT_DISPATCH_RETRIES,
-                       help="Retry count for non-zero dispatch exits (default: 2)")
-    run_p.add_argument("--dispatch-retry-base-sec", type=int, default=DEFAULT_DISPATCH_RETRY_BASE_SEC,
-                       help="Base retry backoff seconds (default: 5, max delay: 60)")
-    run_p.add_argument("--artifact-timeout", type=int, default=DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC,
-                       help="Post-dispatch artifact timeout in seconds (default: 90)")
-    run_p.add_argument("--single-round", action="store_true",
-                       help="Run exactly one round and exit")
-    run_p.add_argument("--round", type=int,
-                       help="Round number for --single-round mode")
-    run_p.add_argument("--allow-dirty", action="store_true",
-                       help="Allow run to start with dirty tracked git files")
-    run_p.add_argument("--resume", action="store_true",
-                       help="Resume from .loop/state.json contract")
-    run_p.add_argument("--verbose", action="store_true",
-                       help="Stream full backend stdout lines during auto-dispatch")
+    run_p.add_argument("--task", default=None, help="Path to task card JSON")
+    run_p.add_argument("--max-rounds", type=int, default=DEFAULT_MAX_ROUNDS, help="Maximum review rounds (default: 3)")
+    run_p.add_argument("--timeout", type=int, default=0, help="Per-phase timeout in seconds (0=unlimited)")
+    run_p.add_argument(
+        "--require-heartbeat", action="store_true", help="Require fresh worker/reviewer heartbeat while waiting"
+    )
+    run_p.add_argument(
+        "--heartbeat-ttl", type=int, default=DEFAULT_HEARTBEAT_TTL_SEC, help="Heartbeat freshness threshold in seconds"
+    )
+    run_p.add_argument(
+        "--auto-dispatch", action="store_true", help="Automatically invoke worker/reviewer backends each round"
+    )
+    run_p.add_argument(
+        "--dispatch-backend",
+        choices=[DISPATCH_BACKEND_NATIVE],
+        default=DEFAULT_DISPATCH_BACKEND,
+        help="Dispatch transport: native subprocess calls",
+    )
+    run_p.add_argument(
+        "--worker-backend", default=DEFAULT_WORKER_BACKEND, help="Backend used for auto worker dispatch (native mode)"
+    )
+    run_p.add_argument(
+        "--reviewer-backend",
+        default=DEFAULT_REVIEWER_BACKEND,
+        help="Backend used for auto reviewer dispatch (native mode)",
+    )
+    run_p.add_argument(
+        "--dispatch-timeout",
+        type=int,
+        default=DEFAULT_DISPATCH_TIMEOUT_SEC,
+        help="Per-dispatch timeout in seconds (default: 600, 0=unlimited)",
+    )
+    run_p.add_argument(
+        "--dispatch-retries",
+        type=int,
+        default=DEFAULT_DISPATCH_RETRIES,
+        help="Retry count for non-zero dispatch exits (default: 2)",
+    )
+    run_p.add_argument(
+        "--dispatch-retry-base-sec",
+        type=int,
+        default=DEFAULT_DISPATCH_RETRY_BASE_SEC,
+        help="Base retry backoff seconds (default: 5, max delay: 60)",
+    )
+    run_p.add_argument(
+        "--artifact-timeout",
+        type=int,
+        default=DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC,
+        help="Post-dispatch artifact timeout in seconds (default: 90)",
+    )
+    run_p.add_argument("--single-round", action="store_true", help="Run exactly one round and exit")
+    run_p.add_argument("--round", type=int, help="Round number for --single-round mode")
+    run_p.add_argument("--allow-dirty", action="store_true", help="Allow run to start with dirty tracked git files")
+    run_p.add_argument("--resume", action="store_true", help="Resume from .loop/state.json contract")
+    run_p.add_argument("--verbose", action="store_true", help="Stream full backend stdout lines during auto-dispatch")
 
     args = parser.parse_args()
     if args.cmd is None:
@@ -2868,6 +2894,7 @@ def main() -> None:
         )
     else:
         parser.print_help()
+
 
 if __name__ == "__main__":
     main()
