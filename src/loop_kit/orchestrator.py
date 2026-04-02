@@ -95,6 +95,8 @@ REVIEW_REQ = _path("review_request.json")
 REVIEW_REPORT = _path("review_report.json")
 LOCK_FILE = _path("lock")
 _SUMMARY_FILE = _path("summary.json")
+_CONFIG_FILE = _path("config.json")
+_TASKS_DIR = LOOP_DIR / "tasks"
 _RESETTABLE_FILES = [
     LOCK_FILE, STATE_FILE, _SUMMARY_FILE,
     WORK_REPORT, REVIEW_REPORT, REVIEW_REQ, FIX_LIST,
@@ -1819,6 +1821,38 @@ def _sync_task_card(task_path: str) -> None:
     _log(f"Synced task card: {src} -> {TASK_CARD}")
 
 
+def _resolve_task_path(task_ref: str | None) -> str | None:
+    """Resolve a task ID or path to an absolute task card path.
+
+    Accepts:
+      - Full path to a JSON file
+      - A task ID like 'T-601' -> finds .loop/tasks/T-601-*.json
+      - None -> returns None (caller falls back to default)
+    """
+    if task_ref is None:
+        return None
+    p = Path(task_ref)
+    if p.is_file():
+        return str(p)
+    # Try as task ID: find .loop/tasks/<id>-*.json
+    if _TASKS_DIR.is_dir():
+        matches = sorted(_TASKS_DIR.glob(f"{task_ref}-*.json"))
+        if matches:
+            return str(matches[0])
+    return task_ref  # return as-is; downstream will error if invalid
+
+
+def _load_config() -> dict:
+    """Load .loop/config.json defaults (worker_backend, reviewer_backend, etc.)."""
+    if not _CONFIG_FILE.is_file():
+        return {}
+    try:
+        data = json.loads(_CONFIG_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
 def _enforce_clean_worktree_or_exit(*, allow_dirty: bool) -> None:
     dirty = _dirty_tracked_paths()
     if not dirty:
@@ -2838,6 +2872,9 @@ def cmd_run(
         if reset and not single_round:
             _reset_bus()
             _sync_task_card(config.task_path)
+        elif not single_round:
+            # Still sync task card even without full reset
+            _sync_task_card(config.task_path)
 
         # Single-round subprocesses are spawned by the parent loop which already
         # validated the worktree — skip redundant check to avoid duplicate warnings.
@@ -2937,61 +2974,64 @@ def main() -> None:
     )
 
     run_p = sub.add_parser("run", parents=[shared], help="Run the full PM-controlled review loop")
-    run_p.add_argument("--task", default=None, help="Path to task card JSON")
-    run_p.add_argument("--max-rounds", type=int, default=DEFAULT_MAX_ROUNDS, help="Maximum review rounds (default: 3)")
-    run_p.add_argument("--timeout", type=int, default=0, help="Per-phase timeout in seconds (0=unlimited)")
+    run_p.add_argument("task_ref", nargs="?", default=None,
+                       help="Task ID (e.g. T-601) or path to task card JSON")
+    run_p.add_argument("--task", default=None, help="Path to task card JSON (overrides positional task_ref)")
+    run_p.add_argument("--max-rounds", type=int, default=None, help="Maximum review rounds (default: 3)")
+    run_p.add_argument("--timeout", type=int, default=None, help="Per-phase timeout in seconds (0=unlimited)")
     run_p.add_argument(
         "--require-heartbeat", action="store_true", help="Require fresh worker/reviewer heartbeat while waiting"
     )
     run_p.add_argument(
-        "--heartbeat-ttl", type=int, default=DEFAULT_HEARTBEAT_TTL_SEC, help="Heartbeat freshness threshold in seconds"
+        "--heartbeat-ttl", type=int, default=None, help="Heartbeat freshness threshold in seconds"
     )
     run_p.add_argument(
-        "--auto-dispatch", action="store_true", help="Automatically invoke worker/reviewer backends each round"
+        "--auto-dispatch", action="store_true", default=False,
+        help="Automatically invoke worker/reviewer backends each round"
     )
     run_p.add_argument(
         "--dispatch-backend",
         choices=[DISPATCH_BACKEND_NATIVE],
-        default=DEFAULT_DISPATCH_BACKEND,
+        default=None,
         help="Dispatch transport: native subprocess calls",
     )
     run_p.add_argument(
-        "--worker-backend", default=DEFAULT_WORKER_BACKEND, help="Backend used for auto worker dispatch (native mode)"
+        "--worker-backend", default=None, help="Backend used for auto worker dispatch (native mode)"
     )
     run_p.add_argument(
         "--reviewer-backend",
-        default=DEFAULT_REVIEWER_BACKEND,
+        default=None,
         help="Backend used for auto reviewer dispatch (native mode)",
     )
     run_p.add_argument(
         "--dispatch-timeout",
         type=int,
-        default=DEFAULT_DISPATCH_TIMEOUT_SEC,
+        default=None,
         help="Per-dispatch timeout in seconds (default: 600, 0=unlimited)",
     )
     run_p.add_argument(
         "--dispatch-retries",
         type=int,
-        default=DEFAULT_DISPATCH_RETRIES,
+        default=None,
         help="Retry count for non-zero dispatch exits (default: 2)",
     )
     run_p.add_argument(
         "--dispatch-retry-base-sec",
         type=int,
-        default=DEFAULT_DISPATCH_RETRY_BASE_SEC,
+        default=None,
         help="Base retry backoff seconds (default: 5, max delay: 60)",
     )
     run_p.add_argument(
         "--artifact-timeout",
         type=int,
-        default=DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC,
+        default=None,
         help="Post-dispatch artifact timeout in seconds (default: 90)",
     )
     run_p.add_argument("--single-round", action="store_true", help="Run exactly one round and exit")
     run_p.add_argument("--round", type=int, help="Round number for --single-round mode")
     run_p.add_argument("--allow-dirty", action="store_true", help="Allow run to start with dirty tracked git files")
     run_p.add_argument("--resume", action="store_true", help="Resume from .loop/state.json contract")
-    run_p.add_argument("--reset", action="store_true", help="Clear stale bus files and sync task card before starting")
+    run_p.add_argument("--no-reset", action="store_true", help="Skip auto-reset of stale bus files")
     run_p.add_argument("--verbose", action="store_true", help="Stream full backend stdout lines during auto-dispatch")
 
     args = parser.parse_args()
@@ -3012,20 +3052,32 @@ def main() -> None:
     elif args.cmd == "archive":
         cmd_archive(args.task_id, args.restore)
     elif args.cmd == "run":
+        cfg = _load_config()
+        # Resolve task path: --task > positional task_ref > config > default
+        raw_ref = args.task if args.task is not None else args.task_ref
+        task_path = _resolve_task_path(raw_ref) or str(TASK_CARD)
+
+        def _cfg_val(cli_val, config_key, builtin_default):
+            """CLI arg > config.json > builtin default."""
+            if cli_val is not None:
+                return cli_val
+            v = cfg.get(config_key)
+            return v if v is not None else builtin_default
+
         config = RunConfig(
-            task_path=args.task if args.task is not None else str(TASK_CARD),
-            max_rounds=args.max_rounds,
-            timeout=args.timeout,
+            task_path=task_path,
+            max_rounds=int(_cfg_val(args.max_rounds, "max_rounds", DEFAULT_MAX_ROUNDS)),
+            timeout=int(_cfg_val(args.timeout, "timeout", 0)),
             require_heartbeat=args.require_heartbeat,
-            heartbeat_ttl=args.heartbeat_ttl,
-            auto_dispatch=args.auto_dispatch,
-            dispatch_backend=args.dispatch_backend,
-            worker_backend=args.worker_backend,
-            reviewer_backend=args.reviewer_backend,
-            dispatch_timeout=args.dispatch_timeout,
-            dispatch_retries=args.dispatch_retries,
-            dispatch_retry_base_sec=args.dispatch_retry_base_sec,
-            artifact_timeout=args.artifact_timeout,
+            heartbeat_ttl=int(_cfg_val(args.heartbeat_ttl, "heartbeat_ttl", DEFAULT_HEARTBEAT_TTL_SEC)),
+            auto_dispatch=args.auto_dispatch or cfg.get("auto_dispatch", False),
+            dispatch_backend=str(_cfg_val(args.dispatch_backend, "dispatch_backend", DEFAULT_DISPATCH_BACKEND)),
+            worker_backend=str(_cfg_val(args.worker_backend, "worker_backend", DEFAULT_WORKER_BACKEND)),
+            reviewer_backend=str(_cfg_val(args.reviewer_backend, "reviewer_backend", DEFAULT_REVIEWER_BACKEND)),
+            dispatch_timeout=int(_cfg_val(args.dispatch_timeout, "dispatch_timeout", DEFAULT_DISPATCH_TIMEOUT_SEC)),
+            dispatch_retries=int(_cfg_val(args.dispatch_retries, "dispatch_retries", DEFAULT_DISPATCH_RETRIES)),
+            dispatch_retry_base_sec=int(_cfg_val(args.dispatch_retry_base_sec, "dispatch_retry_base_sec", DEFAULT_DISPATCH_RETRY_BASE_SEC)),
+            artifact_timeout=int(_cfg_val(args.artifact_timeout, "artifact_timeout", DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC)),
             allow_dirty=args.allow_dirty,
             verbose=args.verbose,
         )
@@ -3034,7 +3086,7 @@ def main() -> None:
             single_round=args.single_round,
             round_num=args.round,
             resume=args.resume,
-            reset=args.reset,
+            reset=not args.no_reset,
         )
     else:
         parser.print_help()
