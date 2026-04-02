@@ -179,6 +179,7 @@ def test_main_loop_dir_overrides_all_bus_paths(tmp_path: Path, monkeypatch) -> N
         captured["pitfalls_file"] = orchestrator._PITFALLS_FILE
         captured["patterns_file"] = orchestrator._PATTERNS_FILE
         captured["state_file"] = orchestrator.STATE_FILE
+        captured["state_backup"] = orchestrator._STATE_BACKUP
         captured["task_card"] = orchestrator.TASK_CARD
         captured["fix_list"] = orchestrator.FIX_LIST
         captured["work_report"] = orchestrator.WORK_REPORT
@@ -202,6 +203,7 @@ def test_main_loop_dir_overrides_all_bus_paths(tmp_path: Path, monkeypatch) -> N
     assert captured["pitfalls_file"] == expected_loop / "context" / "pitfalls.md"
     assert captured["patterns_file"] == expected_loop / "context" / "patterns.jsonl"
     assert captured["state_file"] == expected_loop / "state.json"
+    assert captured["state_backup"] == expected_loop / ".state.json.bak"
     assert captured["task_card"] == expected_loop / "task_card.json"
     assert captured["fix_list"] == expected_loop / "fix_list.json"
     assert captured["work_report"] == expected_loop / "work_report.json"
@@ -1340,6 +1342,7 @@ def _configure_loop_paths(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(orchestrator, "RUNTIME_DIR", runtime_dir)
     monkeypatch.setattr(orchestrator, "ARCHIVE_DIR", loop_dir / "archive")
     monkeypatch.setattr(orchestrator, "STATE_FILE", loop_dir / "state.json")
+    monkeypatch.setattr(orchestrator, "_STATE_BACKUP", loop_dir / ".state.json.bak")
     monkeypatch.setattr(orchestrator, "TASK_CARD", loop_dir / "task_card.json")
     monkeypatch.setattr(orchestrator, "FIX_LIST", loop_dir / "fix_list.json")
     monkeypatch.setattr(orchestrator, "WORK_REPORT", loop_dir / "work_report.json")
@@ -3153,6 +3156,38 @@ class TestLoadState:
 
         assert state == {"state": "idle", "round": 0, "task_id": None}
 
+    def test_recovers_from_backup_when_state_is_corrupted(self, tmp_path: Path, monkeypatch, capsys) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        backup_state = {"state": "awaiting_review", "round": 7, "task_id": "T-616"}
+        orchestrator._STATE_BACKUP.write_text(json.dumps(backup_state), encoding="utf-8")
+        orchestrator.STATE_FILE.write_text("{broken\n", encoding="utf-8")
+
+        state = orchestrator._load_state()
+
+        assert state == backup_state
+        assert json.loads(orchestrator.STATE_FILE.read_text(encoding="utf-8")) == backup_state
+        assert "state.json corrupted, recovered from backup" in capsys.readouterr().err
+
+    def test_recovers_from_backup_on_read_oserror(self, tmp_path: Path, monkeypatch, capsys) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        backup_state = {"state": "done", "round": 3, "task_id": "T-616"}
+        orchestrator._STATE_BACKUP.write_text(json.dumps(backup_state), encoding="utf-8")
+        orchestrator.STATE_FILE.write_text("{}", encoding="utf-8")
+        original_read_text = orchestrator.Path.read_text
+
+        def _fake_read_text(self_path: Path, *args, **kwargs):
+            if self_path == orchestrator.STATE_FILE:
+                raise OSError("permission denied")
+            return original_read_text(self_path, *args, **kwargs)
+
+        monkeypatch.setattr(orchestrator.Path, "read_text", _fake_read_text)
+
+        state = orchestrator._load_state()
+
+        assert state == backup_state
+        assert json.loads(original_read_text(orchestrator.STATE_FILE, encoding="utf-8")) == backup_state
+        assert "state.json corrupted, recovered from backup" in capsys.readouterr().err
+
 
 class TestSaveState:
     def test_writes_json(self, tmp_path: Path, monkeypatch) -> None:
@@ -3161,6 +3196,16 @@ class TestSaveState:
         data = json.loads(orchestrator.STATE_FILE.read_text(encoding="utf-8"))
         assert data["state"] == "done"
         assert data["round"] == 2
+
+    def test_creates_backup_before_overwriting_state(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        previous_state = {"state": "awaiting_work", "round": 1}
+        orchestrator.STATE_FILE.write_text(json.dumps(previous_state), encoding="utf-8")
+
+        orchestrator._save_state({"state": "done", "round": 2})
+
+        assert json.loads(orchestrator._STATE_BACKUP.read_text(encoding="utf-8")) == previous_state
+        assert json.loads(orchestrator.STATE_FILE.read_text(encoding="utf-8")) == {"state": "done", "round": 2}
 
 
 class TestArchiveTaskSummary:

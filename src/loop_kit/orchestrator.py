@@ -49,6 +49,7 @@ LOGS_DIR = LOOP_DIR / "logs"
 RUNTIME_DIR = LOOP_DIR / "runtime"
 ARCHIVE_DIR = LOOP_DIR / "archive"
 STATE_FILE = LOOP_DIR / "state.json"
+_STATE_BACKUP = LOOP_DIR / ".state.json.bak"
 
 DEFAULT_MAX_ROUNDS = 3
 POLL_INTERVAL_SEC = 1
@@ -111,6 +112,7 @@ _PATTERNS_FILE = _CONTEXT_DIR / "patterns.jsonl"
 _RESETTABLE_FILES = [
     LOCK_FILE,
     STATE_FILE,
+    _STATE_BACKUP,
     _SUMMARY_FILE,
     WORK_REPORT,
     REVIEW_REPORT,
@@ -153,6 +155,7 @@ def _configure_loop_paths(loop_dir: str | Path = ".loop") -> None:
     global RUNTIME_DIR
     global ARCHIVE_DIR
     global STATE_FILE
+    global _STATE_BACKUP
     global TASK_CARD
     global FIX_LIST
     global WORK_REPORT
@@ -176,6 +179,7 @@ def _configure_loop_paths(loop_dir: str | Path = ".loop") -> None:
     RUNTIME_DIR = LOOP_DIR / "runtime"
     ARCHIVE_DIR = LOOP_DIR / "archive"
     STATE_FILE = LOOP_DIR / "state.json"
+    _STATE_BACKUP = LOOP_DIR / ".state.json.bak"
     TASK_CARD = _path("task_card.json")
     FIX_LIST = _path("fix_list.json")
     WORK_REPORT = _path("work_report.json")
@@ -2072,12 +2076,39 @@ def _load_state() -> dict:
     default_state = {"state": STATE_IDLE, "round": 0, "task_id": None}
     if not STATE_FILE.exists():
         return default_state.copy()
+
+    def _load_backup_state() -> dict | None:
+        if not _STATE_BACKUP.exists():
+            return None
+        try:
+            backup_data = json.loads(_STATE_BACKUP.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as backup_err:
+            _log(f"Warning: backup state file is corrupted: {backup_err}.")
+            return None
+        except OSError as backup_err:
+            _log(f"Warning: unable to read backup state file: {backup_err}.")
+            return None
+        if not isinstance(backup_data, dict):
+            _log("Warning: backup state file root must be a JSON object. Ignoring backup.")
+            return None
+        return backup_data
+
     try:
         data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
     except json.JSONDecodeError as e:
+        backup_state = _load_backup_state()
+        if backup_state is not None:
+            print("state.json corrupted, recovered from backup", file=sys.stderr)
+            _atomic_write_json(STATE_FILE, backup_state)
+            return backup_state
         _log(f"Warning: state.json is corrupted: {e}. Using fresh default state.")
         return default_state.copy()
     except OSError as e:
+        backup_state = _load_backup_state()
+        if backup_state is not None:
+            print("state.json corrupted, recovered from backup", file=sys.stderr)
+            _atomic_write_json(STATE_FILE, backup_state)
+            return backup_state
         _log(f"Warning: unable to read state.json: {e}. Using fresh default state.")
         return default_state.copy()
     if not isinstance(data, dict):
@@ -2108,6 +2139,9 @@ def _atomic_write_json(path: Path, data: object) -> None:
 
 
 def _save_state(state: dict) -> None:
+    if STATE_FILE.exists():
+        _STATE_BACKUP.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(STATE_FILE, _STATE_BACKUP)
     _atomic_write_json(STATE_FILE, state)
 
 
