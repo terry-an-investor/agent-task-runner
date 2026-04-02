@@ -1417,9 +1417,21 @@ STATE_AWAITING_REVIEW = "awaiting_review"
 STATE_DONE            = "done"
 
 def _load_state() -> dict:
-    if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    return {"state": STATE_IDLE, "round": 0, "task_id": None}
+    default_state = {"state": STATE_IDLE, "round": 0, "task_id": None}
+    if not STATE_FILE.exists():
+        return default_state.copy()
+    try:
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        _log(f"Warning: state.json is corrupted: {e}. Using fresh default state.")
+        return default_state.copy()
+    except OSError as e:
+        _log(f"Warning: unable to read state.json: {e}. Using fresh default state.")
+        return default_state.copy()
+    if not isinstance(data, dict):
+        _log("Warning: state.json root must be a JSON object. Using fresh default state.")
+        return default_state.copy()
+    return data
 
 def _atomic_write_json(path: Path, data: object) -> None:
     """Write *data* as JSON to *path* atomically (write-then-rename)."""
@@ -1544,6 +1556,48 @@ def _validate_work_report(
         return (
             "work_report field 'round' mismatch: "
             f"expected {expected_round}, got {work['round']!r}"
+        )
+    return None
+
+
+def _validate_review_report(
+    review: dict,
+    *,
+    expected_task_id: str,
+    expected_round: int,
+) -> str | None:
+    required_types: dict[str, type] = {
+        "task_id": str,
+        "round": int,
+        "decision": str,
+    }
+    for field_name, typ in required_types.items():
+        if field_name not in review:
+            return f"review_report.json missing required field '{field_name}'"
+        value = review[field_name]
+        if typ is int:
+            if type(value) is not int:
+                return f"review_report field '{field_name}' must be int, got {type(value).__name__}"
+        elif not isinstance(value, typ):
+            return f"review_report field '{field_name}' must be {typ.__name__}, got {type(value).__name__}"
+        if typ is str and not value.strip():
+            return f"review_report field '{field_name}' must be non-empty"
+
+    if review["decision"] not in {"approve", "changes_required"}:
+        return (
+            "review_report field 'decision' must be one of "
+            "{'approve', 'changes_required'}, "
+            f"got {review['decision']!r}"
+        )
+    if review["task_id"] != expected_task_id:
+        return (
+            "review_report field 'task_id' mismatch: "
+            f"expected {expected_task_id!r}, got {review['task_id']!r}"
+        )
+    if review["round"] != expected_round:
+        return (
+            "review_report field 'round' mismatch: "
+            f"expected {expected_round}, got {review['round']!r}"
         )
     return None
 
@@ -1768,7 +1822,14 @@ def _load_task_card(task_path: str) -> tuple[Path, dict, str]:
     if not tp.exists():
         print(f"Error: task card not found: {tp}", file=sys.stderr)
         sys.exit(1)
-    task_card = json.loads(tp.read_text(encoding="utf-8"))
+    try:
+        task_card = json.loads(tp.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        print(f"Error: task card at {tp} contains invalid JSON: {e}", file=sys.stderr)
+        sys.exit(1)
+    except OSError as e:
+        print(f"Error: unable to read task card at {tp}: {e}", file=sys.stderr)
+        sys.exit(1)
     if not isinstance(task_card, dict):
         print(f"Error: task card must be a JSON object: {tp}", file=sys.stderr)
         sys.exit(1)
@@ -2127,7 +2188,20 @@ def _run_single_round(
         _save_single_round_state()
         sys.exit(2)
 
-    decision = review.get("decision", "changes_required")
+    review_error = _validate_review_report(
+        review,
+        expected_task_id=task_id,
+        expected_round=round_num,
+    )
+    if review_error:
+        _fail_single_round(
+            outcome="invalid_review_report",
+            message=review_error,
+            exit_code=3,
+        )
+        return
+
+    decision = str(review["decision"])
     _log(f"Reviewer decision: {decision}")
     print(f"\n  Reviewer: {decision}")
 

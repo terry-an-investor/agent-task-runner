@@ -1383,6 +1383,95 @@ def test_single_round_invalid_work_report_sets_invalid_outcome(tmp_path: Path, m
     assert "round" in state["error"]
 
 
+def test_single_round_invalid_review_report_sets_invalid_outcome(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+
+    task_path = tmp_path / "task_input.json"
+    task_path.write_text(
+        json.dumps({"task_id": "T-604", "goal": "invalid review report test"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    orchestrator.STATE_FILE.write_text(
+        json.dumps(
+            {
+                "state": orchestrator.STATE_AWAITING_WORK,
+                "round": 1,
+                "task_id": "T-604",
+                "base_sha": "base-sha",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    work_report = {
+        "task_id": "T-604",
+        "round": 1,
+        "head_sha": "head-sha",
+        "files_changed": ["tools/orchestrator.py"],
+        "tests": [],
+        "notes": "ok",
+    }
+
+    def fake_wait(path: Path, description: str, **kwargs) -> dict | None:
+        _ = (description, kwargs)
+        if path == orchestrator.WORK_REPORT:
+            return work_report
+        if path == orchestrator.REVIEW_REPORT:
+            return {
+                "task_id": "T-604",
+                "round": 1,
+                "decision": "maybe",
+            }
+        return None
+
+    monkeypatch.setattr(orchestrator, "_wait_for_file", fake_wait)
+    monkeypatch.setattr(orchestrator, "_diff", lambda base, head: f"diff {base}->{head}")
+    monkeypatch.setattr(orchestrator, "_log_oneline", lambda base, head: f"log {base}->{head}")
+
+    with pytest.raises(SystemExit) as exc:
+        orchestrator.cmd_run(
+            _run_config(str(task_path), allow_dirty=True),
+            single_round=True,
+            round_num=1,
+        )
+
+    assert exc.value.code == 3
+    state = json.loads(orchestrator.STATE_FILE.read_text(encoding="utf-8"))
+    assert state["outcome"] == "invalid_review_report"
+    assert "decision" in state["error"]
+
+
+def test_load_task_card_rejects_invalid_json(tmp_path: Path, capsys) -> None:
+    task_path = tmp_path / "task_input.json"
+    task_path.write_text("{oops\n", encoding="utf-8")
+
+    with pytest.raises(SystemExit) as exc:
+        orchestrator._load_task_card(str(task_path))
+
+    assert exc.value.code == 1
+    assert "contains invalid JSON" in capsys.readouterr().err
+
+
+def test_load_task_card_rejects_unreadable_file(tmp_path: Path, monkeypatch, capsys) -> None:
+    task_path = tmp_path / "task_input.json"
+    task_path.write_text("{}", encoding="utf-8")
+    original_read_text = orchestrator.Path.read_text
+
+    def _fake_read_text(self_path: Path, *args, **kwargs):
+        if self_path == task_path:
+            raise OSError("permission denied")
+        return original_read_text(self_path, *args, **kwargs)
+
+    monkeypatch.setattr(orchestrator.Path, "read_text", _fake_read_text)
+
+    with pytest.raises(SystemExit) as exc:
+        orchestrator._load_task_card(str(task_path))
+
+    assert exc.value.code == 1
+    assert "unable to read task card" in capsys.readouterr().err
+
+
 def test_load_task_card_rejects_non_dict_json(tmp_path: Path, capsys) -> None:
     task_path = tmp_path / "task_input.json"
     task_path.write_text("[]\n", encoding="utf-8")
@@ -2355,6 +2444,35 @@ class TestValidateWorkReport:
         )
 
 
+class TestValidateReviewReport:
+    def test_valid_report(self) -> None:
+        review = {"task_id": "T-1", "round": 1, "decision": "approve"}
+        assert orchestrator._validate_review_report(
+            review,
+            expected_task_id="T-1",
+            expected_round=1,
+        ) is None
+
+    def test_missing_field(self) -> None:
+        assert "missing required field" in (
+            orchestrator._validate_review_report(
+                {},
+                expected_task_id="T-1",
+                expected_round=1,
+            ) or ""
+        )
+
+    def test_invalid_decision(self) -> None:
+        review = {"task_id": "T-1", "round": 1, "decision": "maybe"}
+        assert "must be one of" in (
+            orchestrator._validate_review_report(
+                review,
+                expected_task_id="T-1",
+                expected_round=1,
+            ) or ""
+        )
+
+
 class TestLoadState:
     def test_default_when_no_file(self, tmp_path: Path, monkeypatch) -> None:
         _configure_loop_paths(monkeypatch, tmp_path)
@@ -2370,6 +2488,30 @@ class TestLoadState:
         state = orchestrator._load_state()
         assert state["state"] == "done"
         assert state["round"] == 3
+
+    def test_returns_default_when_json_is_corrupted(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        orchestrator.STATE_FILE.write_text("{broken\n", encoding="utf-8")
+
+        state = orchestrator._load_state()
+
+        assert state == {"state": "idle", "round": 0, "task_id": None}
+
+    def test_returns_default_on_read_oserror(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        orchestrator.STATE_FILE.write_text("{}", encoding="utf-8")
+        original_read_text = orchestrator.Path.read_text
+
+        def _fake_read_text(self_path: Path, *args, **kwargs):
+            if self_path == orchestrator.STATE_FILE:
+                raise OSError("permission denied")
+            return original_read_text(self_path, *args, **kwargs)
+
+        monkeypatch.setattr(orchestrator.Path, "read_text", _fake_read_text)
+
+        state = orchestrator._load_state()
+
+        assert state == {"state": "idle", "round": 0, "task_id": None}
 
 
 class TestSaveState:

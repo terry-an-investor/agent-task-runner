@@ -45,7 +45,7 @@ loop extract-diff BASE HEAD  Print git diff between two commits
 | `--max-rounds N` | 3 | Maximum review rounds |
 | `--timeout N` | 0 | Per-phase timeout in seconds (0=unlimited) |
 | `--auto-dispatch` | off | Automatically invoke worker/reviewer backends |
-| `--dispatch-backend native\|par` | native | Subprocess or par transport |
+| `--dispatch-backend native` | native | Subprocess transport |
 | `--worker-backend codex\|claude` | codex | Backend for worker dispatch |
 | `--reviewer-backend codex\|claude` | codex | Backend for reviewer dispatch |
 | `--dispatch-timeout N` | 600 | Per-dispatch timeout in seconds |
