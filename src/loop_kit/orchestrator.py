@@ -98,8 +98,14 @@ _SUMMARY_FILE = _path("summary.json")
 _CONFIG_FILE = _path("config.json")
 _TASKS_DIR = LOOP_DIR / "tasks"
 _RESETTABLE_FILES = [
-    LOCK_FILE, STATE_FILE, _SUMMARY_FILE,
-    WORK_REPORT, REVIEW_REPORT, REVIEW_REQ, FIX_LIST,
+    LOCK_FILE,
+    STATE_FILE,
+    _SUMMARY_FILE,
+    WORK_REPORT,
+    REVIEW_REPORT,
+    REVIEW_REQ,
+    FIX_LIST,
+    TASK_CARD,
 ]
 
 
@@ -141,6 +147,9 @@ def _configure_loop_paths(loop_dir: str | Path = ".loop") -> None:
     global REVIEW_REQ
     global REVIEW_REPORT
     global LOCK_FILE
+    global _SUMMARY_FILE
+    global _CONFIG_FILE
+    global _TASKS_DIR
     global _LOGS_DIR_ENSURED
     global _LOGS_DIR_ENSURED_PATH
 
@@ -155,6 +164,9 @@ def _configure_loop_paths(loop_dir: str | Path = ".loop") -> None:
     REVIEW_REQ = _path("review_request.json")
     REVIEW_REPORT = _path("review_report.json")
     LOCK_FILE = _path("lock")
+    _SUMMARY_FILE = LOOP_DIR / "summary.json"
+    _CONFIG_FILE = LOOP_DIR / "config.json"
+    _TASKS_DIR = LOOP_DIR / "tasks"
     _LOGS_DIR_ENSURED = False
     _LOGS_DIR_ENSURED_PATH = None
 
@@ -433,19 +445,24 @@ def _extract_codex_thread_id(stdout: str) -> str | None:
     return None
 
 
-def _flatten_text_payload(value: object) -> str:
-    if isinstance(value, str):
-        return value.strip()
-    if isinstance(value, list):
-        parts = [_flatten_text_payload(item) for item in value]
-        return " ".join(part for part in parts if part).strip()
-    if isinstance(value, dict):
-        for key in ("text", "message", "content", "output_text", "value"):
-            if key in value:
-                text = _flatten_text_payload(value.get(key))
-                if text:
-                    return text
-    return ""
+def _flatten_text_payload(value: object, max_depth: int = 10) -> str:
+    def _flatten(value: object, depth: int) -> str:
+        if depth <= 0:
+            return ""
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, list):
+            parts = [_flatten(item, depth - 1) for item in value]
+            return " ".join(part for part in parts if part).strip()
+        if isinstance(value, dict):
+            for key in ("text", "message", "content", "output_text", "value"):
+                if key in value:
+                    text = _flatten(value.get(key), depth - 1)
+                    if text:
+                        return text
+        return ""
+
+    return _flatten(value, max_depth)
 
 
 def _truncate_summary_text(text: str, max_len: int = 120) -> str:
@@ -888,10 +905,9 @@ def _build_claude_command(exe: str, prompt: str) -> tuple[list[str], str | None,
             "--dangerously-skip-permissions",
             "--session-id",
             sid,
-            prompt,
         ],
         sid,
-        None,
+        prompt,
     )
 
 
@@ -1169,7 +1185,7 @@ def _collect_streamed_process_output(
     stdout_thread.join()
     stderr_thread.join()
     if stdin_thread is not None:
-        stdin_thread.join(timeout=DISPATCH_STREAM_POLL_SEC)
+        stdin_thread.join(timeout=5.0)
     return "".join(stdout_chunks), "".join(stderr_chunks), returncode, timed_out
 
 
@@ -1715,7 +1731,16 @@ def _atomic_write_json(path: Path, data: object) -> None:
     tmp = path.with_suffix(".tmp")
     try:
         tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-        tmp.replace(path)
+        try:
+            tmp.replace(path)
+        except PermissionError:
+            if os.name == "nt":
+                import time
+
+                time.sleep(0.05)
+                tmp.replace(path)
+            else:
+                raise
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
@@ -1834,12 +1859,12 @@ def _resolve_task_path(task_ref: str | None) -> str | None:
     p = Path(task_ref)
     if p.is_file():
         return str(p)
-    # Try as task ID: find .loop/tasks/<id>-*.json
     if _TASKS_DIR.is_dir():
-        matches = sorted(_TASKS_DIR.glob(f"{task_ref}-*.json"))
+        escaped = task_ref.translate(str.maketrans({"[": "[[]", "]": "[]]", "*": "[*]", "?": "[?]"}))
+        matches = sorted(_TASKS_DIR.glob(f"{escaped}-*.json"))
         if matches:
             return str(matches[0])
-    return task_ref  # return as-is; downstream will error if invalid
+    return task_ref
 
 
 def _load_config() -> dict:
@@ -1968,7 +1993,7 @@ def _wait_for_file(
     _log(f"Waiting for {path.name} ({description}) ...")
     if show_manual_hint:
         print(f"\n  >>> Tell the {'Worker' if 'work' in path.name else 'Reviewer'} to process their input file. <<<\n")
-    elapsed = 0
+    start_time = time.monotonic()
     last_ignored_signature: tuple[int, int] | None = None
     while True:
         if expected_role is not None:
@@ -1993,16 +2018,14 @@ def _wait_for_file(
                 else:
                     _log(f"Found {path.name}")
                     return data
+        elapsed = time.monotonic() - start_time
         if timeout_sec and elapsed >= timeout_sec:
             _log(f"Timeout ({timeout_sec}s) waiting for {path.name}")
             return None
-        # Absolute safety cap: even with timeout_sec=0 (unlimited),
-        # bail after 24 hours to prevent runaway processes.
         if elapsed >= _WAIT_SAFETY_CAP_SEC:
             _log(f"Safety cap (24h) reached waiting for {path.name}")
             return None
         time.sleep(POLL_INTERVAL_SEC)
-        elapsed += POLL_INTERVAL_SEC
 
 
 def _fail_with_state(state: dict, outcome: str, message: str, exit_code: int = EXIT_GENERAL_ERROR) -> None:
@@ -2091,6 +2114,9 @@ def _restore_target_name_from_archive(stem: str) -> str:
 
 
 def cmd_archive(task_id: str, restore: str | None = None) -> None:
+    if ".." in task_id or "/" in task_id or "\\" in task_id:
+        print("Error: invalid task_id (path traversal not allowed)", file=sys.stderr)
+        sys.exit(EXIT_GENERAL_ERROR)
     archive_dir = _task_archive_dir(task_id)
     if restore is None:
         if not archive_dir.exists():
@@ -2304,7 +2330,7 @@ def _wait_for_role_result(
     )
 
 
-def _print_blocking_issues(items: list[object]) -> None:
+def _print_blocking_issues(items: list[dict]) -> None:
     print(f"  Blocking issues: {len(items)}")
     for issue in items:
         print(f"    - [{issue.get('severity', '?')}] {issue.get('file', '')}: {issue.get('reason', '')}")
@@ -2713,11 +2739,11 @@ def _run_multi_round_via_subprocess(
 
     last_decision = "changes_required"
     interrupted = False
+    _interrupted_event = threading.Event()
     current_proc: subprocess.Popen[str] | None = None
 
     def _outer_sigint_handler(signum: int, frame: object) -> None:
-        nonlocal interrupted
-        interrupted = True
+        _interrupted_event.set()
         if current_proc is not None and current_proc.poll() is None:
             _log(f"SIGINT received during round {round_num}; terminating subprocess")
             with contextlib.suppress(OSError):
@@ -2727,7 +2753,8 @@ def _run_multi_round_via_subprocess(
 
     try:
         for round_num in range(start_round, config.max_rounds + 1):
-            if interrupted:
+            if _interrupted_event.is_set():
+                interrupted = True
                 break
 
             print(f"\n{'=' * 60}")
@@ -2755,7 +2782,8 @@ def _run_multi_round_via_subprocess(
             )
             current_proc = None
 
-            if interrupted:
+            if _interrupted_event.is_set():
+                interrupted = True
                 _log(f"Round {round_num} subprocess terminated by SIGINT")
                 break
 
@@ -2974,20 +3002,19 @@ def main() -> None:
     )
 
     run_p = sub.add_parser("run", parents=[shared], help="Run the full PM-controlled review loop")
-    run_p.add_argument("task_ref", nargs="?", default=None,
-                       help="Task ID (e.g. T-601) or path to task card JSON")
+    run_p.add_argument("task_ref", nargs="?", default=None, help="Task ID (e.g. T-601) or path to task card JSON")
     run_p.add_argument("--task", default=None, help="Path to task card JSON (overrides positional task_ref)")
     run_p.add_argument("--max-rounds", type=int, default=None, help="Maximum review rounds (default: 3)")
     run_p.add_argument("--timeout", type=int, default=None, help="Per-phase timeout in seconds (0=unlimited)")
     run_p.add_argument(
         "--require-heartbeat", action="store_true", help="Require fresh worker/reviewer heartbeat while waiting"
     )
+    run_p.add_argument("--heartbeat-ttl", type=int, default=None, help="Heartbeat freshness threshold in seconds")
     run_p.add_argument(
-        "--heartbeat-ttl", type=int, default=None, help="Heartbeat freshness threshold in seconds"
-    )
-    run_p.add_argument(
-        "--auto-dispatch", action="store_true", default=False,
-        help="Automatically invoke worker/reviewer backends each round"
+        "--auto-dispatch",
+        action="store_true",
+        default=False,
+        help="Automatically invoke worker/reviewer backends each round",
     )
     run_p.add_argument(
         "--dispatch-backend",
@@ -2995,9 +3022,7 @@ def main() -> None:
         default=None,
         help="Dispatch transport: native subprocess calls",
     )
-    run_p.add_argument(
-        "--worker-backend", default=None, help="Backend used for auto worker dispatch (native mode)"
-    )
+    run_p.add_argument("--worker-backend", default=None, help="Backend used for auto worker dispatch (native mode)")
     run_p.add_argument(
         "--reviewer-backend",
         default=None,
@@ -3031,7 +3056,7 @@ def main() -> None:
     run_p.add_argument("--round", type=int, help="Round number for --single-round mode")
     run_p.add_argument("--allow-dirty", action="store_true", help="Allow run to start with dirty tracked git files")
     run_p.add_argument("--resume", action="store_true", help="Resume from .loop/state.json contract")
-    run_p.add_argument("--no-reset", action="store_true", help="Skip auto-reset of stale bus files")
+    run_p.add_argument("--reset", action="store_true", help="Reset stale bus files before running (default: off)")
     run_p.add_argument("--verbose", action="store_true", help="Stream full backend stdout lines during auto-dispatch")
 
     args = parser.parse_args()
@@ -3070,14 +3095,18 @@ def main() -> None:
             timeout=int(_cfg_val(args.timeout, "timeout", 0)),
             require_heartbeat=args.require_heartbeat,
             heartbeat_ttl=int(_cfg_val(args.heartbeat_ttl, "heartbeat_ttl", DEFAULT_HEARTBEAT_TTL_SEC)),
-            auto_dispatch=args.auto_dispatch or cfg.get("auto_dispatch", False),
+            auto_dispatch=_cfg_val(args.auto_dispatch, "auto_dispatch", False),
             dispatch_backend=str(_cfg_val(args.dispatch_backend, "dispatch_backend", DEFAULT_DISPATCH_BACKEND)),
             worker_backend=str(_cfg_val(args.worker_backend, "worker_backend", DEFAULT_WORKER_BACKEND)),
             reviewer_backend=str(_cfg_val(args.reviewer_backend, "reviewer_backend", DEFAULT_REVIEWER_BACKEND)),
             dispatch_timeout=int(_cfg_val(args.dispatch_timeout, "dispatch_timeout", DEFAULT_DISPATCH_TIMEOUT_SEC)),
             dispatch_retries=int(_cfg_val(args.dispatch_retries, "dispatch_retries", DEFAULT_DISPATCH_RETRIES)),
-            dispatch_retry_base_sec=int(_cfg_val(args.dispatch_retry_base_sec, "dispatch_retry_base_sec", DEFAULT_DISPATCH_RETRY_BASE_SEC)),
-            artifact_timeout=int(_cfg_val(args.artifact_timeout, "artifact_timeout", DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC)),
+            dispatch_retry_base_sec=int(
+                _cfg_val(args.dispatch_retry_base_sec, "dispatch_retry_base_sec", DEFAULT_DISPATCH_RETRY_BASE_SEC)
+            ),
+            artifact_timeout=int(
+                _cfg_val(args.artifact_timeout, "artifact_timeout", DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC)
+            ),
             allow_dirty=args.allow_dirty,
             verbose=args.verbose,
         )
@@ -3086,7 +3115,7 @@ def main() -> None:
             single_round=args.single_round,
             round_num=args.round,
             resume=args.resume,
-            reset=not args.no_reset,
+            reset=args.reset,
         )
     else:
         parser.print_help()

@@ -8,3 +8,4 @@ build/
 .loop/
 *.egg
 uv.lock
+nul

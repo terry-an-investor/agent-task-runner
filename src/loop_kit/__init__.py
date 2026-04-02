@@ -1,3 +1,5 @@
 """loop-kit — PM-driven review-loop orchestrator for AI coding agents."""
 
-__version__ = "0.2.0"
+from importlib.metadata import version as _version
+
+__version__ = _version("loop-kit")

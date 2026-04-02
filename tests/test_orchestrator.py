@@ -117,7 +117,7 @@ def test_agent_command_codex_uses_stdin_and_short_cli_instruction(monkeypatch) -
     assert stdin_text == long_prompt
 
 
-def test_agent_command_claude_keeps_prompt_in_cli_and_no_stdin(monkeypatch) -> None:
+def test_agent_command_claude_passes_prompt_via_stdin(monkeypatch) -> None:
     monkeypatch.setattr(orchestrator, "_resolve_backend_exe", lambda backend: f"{backend}.exe")
     prompt = "claude prompt payload"
 
@@ -125,9 +125,9 @@ def test_agent_command_claude_keeps_prompt_in_cli_and_no_stdin(monkeypatch) -> N
 
     assert cmd[0] == "claude.exe"
     assert "--session-id" in cmd
-    assert cmd[-1] == prompt
+    assert cmd[-1] != prompt
     assert isinstance(session_id, str) and session_id
-    assert stdin_text is None
+    assert stdin_text == prompt
 
 
 def test_agent_command_opencode_uses_stdin_and_short_cli_instruction(monkeypatch) -> None:
@@ -3255,3 +3255,64 @@ class TestStreamDispatchSuppression:
         out_lines = [line.strip() for line in capsys.readouterr().out.splitlines() if line.strip()]
         assert len(out_lines) == 1
         assert "Session: tid-999" in out_lines[0]
+
+
+class TestPathTraversalRejection:
+    def test_archive_rejects_dotdot_task_id(self, monkeypatch, capsys, tmp_path) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        with pytest.raises(SystemExit) as exc:
+            orchestrator.cmd_archive("../T-001")
+        assert exc.value.code == 1
+        assert "path traversal" in capsys.readouterr().err
+
+    def test_archive_rejects_slash_task_id(self, monkeypatch, capsys, tmp_path) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        with pytest.raises(SystemExit) as exc:
+            orchestrator.cmd_archive("T-001/sub")
+        assert exc.value.code == 1
+        assert "path traversal" in capsys.readouterr().err
+
+    def test_archive_rejects_backslash_task_id(self, monkeypatch, capsys, tmp_path) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        with pytest.raises(SystemExit) as exc:
+            orchestrator.cmd_archive("T-001\\sub")
+        assert exc.value.code == 1
+        assert "path traversal" in capsys.readouterr().err
+
+
+class TestFlattenDepthLimit:
+    def test_flatten_respects_max_depth(self) -> None:
+        deep = {"a": {"b": {"c": {"d": {"e": "deep_value"}}}}}
+        result = orchestrator._flatten_text_payload(deep, max_depth=3)
+        assert "deep_value" not in result
+
+    def test_flatten_depth_default_allows_shallow(self) -> None:
+        shallow = {"text": "hello world"}
+        result = orchestrator._flatten_text_payload(shallow)
+        assert result == "hello world"
+
+    def test_flatten_depth_zero_returns_empty(self) -> None:
+        result = orchestrator._flatten_text_payload({"text": "hello"}, max_depth=0)
+        assert result == ""
+
+
+class TestConfigureLoopPathsGlobals:
+    def test_configure_updates_summary_config_tasks_globals(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setattr(orchestrator, "ROOT", tmp_path)
+        monkeypatch.setattr(orchestrator, "_LOGS_DIR_ENSURED", False)
+        monkeypatch.setattr(orchestrator, "_LOGS_DIR_ENSURED_PATH", None)
+        orchestrator._set_feed_task_id(None)
+
+        orchestrator._configure_loop_paths(".loop-test")
+
+        assert orchestrator._SUMMARY_FILE == tmp_path / ".loop-test" / "summary.json"
+        assert orchestrator._CONFIG_FILE == tmp_path / ".loop-test" / "config.json"
+        assert orchestrator._TASKS_DIR == tmp_path / ".loop-test" / "tasks"
+
+        monkeypatch.setattr(orchestrator, "ROOT", Path.cwd())
+        orchestrator._configure_loop_paths(".loop")
+
+
+class TestResetDefault:
+    def test_task_card_in_resettable_files(self) -> None:
+        assert orchestrator.TASK_CARD in orchestrator._RESETTABLE_FILES
