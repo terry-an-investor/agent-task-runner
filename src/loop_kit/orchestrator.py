@@ -342,9 +342,34 @@ def _feed_log_path() -> Path:
     return LOGS_DIR / "feed.jsonl"
 
 
+DEFAULT_LOG_MAX_BYTES = 5 * 1024 * 1024
+DEFAULT_LOG_BACKUP_COUNT = 3
+
+
 # ── logging ─────────────────────────────────────────────────────────
 def _ts() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _rotate_log_file(
+    path: Path, max_bytes: int = DEFAULT_LOG_MAX_BYTES, backup_count: int = DEFAULT_LOG_BACKUP_COUNT
+) -> None:
+    if not path.exists():
+        return
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return
+    if size < max_bytes:
+        return
+    for i in range(backup_count, 1, -1):
+        src = path.with_suffix(f"{path.suffix}.{i - 1}")
+        dest = path.with_suffix(f"{path.suffix}.{i}")
+        if src.exists():
+            if dest.exists() and i == backup_count:
+                dest.unlink(missing_ok=True)
+            src.replace(dest)
+    path.replace(path.with_suffix(f"{path.suffix}.1"))
 
 
 def _set_feed_task_id(task_id: str | None) -> None:
@@ -370,13 +395,15 @@ def _feed_event(event: str, *, level: str = "info", data: dict | None = None) ->
     if _FEED_TASK_ID and "task_id" not in payload_data:
         payload_data["task_id"] = _FEED_TASK_ID
     _ensure_logs_dir()
+    feed_path = _feed_log_path()
+    _rotate_log_file(feed_path)
     payload = {
         "ts": _ts(),
         "level": level,
         "event": event,
         "data": payload_data,
     }
-    with open(_feed_log_path(), "a", encoding="utf-8") as f:
+    with open(feed_path, "a", encoding="utf-8") as f:
         f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
@@ -385,10 +412,12 @@ def _log(msg: str) -> None:
     line = f"[{ts}] {msg}"
     print(line, flush=True)
     _ensure_logs_dir()
+    log_path = LOGS_DIR / "orchestrator.log"
+    _rotate_log_file(log_path)
     entry: dict[str, object] = {"ts": ts, "msg": msg}
     if _FEED_TASK_ID:
         entry["task_id"] = _FEED_TASK_ID
-    with open(LOGS_DIR / "orchestrator.log", "a", encoding="utf-8") as f:
+    with open(log_path, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     _feed_event("log", data={"message": msg})
 
@@ -2093,11 +2122,21 @@ def cmd_init() -> None:
 # ── status ──────────────────────────────────────────────────────────
 def cmd_status() -> None:
     state = _load_state()
-    print(json.dumps(state, indent=2, ensure_ascii=False))
-    # also show which files exist
+    print(f"State: {state.get('state', 'unknown')}")
+    print(f"Round: {state.get('round', 0)}")
+    task_id = state.get("task_id")
+    if task_id:
+        print(f"Task ID: {task_id}")
+    outcome = state.get("outcome")
+    if outcome:
+        print(f"Outcome: {outcome}")
+    print()
+    print("Bus files:")
     for p in [TASK_CARD, WORK_REPORT, REVIEW_REQ, REVIEW_REPORT, FIX_LIST]:
         marker = "EXISTS" if p.exists() else "missing"
         print(f"  {p.name}: {marker}")
+    print()
+    print("Heartbeats:")
     for role in ("worker", "reviewer"):
         hb = _heartbeat_path(role)
         marker = "EXISTS" if hb.exists() else "missing"

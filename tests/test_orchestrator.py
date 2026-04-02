@@ -2862,13 +2862,14 @@ class TestArchiveTaskSummary:
 
 
 class TestCmdStatus:
-    def test_prints_state_and_file_markers(self, tmp_path: Path, monkeypatch, capsys) -> None:
+    def test_shows_human_readable_summary(self, tmp_path: Path, monkeypatch, capsys) -> None:
         _configure_loop_paths(monkeypatch, tmp_path)
         orchestrator.STATE_FILE.write_text(json.dumps({"state": "done", "round": 1}), encoding="utf-8")
         orchestrator.TASK_CARD.write_text("{}", encoding="utf-8")
         orchestrator.cmd_status()
         out = capsys.readouterr().out
-        assert '"state": "done"' in out
+        assert "State: done" in out
+        assert "Round: 1" in out
         assert "task_card.json: EXISTS" in out
         assert "work_report.json: missing" in out
 
@@ -3459,3 +3460,120 @@ class TestResetDefault:
         orchestrator.main()
 
         assert captured["reset"] is True
+
+
+class TestRotateLogFile:
+    def test_no_rotation_when_under_max_size(self, tmp_path: Path) -> None:
+        log = tmp_path / "test.log"
+        log.write_text("small content", encoding="utf-8")
+        orchestrator._rotate_log_file(log, max_bytes=1024, backup_count=3)
+        assert log.read_text(encoding="utf-8") == "small content"
+        assert not (tmp_path / "test.log.1").exists()
+
+    def test_rotates_when_exceeds_max_size(self, tmp_path: Path) -> None:
+        log = tmp_path / "test.log"
+        big_content = "x" * 100
+        log.write_text(big_content, encoding="utf-8")
+        orchestrator._rotate_log_file(log, max_bytes=50, backup_count=3)
+        assert not log.exists()
+        backup = tmp_path / "test.log.1"
+        assert backup.exists()
+        assert backup.read_text(encoding="utf-8") == big_content
+
+    def test_rotates_multiple_backups(self, tmp_path: Path) -> None:
+        log = tmp_path / "test.log"
+        log.write_text("content1", encoding="utf-8")
+        orchestrator._rotate_log_file(log, max_bytes=1, backup_count=3)
+        assert (tmp_path / "test.log.1").read_text(encoding="utf-8") == "content1"
+
+        log.write_text("content2", encoding="utf-8")
+        orchestrator._rotate_log_file(log, max_bytes=1, backup_count=3)
+        assert (tmp_path / "test.log.1").read_text(encoding="utf-8") == "content2"
+        assert (tmp_path / "test.log.2").read_text(encoding="utf-8") == "content1"
+
+        log.write_text("content3", encoding="utf-8")
+        orchestrator._rotate_log_file(log, max_bytes=1, backup_count=3)
+        assert (tmp_path / "test.log.1").read_text(encoding="utf-8") == "content3"
+        assert (tmp_path / "test.log.2").read_text(encoding="utf-8") == "content2"
+        assert (tmp_path / "test.log.3").read_text(encoding="utf-8") == "content1"
+
+    def test_drops_oldest_when_exceeds_backup_count(self, tmp_path: Path) -> None:
+        log = tmp_path / "test.log"
+        log.write_text("c1", encoding="utf-8")
+        orchestrator._rotate_log_file(log, max_bytes=1, backup_count=2)
+
+        log.write_text("c2", encoding="utf-8")
+        orchestrator._rotate_log_file(log, max_bytes=1, backup_count=2)
+
+        log.write_text("c3", encoding="utf-8")
+        orchestrator._rotate_log_file(log, max_bytes=1, backup_count=2)
+
+        assert (tmp_path / "test.log.1").read_text(encoding="utf-8") == "c3"
+        assert (tmp_path / "test.log.2").read_text(encoding="utf-8") == "c2"
+        assert not (tmp_path / "test.log.3").exists()
+
+    def test_noop_when_file_missing(self, tmp_path: Path) -> None:
+        missing = tmp_path / "nope.log"
+        orchestrator._rotate_log_file(missing, max_bytes=1, backup_count=3)
+
+    def test_default_max_bytes_is_5mb(self) -> None:
+        assert orchestrator.DEFAULT_LOG_MAX_BYTES == 5 * 1024 * 1024
+
+    def test_default_backup_count_is_3(self) -> None:
+        assert orchestrator.DEFAULT_LOG_BACKUP_COUNT == 3
+
+
+class TestCmdStatusSummary:
+    def test_shows_human_readable_summary_not_raw_json(self, tmp_path: Path, monkeypatch, capsys) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        orchestrator.STATE_FILE.write_text(
+            json.dumps(
+                {
+                    "state": "done",
+                    "round": 2,
+                    "task_id": "T-609",
+                    "outcome": "approved",
+                    "head_sha": "abc123",
+                    "base_sha": "def456",
+                    "round_details": [{"round": 1}],
+                    "error": "some error",
+                    "started_at": "2024-01-01T00:00:00Z",
+                    "failed_at": "2024-01-01T01:00:00Z",
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        orchestrator.TASK_CARD.write_text("{}", encoding="utf-8")
+
+        orchestrator.cmd_status()
+        out = capsys.readouterr().out
+
+        assert "State: done" in out
+        assert "Round: 2" in out
+        assert "Task ID: T-609" in out
+        assert "Outcome: approved" in out
+        assert "task_card.json: EXISTS" in out
+        assert "work_report.json: missing" in out
+        assert "abc123" not in out
+        assert "def456" not in out
+        assert "round_details" not in out
+        assert "some error" not in out
+        assert "started_at" not in out
+        assert "failed_at" not in out
+        assert '"state"' not in out
+
+    def test_shows_state_without_optional_fields(self, tmp_path: Path, monkeypatch, capsys) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        orchestrator.STATE_FILE.write_text(
+            json.dumps({"state": "idle", "round": 0}),
+            encoding="utf-8",
+        )
+
+        orchestrator.cmd_status()
+        out = capsys.readouterr().out
+
+        assert "State: idle" in out
+        assert "Round: 0" in out
+        assert "Task ID:" not in out
+        assert "Outcome:" not in out
