@@ -691,7 +691,14 @@ def _extract_read_filename(command_text: str) -> str | None:
     return name or cleaned
 
 
-def _stream_dispatch_stdout_line(role: str, backend: str, raw_line: str, *, verbose: bool) -> None:
+def _stream_dispatch_stdout_line(
+    role: str,
+    backend: str,
+    raw_line: str,
+    parse_event_fn: "BackendParseEventFn",
+    *,
+    verbose: bool,
+) -> None:
 
     read_state = getattr(_stream_local, "read_state", None)
     if read_state is None:
@@ -703,7 +710,7 @@ def _stream_dispatch_stdout_line(role: str, backend: str, raw_line: str, *, verb
     if verbose:
         print(line, flush=True)
         return
-    summary = _codex_event_summary(role, backend, line)
+    summary = parse_event_fn(role, backend, line)
     if not summary:
         read_state.pop(state_key, None)
         return
@@ -734,21 +741,29 @@ def _stream_dispatch_stdout_line(role: str, backend: str, raw_line: str, *, verb
 
 BackendBuildFn = Callable[[str, str], tuple[list[str], str | None, str | None]]
 BackendResolveFn = Callable[[str], str]
-_BACKEND_REGISTRY: dict[str, tuple[BackendBuildFn, BackendResolveFn]] = {}
+BackendParseEventFn = Callable[[str, str, str], str | None]
+_BACKEND_REGISTRY: dict[str, tuple[BackendBuildFn, BackendResolveFn, BackendParseEventFn]] = {}
 
 
 def _available_backends() -> list[str]:
     return sorted(_BACKEND_REGISTRY.keys())
 
 
-def register_backend(name: str, build_cmd_fn: BackendBuildFn, resolve_exe_fn: BackendResolveFn) -> None:
+def register_backend(
+    name: str,
+    build_cmd_fn: BackendBuildFn,
+    resolve_exe_fn: BackendResolveFn,
+    parse_event_fn: BackendParseEventFn,
+) -> None:
     backend = name.strip().lower()
     if not backend:
         raise ValueError("backend name must not be empty")
-    _BACKEND_REGISTRY[backend] = (build_cmd_fn, resolve_exe_fn)
+    _BACKEND_REGISTRY[backend] = (build_cmd_fn, resolve_exe_fn, parse_event_fn)
 
 
-def _require_registered_backend(backend: str) -> tuple[BackendBuildFn, BackendResolveFn]:
+def _require_registered_backend(
+    backend: str,
+) -> tuple[BackendBuildFn, BackendResolveFn, BackendParseEventFn]:
     key = backend.strip().lower()
     spec = _BACKEND_REGISTRY.get(key)
     if spec is None:
@@ -764,6 +779,11 @@ def _resolve_exe_from_candidates(*, backend: str, candidates: list[str | None]) 
         if exe and Path(exe).exists():
             return exe
     raise RuntimeError(f"Cannot find executable for backend={backend}")
+
+
+def _claude_parse_event(role: str, backend: str, line: str) -> str | None:
+    _ = (role, backend, line)
+    return None
 
 
 def _resolve_codex_exe(backend: str) -> str:
@@ -827,7 +847,7 @@ def _build_claude_command(exe: str, prompt: str) -> tuple[list[str], str | None,
 
 
 def _resolve_backend_exe(backend: str) -> str:
-    _, resolve_exe_fn = _require_registered_backend(backend)
+    _, resolve_exe_fn, _ = _require_registered_backend(backend)
     return resolve_exe_fn(backend.strip().lower())
 
 def _agent_command(backend: str, prompt: str) -> tuple[list[str], str | None, str | None]:
@@ -836,13 +856,18 @@ def _agent_command(backend: str, prompt: str) -> tuple[list[str], str | None, st
     For codex >= 0.118.0 the prompt context is piped via stdin so the
     command line stays short.  The short CLI arg is a one-line instruction.
     """
-    build_cmd_fn, _ = _require_registered_backend(backend)
+    build_cmd_fn, _, _ = _require_registered_backend(backend)
     exe = _resolve_backend_exe(backend)
     return build_cmd_fn(exe, prompt)
 
 
-register_backend(BACKEND_CODEX, _build_codex_command, _resolve_codex_exe)
-register_backend(BACKEND_CLAUDE, _build_claude_command, _resolve_claude_exe)
+def _require_registered_parse_event(backend: str) -> BackendParseEventFn:
+    _, _, parse_event_fn = _require_registered_backend(backend)
+    return parse_event_fn
+
+
+register_backend(BACKEND_CODEX, _build_codex_command, _resolve_codex_exe, _codex_event_summary)
+register_backend(BACKEND_CLAUDE, _build_claude_command, _resolve_claude_exe, _claude_parse_event)
 
 
 def _write_dispatch_log(
@@ -931,6 +956,7 @@ def _collect_streamed_process_output(
     *,
     role: str,
     backend: str,
+    parse_event_fn: BackendParseEventFn,
     stdin_text: str | None,
     timeout_sec: int,
     verbose: bool,
@@ -973,6 +999,7 @@ def _collect_streamed_process_output(
                 role,
                 backend,
                 raw_line,
+                parse_event_fn,
                 verbose=verbose,
             ),
         ),
@@ -1066,6 +1093,7 @@ def _run_auto_dispatch(
     dispatch_retries: int = DEFAULT_DISPATCH_RETRIES,
     dispatch_retry_base_sec: int = DEFAULT_DISPATCH_RETRY_BASE_SEC,
 ) -> None:
+    parse_event_fn = _require_registered_parse_event(backend)
     retry_count = max(0, int(dispatch_retries))
     retry_base_sec = max(1, int(dispatch_retry_base_sec))
     max_attempts = retry_count + 1
@@ -1091,6 +1119,7 @@ def _run_auto_dispatch(
                 proc,
                 role=role,
                 backend=backend,
+                parse_event_fn=parse_event_fn,
                 stdin_text=stdin_text,
                 timeout_sec=timeout_sec,
                 verbose=verbose,

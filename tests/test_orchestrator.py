@@ -197,7 +197,12 @@ def test_register_backend_allows_custom_backend_in_run_cli(monkeypatch) -> None:
     def build_cmd(exe: str, prompt: str) -> tuple[list[str], str | None, str | None]:
         return [exe, "--prompt", prompt], "my-session", None
 
-    orchestrator.register_backend("mybackend", build_cmd, resolve_exe)
+    orchestrator.register_backend(
+        "mybackend",
+        build_cmd,
+        resolve_exe,
+        lambda role, backend, line: None,
+    )
     cmd, session_id, stdin_text = orchestrator._agent_command("mybackend", "payload")
     assert cmd == ["mybackend.exe", "--prompt", "payload"]
     assert session_id == "my-session"
@@ -233,6 +238,38 @@ def test_register_backend_allows_custom_backend_in_run_cli(monkeypatch) -> None:
 
     assert captured["worker_backend"] == "mybackend"
     assert captured["reviewer_backend"] == "mybackend"
+
+
+def test_register_backend_custom_parse_event_fn_is_used_by_stream_dispatch(
+    monkeypatch, capsys
+) -> None:
+    monkeypatch.setattr(orchestrator, "_BACKEND_REGISTRY", dict(orchestrator._BACKEND_REGISTRY))
+    monkeypatch.setattr(orchestrator, "_stream_local", threading.local())
+
+    def resolve_exe(backend: str) -> str:
+        return f"{backend}.exe"
+
+    def build_cmd(exe: str, prompt: str) -> tuple[list[str], str | None, str | None]:
+        return [exe, "--prompt", prompt], "my-session", None
+
+    def parse_event(role: str, backend: str, line: str) -> str | None:
+        _ = backend
+        if line == "custom event":
+            return f"[{role}] Custom summary"
+        return None
+
+    orchestrator.register_backend("mybackend", build_cmd, resolve_exe, parse_event)
+    parse_event_fn = orchestrator._require_registered_parse_event("mybackend")
+    orchestrator._stream_dispatch_stdout_line(
+        "worker",
+        "mybackend",
+        "custom event\n",
+        parse_event_fn,
+        verbose=False,
+    )
+
+    out_lines = [line.strip() for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert out_lines == ["[worker] Custom summary"]
 
 
 def test_run_auto_dispatch_passes_stdin_text_to_subprocess(monkeypatch) -> None:
@@ -408,6 +445,47 @@ def test_run_auto_dispatch_non_verbose_filters_out_non_summary_lines(monkeypatch
     assert json_line.strip() not in out
 
 
+def test_stream_dispatch_stdout_line_uses_codex_registered_parser(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(orchestrator, "_stream_local", threading.local())
+    parse_event_fn = orchestrator._require_registered_parse_event("codex")
+    line = json.dumps({
+        "type": "item.completed",
+        "item": {"type": "command_execution", "command": "git status --short"},
+    })
+
+    orchestrator._stream_dispatch_stdout_line(
+        "worker",
+        "codex",
+        line + "\n",
+        parse_event_fn,
+        verbose=False,
+    )
+
+    out_lines = [item.strip() for item in capsys.readouterr().out.splitlines() if item.strip()]
+    assert out_lines == ["[worker] Running: git status --short"]
+
+
+def test_stream_dispatch_stdout_line_claude_parser_stub_suppresses_summaries(
+    monkeypatch, capsys
+) -> None:
+    monkeypatch.setattr(orchestrator, "_stream_local", threading.local())
+    parse_event_fn = orchestrator._require_registered_parse_event("claude")
+    line = json.dumps({
+        "type": "item.completed",
+        "item": {"type": "command_execution", "command": "git status --short"},
+    })
+
+    orchestrator._stream_dispatch_stdout_line(
+        "worker",
+        "claude",
+        line + "\n",
+        parse_event_fn,
+        verbose=False,
+    )
+
+    assert capsys.readouterr().out == ""
+
+
 def test_stream_dispatch_stdout_line_collapses_consecutive_reads(monkeypatch, capsys) -> None:
     monkeypatch.setattr(orchestrator, "_stream_local", threading.local())
     line_1 = json.dumps({
@@ -425,8 +503,20 @@ def test_stream_dispatch_stdout_line_collapses_consecutive_reads(monkeypatch, ca
         },
     })
 
-    orchestrator._stream_dispatch_stdout_line("reader", "codex", line_1 + "\n", verbose=False)
-    orchestrator._stream_dispatch_stdout_line("reader", "codex", line_2 + "\n", verbose=False)
+    orchestrator._stream_dispatch_stdout_line(
+        "reader",
+        "codex",
+        line_1 + "\n",
+        orchestrator._codex_event_summary,
+        verbose=False,
+    )
+    orchestrator._stream_dispatch_stdout_line(
+        "reader",
+        "codex",
+        line_2 + "\n",
+        orchestrator._codex_event_summary,
+        verbose=False,
+    )
 
     out_lines = [line.strip() for line in capsys.readouterr().out.splitlines() if line.strip()]
     assert out_lines == ["[reader] Reading: orchestrator.py"]
@@ -444,9 +534,27 @@ def test_stream_dispatch_stdout_line_read_collapse_resets_on_non_summary_line(
         },
     })
 
-    orchestrator._stream_dispatch_stdout_line("reader", "codex", read_line + "\n", verbose=False)
-    orchestrator._stream_dispatch_stdout_line("reader", "codex", "plain status line\n", verbose=False)
-    orchestrator._stream_dispatch_stdout_line("reader", "codex", read_line + "\n", verbose=False)
+    orchestrator._stream_dispatch_stdout_line(
+        "reader",
+        "codex",
+        read_line + "\n",
+        orchestrator._codex_event_summary,
+        verbose=False,
+    )
+    orchestrator._stream_dispatch_stdout_line(
+        "reader",
+        "codex",
+        "plain status line\n",
+        orchestrator._codex_event_summary,
+        verbose=False,
+    )
+    orchestrator._stream_dispatch_stdout_line(
+        "reader",
+        "codex",
+        read_line + "\n",
+        orchestrator._codex_event_summary,
+        verbose=False,
+    )
 
     out_lines = [line.strip() for line in capsys.readouterr().out.splitlines() if line.strip()]
     assert out_lines == [
@@ -2587,11 +2695,21 @@ class TestRestoreTargetNameFromArchive:
 class TestRegisterBackendValidation:
     def test_empty_name_raises(self) -> None:
         with pytest.raises(ValueError, match="must not be empty"):
-            orchestrator.register_backend("  ", lambda e, p: ([], None, None), lambda b: b)
+            orchestrator.register_backend(
+                "  ",
+                lambda e, p: ([], None, None),
+                lambda b: b,
+                lambda role, backend, line: None,
+            )
 
     def test_strip_and_lower(self, monkeypatch) -> None:
         monkeypatch.setattr(orchestrator, "_resolve_backend_exe", lambda b: "test.exe")
-        orchestrator.register_backend("MyBackend", lambda e, p: ([e, "run"], None, None), lambda b: "test.exe")
+        orchestrator.register_backend(
+            "MyBackend",
+            lambda e, p: ([e, "run"], None, None),
+            lambda b: "test.exe",
+            lambda role, backend, line: None,
+        )
         assert "mybackend" in orchestrator._available_backends()
         # cleanup
         del orchestrator._BACKEND_REGISTRY["mybackend"]
