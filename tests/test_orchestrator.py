@@ -1287,7 +1287,7 @@ def test_worker_prompt_round2_no_fix_list(monkeypatch) -> None:
     assert "fixes:\n- <none>" in prompt
 
 
-def test_worker_prompt_round1_ignores_template_file(tmp_path: Path, monkeypatch) -> None:
+def test_worker_prompt_round1_uses_custom_template_file(tmp_path: Path, monkeypatch) -> None:
     _configure_loop_paths(monkeypatch, tmp_path)
     (tmp_path / "AGENTS.md").write_text("AGENTS_CONTENT", encoding="utf-8")
     role_path = tmp_path / "docs" / "roles" / "code-writer.md"
@@ -1316,7 +1316,7 @@ def test_worker_prompt_round1_ignores_template_file(tmp_path: Path, monkeypatch)
 
     prompt = orchestrator._worker_prompt("T-611", 1)
 
-    assert "CUSTOM" not in prompt
+    assert "CUSTOM" in prompt
     assert "AGENTS_CONTENT" in prompt
     assert "CODE_WRITER_CONTENT" in prompt
     assert "goal: Build via sections" in prompt
