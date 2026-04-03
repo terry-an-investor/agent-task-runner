@@ -5613,6 +5613,34 @@ class TestCmdReport:
         assert exc.value.code == orchestrator.EXIT_VALIDATION_ERROR
         assert "task_id is required" in capsys.readouterr().err
 
+    def test_goal_ignored_when_task_card_task_id_mismatch(self, tmp_path: Path, monkeypatch, capsys) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        orchestrator.TASK_CARD.write_text(
+            json.dumps({"task_id": "T-720", "goal": "wrong-goal"}, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        orchestrator.STATE_FILE.write_text(
+            json.dumps(
+                {"state": "done", "round": 2, "task_id": "T-720", "base_sha": "base-sha", "outcome": "approved"},
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        archive_dir = orchestrator.LOOP_DIR / "archive" / "T-999"
+        archive_dir.mkdir(parents=True)
+        (archive_dir / "r1_review_report.json").write_text(
+            json.dumps({"task_id": "T-999", "round": 1, "decision": "approve"}, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+
+        orchestrator.cmd_report("T-999", output_format="json")
+        out = capsys.readouterr().out
+        json_start = out.find("{")
+        payload = json.loads(out[json_start:] if json_start >= 0 else out)
+        assert payload["task_id"] == "T-999"
+        assert payload["goal"] == ""
+
 
 class TestMainDiffAndReportCommands:
     def test_main_dispatches_diff_command(self, tmp_path: Path, monkeypatch) -> None:

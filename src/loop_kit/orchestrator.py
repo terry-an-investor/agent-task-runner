@@ -5168,8 +5168,9 @@ def _build_task_report(task_id: str, *, paths: LoopPaths | None = None) -> dict[
     task_card_data = _read_json_if_exists(resolved_paths.task_card)
     goal = ""
     if isinstance(task_card_data, dict):
+        task_card_task_id = task_card_data.get("task_id")
         task_card_goal = task_card_data.get("goal")
-        if isinstance(task_card_goal, str):
+        if task_card_task_id == task_id and isinstance(task_card_goal, str):
             goal = task_card_goal.strip()
 
     state_task_id = state.get("task_id")
