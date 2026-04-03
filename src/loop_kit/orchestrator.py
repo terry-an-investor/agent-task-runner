@@ -22,8 +22,8 @@ All messages are JSON. Git commits are the single source of truth.
 
 import argparse
 import ast
-import contextlib
 import concurrent.futures
+import contextlib
 import difflib
 import fnmatch
 import hashlib
@@ -3233,14 +3233,11 @@ def _estimate_backend_cost_cents(
         else:
             input_tokens = 0
     elif output_tokens is None:
-        if total_tokens is not None:
-            output_tokens = max(0, total_tokens - input_tokens)
-        else:
-            output_tokens = 0
+        output_tokens = max(0, total_tokens - input_tokens) if total_tokens is not None else 0
     weighted_token_cost = (input_tokens * input_rate_cents) + (output_tokens * output_rate_cents)
     if weighted_token_cost <= 0:
         return 0
-    return int(math.ceil(weighted_token_cost / 1_000_000))
+    return math.ceil(weighted_token_cost / 1_000_000)
 
 
 def _runtime_cost_and_token_fields(payload: dict[str, object], *, backend: str) -> dict[str, int]:
@@ -5287,7 +5284,9 @@ def _build_lane_worker_prompt(
     return f"{base_prompt}\n\n{lane_context}"
 
 
-def _initialize_lane_state(task_lanes: list[TaskLane], *, paths: LoopPaths | None = None) -> dict[str, dict[str, object]]:
+def _initialize_lane_state(
+    task_lanes: list[TaskLane], *, paths: LoopPaths | None = None
+) -> dict[str, dict[str, object]]:
     lane_state: dict[str, dict[str, object]] = {}
     for lane in task_lanes:
         lane_id = str(lane["lane_id"]).strip()
@@ -6517,7 +6516,13 @@ def _validate_report(
                     lane_review_backend = lane_metric.get("review_backend")
                     if lane_review_backend is not None and not isinstance(lane_review_backend, str):
                         return f"{prefix} lane_metrics[{index}] field 'review_backend' must be a string"
-                    for lane_int_field in ("duration_ms", "input_tokens", "output_tokens", "total_tokens", "cost_cents"):
+                    for lane_int_field in (
+                        "duration_ms",
+                        "input_tokens",
+                        "output_tokens",
+                        "total_tokens",
+                        "cost_cents",
+                    ):
                         if lane_int_field not in lane_metric:
                             continue
                         lane_int_value = lane_metric[lane_int_field]
@@ -8620,8 +8625,12 @@ def _run_single_round(
             lane_review_request_path = lane_loop_dir / "review_request.json"
             lane_review_request_snapshot_path = _lane_review_request_path(lane_id, paths=resolved_paths)
             lane_review_request_snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-            lane_acceptance_checks = [str(item).strip() for item in lane.get("acceptance_checks", []) if str(item).strip()]
-            lane_acceptance_criteria = [item for item in task_card.get("acceptance_criteria", []) if isinstance(item, str)]
+            lane_acceptance_checks = [
+                str(item).strip() for item in lane.get("acceptance_checks", []) if str(item).strip()
+            ]
+            lane_acceptance_criteria = [
+                item for item in task_card.get("acceptance_criteria", []) if isinstance(item, str)
+            ]
             lane_acceptance_criteria.extend([f"[lane:{lane_id}] {item}" for item in lane_acceptance_checks])
             lane_review_request: ReviewRequest = {
                 "task_id": task_id,
@@ -8843,11 +8852,19 @@ def _run_single_round(
                     continue
                 lane_handle = lane_handle_by_id.get(lane_id)
                 lane_entry["review_status"] = "pending"
-                lane_entry["review_request_path"] = _display_path(_lane_review_request_path(lane_id, paths=resolved_paths))
-                lane_entry["review_report_path"] = _display_path(_lane_review_report_path(lane_id, paths=resolved_paths))
+                lane_entry["review_request_path"] = _display_path(
+                    _lane_review_request_path(lane_id, paths=resolved_paths)
+                )
+                lane_entry["review_report_path"] = _display_path(
+                    _lane_review_report_path(lane_id, paths=resolved_paths)
+                )
                 if lane_handle is not None:
-                    lane_entry["review_request_local_path"] = _display_path(_lane_local_loop_dir(lane_handle) / "review_request.json")
-                    lane_entry["review_report_local_path"] = _display_path(_lane_local_loop_dir(lane_handle) / "review_report.json")
+                    lane_entry["review_request_local_path"] = _display_path(
+                        _lane_local_loop_dir(lane_handle) / "review_request.json"
+                    )
+                    lane_entry["review_report_local_path"] = _display_path(
+                        _lane_local_loop_dir(lane_handle) / "review_report.json"
+                    )
             _save_lane_state_snapshot(state, lane_state, paths=resolved_paths)
 
             review_workers = min(config.max_parallel_workers, len(lane_execution_order))
@@ -9030,7 +9047,7 @@ def _run_single_round(
             outcome="worker_dispatch_failed",
             message="Worker dispatch produced no work report.",
             exit_code=EXIT_VALIDATION_ERROR,
-            cleanup_lane_worktrees=False if preserve_lane_worktrees else True,
+            cleanup_lane_worktrees=not preserve_lane_worktrees,
         )
         return
 

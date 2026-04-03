@@ -118,7 +118,8 @@ def _write_fake_opencode_backend(bin_dir: Path) -> Path:
             '    reviewer_decision = os.environ.get("FAKE_OPENCODE_REVIEW_DECISION", "approve").strip()\n'
             '    lane_review_decisions_raw = os.environ.get("FAKE_OPENCODE_LANE_REVIEW_DECISIONS", "").strip()\n'
             "    try:\n"
-            "        lane_review_decisions = json.loads(lane_review_decisions_raw) if lane_review_decisions_raw else {}\n"
+            "        lane_review_decisions = json.loads(lane_review_decisions_raw) if "
+            "lane_review_decisions_raw else {}\n"
             "    except json.JSONDecodeError:\n"
             "        lane_review_decisions = {}\n"
             "    if not isinstance(lane_review_decisions, dict):\n"
@@ -128,7 +129,8 @@ def _write_fake_opencode_backend(bin_dir: Path) -> Path:
             "        sleep_sec = float(sleep_raw) if sleep_raw else 0.0\n"
             "    except ValueError:\n"
             "        sleep_sec = 0.0\n"
-            '    lane_conflict = os.environ.get("FAKE_OPENCODE_LANE_CONFLICT", "").strip().lower() in {"1", "true", "yes", "on"}\n'
+            '    lane_conflict = os.environ.get("FAKE_OPENCODE_LANE_CONFLICT", "").strip().lower() '
+            'in {"1", "true", "yes", "on"}\n'
             '    trace_file = os.environ.get("FAKE_OPENCODE_TRACE_FILE", "").strip()\n'
             '    session_id = _arg_value("-s", argv) or "fake-session"\n'
             "\n"
@@ -575,7 +577,9 @@ def test_parallel_lane_dispatch_writes_lane_reports_and_merges_work_report(tmp_p
         "lane_core": "approve",
         "lane_tests": "approve",
     }
-    integration_test_names = [item["name"] for item in merged_work.get("tests", []) if item["name"].startswith("integration/")]
+    integration_test_names = [
+        item["name"] for item in merged_work.get("tests", []) if item["name"].startswith("integration/")
+    ]
     assert set(integration_test_names) == {
         "integration/head_matches_merged_sha",
         "integration/merged_head_descends_from_base",

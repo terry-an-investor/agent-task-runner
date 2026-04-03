@@ -4598,7 +4598,9 @@ def test_single_round_dispatch_failure_marks_task_status_blocked(tmp_path: Path,
     assert src_after["status"] == "blocked"
 
 
-def test_single_round_lane_failure_preserves_worktrees_and_marks_blocked_dependencies(tmp_path: Path, monkeypatch) -> None:
+def test_single_round_lane_failure_preserves_worktrees_and_marks_blocked_dependencies(
+    tmp_path: Path, monkeypatch
+) -> None:
     _configure_loop_paths(monkeypatch, tmp_path)
 
     task_path = tmp_path / "task_input.json"
@@ -7319,8 +7321,14 @@ class TestCmdReport:
         out = capsys.readouterr().out
         assert "## Lane Runtime" in out
         assert "r1: lane_count=2 total_duration_ms=321 total_cost_cents=3" in out
-        assert "lane_core: status=completed backend=codex duration_ms=321 cost_cents=3 total_tokens=2100 review_decision=approve" in out
-        assert "lane_docs: status=blocked backend=<unknown> duration_ms=0 cost_cents=0 total_tokens=n/a review_decision=changes_required" in out
+        assert (
+            "lane_core: status=completed backend=codex duration_ms=321 "
+            "cost_cents=3 total_tokens=2100 review_decision=approve"
+        ) in out
+        assert (
+            "lane_docs: status=blocked backend=<unknown> duration_ms=0 "
+            "cost_cents=0 total_tokens=n/a review_decision=changes_required"
+        ) in out
 
         orchestrator.cmd_report("T-710", output_format="json")
         out = capsys.readouterr().out
