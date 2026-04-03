@@ -51,6 +51,7 @@ loop run                   Run the full PM-controlled review loop
 loop knowledge             Manage built-in defaults knowledge JSONL files
 loop status                Show current loop state
 loop health                Show worker/reviewer heartbeat health
+loop dispatch-metrics      Summarize dispatch phase latency metrics from feed logs
 loop heartbeat             Write role heartbeat continuously
 loop archive               List or restore archived bus files
 loop extract-diff BASE HEAD  Print git diff between two commits
@@ -81,6 +82,20 @@ loop extract-diff BASE HEAD  Print git diff between two commits
 | `--allow-dirty` | off | Allow starting with dirty tracked files |
 | `--verbose` | off | Stream full backend stdout |
 | `--loop-dir PATH` | .loop | Loop bus directory |
+
+### `loop dispatch-metrics` flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--task-id ID` | all task IDs | Filter `dispatch_phase_metrics` rows by task ID |
+| `--role all\|worker\|reviewer` | all | Filter rows by role |
+| `--loop-dir PATH` | .loop | Loop bus directory |
+
+Example:
+
+```bash
+loop dispatch-metrics --task-id T-715 --role worker
+```
 
 ### `loop knowledge` commands
 
@@ -162,6 +177,15 @@ Interpretation boundaries:
 - `context_to_work_ms` captures initial context understanding before real execution begins.
 - `work_to_artifact_ms` captures execution-to-artifact completion.
 - If a boundary is missing (for example no concrete work signal), the missing segment is emitted as `null` while `total_ms` is still reported.
+
+Use `loop dispatch-metrics` to aggregate these events directly from `.loop/logs/feed.jsonl` with `count`, `missing`, `avg_ms`, `p50_ms`, and `p95_ms` per segment.
+
+Interpretation limits for the command output:
+
+- `count` is the number of non-null numeric values for that segment.
+- `missing` counts rows where the segment is null, absent, or non-numeric.
+- `p50_ms`/`p95_ms` use nearest-rank percentiles on the filtered rows.
+- The report only reflects events present in the local feed file; it does not infer missing telemetry from other artifacts.
 
 ### Key JSON schemas
 

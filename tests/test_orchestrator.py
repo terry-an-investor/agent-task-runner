@@ -5069,6 +5069,168 @@ class TestCmdHealth:
         assert "dead" in out  # no heartbeats exist
 
 
+class TestDispatchMetricsReport:
+    def test_collect_and_summarize_mixed_partial_metrics(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        feed_entries = [
+            {
+                "event": orchestrator.FEED_DISPATCH_PHASE_METRICS,
+                "data": {
+                    "task_id": "T-716",
+                    "role": "worker",
+                    "startup_ms": 100,
+                    "context_to_work_ms": 300,
+                    "work_to_artifact_ms": 500,
+                    "total_ms": 600,
+                },
+            },
+            {
+                "event": orchestrator.FEED_DISPATCH_PHASE_METRICS,
+                "data": {
+                    "task_id": "T-716",
+                    "role": "worker",
+                    "startup_ms": 140,
+                    "context_to_work_ms": None,
+                    "work_to_artifact_ms": None,
+                    "total_ms": 700,
+                },
+            },
+            {
+                "event": orchestrator.FEED_DISPATCH_PHASE_METRICS,
+                "data": {
+                    "task_id": "T-716",
+                    "role": "worker",
+                    "startup_ms": 200,
+                    "context_to_work_ms": 300,
+                    "work_to_artifact_ms": 500,
+                    "total_ms": 800,
+                },
+            },
+            {
+                "event": orchestrator.FEED_DISPATCH_PHASE_METRICS,
+                "data": {
+                    "task_id": "T-716",
+                    "role": "reviewer",
+                    "startup_ms": 50,
+                    "context_to_work_ms": 20,
+                    "work_to_artifact_ms": 70,
+                    "total_ms": 140,
+                },
+            },
+            {"event": "dispatch_start", "data": {"task_id": "T-716", "role": "worker"}},
+        ]
+        feed_payload = "".join(json.dumps(entry, ensure_ascii=False) + "\n" for entry in feed_entries)
+        feed_payload += "{broken json line\n"
+        (orchestrator.LOGS_DIR / "feed.jsonl").write_text(feed_payload, encoding="utf-8")
+
+        rows = orchestrator._collect_dispatch_phase_metrics_events(
+            orchestrator.LOGS_DIR / "feed.jsonl",
+            task_id="T-716",
+            role="worker",
+        )
+        assert len(rows) == 3
+
+        summary = orchestrator._summarize_dispatch_phase_metrics(rows)
+        assert summary["startup_ms"]["count"] == 3
+        assert summary["startup_ms"]["missing"] == 0
+        assert summary["startup_ms"]["avg"] == pytest.approx(146.666, rel=1e-3)
+        assert summary["startup_ms"]["p50"] == 140
+        assert summary["startup_ms"]["p95"] == 200
+
+        assert summary["context_to_work_ms"]["count"] == 2
+        assert summary["context_to_work_ms"]["missing"] == 1
+        assert summary["context_to_work_ms"]["avg"] == 300
+        assert summary["context_to_work_ms"]["p50"] == 300
+        assert summary["context_to_work_ms"]["p95"] == 300
+
+        assert summary["work_to_artifact_ms"]["count"] == 2
+        assert summary["work_to_artifact_ms"]["missing"] == 1
+        assert summary["total_ms"]["count"] == 3
+        assert summary["total_ms"]["missing"] == 0
+        assert summary["total_ms"]["p50"] == 700
+        assert summary["total_ms"]["p95"] == 800
+
+    def test_cli_dispatch_metrics_filters_task_id_and_role(self, tmp_path: Path, monkeypatch, capsys) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        feed_entries = [
+            {
+                "event": orchestrator.FEED_DISPATCH_PHASE_METRICS,
+                "data": {
+                    "task_id": "T-900",
+                    "role": "worker",
+                    "startup_ms": 10,
+                    "context_to_work_ms": 20,
+                    "work_to_artifact_ms": 30,
+                    "total_ms": 60,
+                },
+            },
+            {
+                "event": orchestrator.FEED_DISPATCH_PHASE_METRICS,
+                "data": {
+                    "task_id": "T-900",
+                    "role": "reviewer",
+                    "startup_ms": 30,
+                    "context_to_work_ms": None,
+                    "work_to_artifact_ms": None,
+                    "total_ms": 120,
+                },
+            },
+            {
+                "event": orchestrator.FEED_DISPATCH_PHASE_METRICS,
+                "data": {
+                    "task_id": "T-901",
+                    "role": "reviewer",
+                    "startup_ms": 90,
+                    "context_to_work_ms": 40,
+                    "work_to_artifact_ms": 80,
+                    "total_ms": 210,
+                },
+            },
+        ]
+        (orchestrator.LOGS_DIR / "feed.jsonl").write_text(
+            "".join(json.dumps(entry, ensure_ascii=False) + "\n" for entry in feed_entries),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["orchestrator.py", "dispatch-metrics", "--task-id", "T-900", "--role", "reviewer"],
+        )
+
+        orchestrator.main()
+        out = capsys.readouterr().out
+        assert "Filters: task_id=T-900 role=reviewer" in out
+        assert "Matched dispatch_phase_metrics events: 1" in out
+        startup_row = next(line for line in out.splitlines() if line.strip().startswith("startup_ms"))
+        startup_cells = [cell.strip() for cell in startup_row.split("|")]
+        assert startup_cells == ["startup_ms", "1", "0", "30.0", "30.0", "30.0"]
+        context_row = next(line for line in out.splitlines() if line.strip().startswith("context_to_work_ms"))
+        context_cells = [cell.strip() for cell in context_row.split("|")]
+        assert context_cells == ["context_to_work_ms", "0", "1", "n/a", "n/a", "n/a"]
+
+    def test_dispatch_metrics_no_matching_data_is_deterministic(self, tmp_path: Path, monkeypatch, capsys) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        (orchestrator.LOGS_DIR / "feed.jsonl").write_text(
+            json.dumps(
+                {
+                    "event": orchestrator.FEED_DISPATCH_PHASE_METRICS,
+                    "data": {"task_id": "T-999", "role": "worker", "startup_ms": 15, "total_ms": 100},
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        orchestrator.cmd_dispatch_metrics(task_id="T-716", role="reviewer")
+        out = capsys.readouterr().out
+        assert "Matched dispatch_phase_metrics events: 0" in out
+        assert "No matching dispatch_phase_metrics events." in out
+        startup_row = next(line for line in out.splitlines() if line.strip().startswith("startup_ms"))
+        startup_cells = [cell.strip() for cell in startup_row.split("|")]
+        assert startup_cells == ["startup_ms", "0", "0", "n/a", "n/a", "n/a"]
+
+
 class TestCmdExtractDiff:
     def test_prints_diff(self, monkeypatch, capsys) -> None:
         monkeypatch.setattr(orchestrator, "_diff", lambda base, head: f"diff {base}..{head}")

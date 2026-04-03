@@ -25,6 +25,7 @@ import hashlib
 import importlib.metadata
 import importlib.resources
 import json
+import math
 import os
 import shutil
 import signal
@@ -225,6 +226,8 @@ DEFAULT_DISPATCH_BACKEND = DISPATCH_BACKEND_NATIVE
 DISPATCH_STREAM_POLL_SEC = 0.1
 _WAIT_SAFETY_CAP_SEC = 86400  # 24h absolute cap in _wait_for_file
 _SESSION_ROLES = ("worker", "reviewer")
+_DISPATCH_PHASE_ROLE_CHOICES = ("all", "worker", "reviewer")
+_DISPATCH_PHASE_METRIC_NAMES = ("startup_ms", "context_to_work_ms", "work_to_artifact_ms", "total_ms")
 EXIT_OK = 0
 EXIT_GENERAL_ERROR = 1
 EXIT_TIMEOUT = 2
@@ -2555,6 +2558,92 @@ def _read_jsonl_entries(path: Path) -> list[dict]:
     return entries
 
 
+def _coerce_non_negative_ms(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if not isinstance(value, (int, float)):
+        return None
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 0:
+        return None
+    return parsed
+
+
+def _nearest_rank_percentile(values: list[float], percentile: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    rank = max(1, int(math.ceil(percentile * len(ordered))))
+    return ordered[min(len(ordered) - 1, rank - 1)]
+
+
+def _collect_dispatch_phase_metrics_events(
+    feed_path: Path,
+    *,
+    task_id: str | None = None,
+    role: Literal["all", "worker", "reviewer"] = "all",
+) -> list[dict[str, object]]:
+    text = _read_text_optional(feed_path)
+    if not text:
+        return []
+    normalized_task_id = task_id.strip() if isinstance(task_id, str) and task_id.strip() else None
+    normalized_role = role.strip().lower()
+    rows: list[dict[str, object]] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("event") != FEED_DISPATCH_PHASE_METRICS:
+            continue
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            continue
+        if normalized_task_id is not None and data.get("task_id") != normalized_task_id:
+            continue
+        row_role_raw = data.get("role")
+        row_role = row_role_raw.strip().lower() if isinstance(row_role_raw, str) else ""
+        if normalized_role != "all" and row_role != normalized_role:
+            continue
+        rows.append(dict(data))
+    return rows
+
+
+def _summarize_dispatch_phase_metrics(
+    rows: list[dict[str, object]],
+) -> dict[str, dict[str, int | float | None]]:
+    summary: dict[str, dict[str, int | float | None]] = {}
+    for metric_name in _DISPATCH_PHASE_METRIC_NAMES:
+        values: list[float] = []
+        missing = 0
+        for row in rows:
+            value = _coerce_non_negative_ms(row.get(metric_name))
+            if value is None:
+                missing += 1
+                continue
+            values.append(value)
+        avg = (sum(values) / len(values)) if values else None
+        summary[metric_name] = {
+            "count": len(values),
+            "missing": missing,
+            "avg": avg,
+            "p50": _nearest_rank_percentile(values, 0.50),
+            "p95": _nearest_rank_percentile(values, 0.95),
+        }
+    return summary
+
+
+def _format_metric_ms(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    return f"{value:.1f}"
+
+
 def _atomic_write_jsonl(path: Path, entries: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in entries)
@@ -4461,6 +4550,44 @@ def cmd_health(ttl: int) -> None:
         print(f"  {role}: {status}  ({reason})")
 
 
+def cmd_dispatch_metrics(
+    *,
+    task_id: str | None = None,
+    role: Literal["all", "worker", "reviewer"] = "all",
+    paths: LoopPaths | None = None,
+) -> None:
+    resolved_paths = _resolve_paths(paths)
+    normalized_task_id = task_id.strip() if isinstance(task_id, str) and task_id.strip() else None
+    normalized_role = role.strip().lower()
+    feed_path = _feed_log_path(paths=resolved_paths)
+    rows = _collect_dispatch_phase_metrics_events(
+        feed_path,
+        task_id=normalized_task_id,
+        role=cast(Literal["all", "worker", "reviewer"], normalized_role),
+    )
+    summary = _summarize_dispatch_phase_metrics(rows)
+    print("Dispatch phase metrics report")
+    print(f"Feed file: {feed_path}")
+    print(f"Filters: task_id={normalized_task_id or '<all>'} role={normalized_role}")
+    print(f"Matched dispatch_phase_metrics events: {len(rows)}")
+    print()
+    table_rows = [
+        [
+            metric_name,
+            str(cast(int, summary[metric_name]["count"])),
+            str(cast(int, summary[metric_name]["missing"])),
+            _format_metric_ms(cast(float | None, summary[metric_name]["avg"])),
+            _format_metric_ms(cast(float | None, summary[metric_name]["p50"])),
+            _format_metric_ms(cast(float | None, summary[metric_name]["p95"])),
+        ]
+        for metric_name in _DISPATCH_PHASE_METRIC_NAMES
+    ]
+    print(_render_table(["metric", "count", "missing", "avg_ms", "p50_ms", "p95_ms"], table_rows))
+    if not rows:
+        print()
+        print("No matching dispatch_phase_metrics events.")
+
+
 # ── main run loop ───────────────────────────────────────────────────
 def _load_task_card(task_path: str) -> tuple[Path, TaskCard, str]:
     try:
@@ -5841,6 +5968,13 @@ def main() -> None:
     health_p.add_argument(
         "--ttl", type=int, default=DEFAULT_HEARTBEAT_TTL_SEC, help="Heartbeat freshness threshold in seconds"
     )
+    metrics_p = sub.add_parser(
+        "dispatch-metrics",
+        parents=[shared],
+        help="Summarize dispatch phase latency metrics from .loop/logs/feed.jsonl",
+    )
+    metrics_p.add_argument("--task-id", default=None, help="Filter by task_id")
+    metrics_p.add_argument("--role", choices=_DISPATCH_PHASE_ROLE_CHOICES, default="all", help="Filter by role")
 
     hb_p = sub.add_parser("heartbeat", parents=[shared], help="Write role heartbeat continuously")
     hb_p.add_argument("--role", choices=["worker", "reviewer"], required=True)
@@ -5961,6 +6095,8 @@ def main() -> None:
             cmd_status()
         elif args.cmd == "health":
             cmd_health(args.ttl)
+        elif args.cmd == "dispatch-metrics":
+            cmd_dispatch_metrics(task_id=args.task_id, role=args.role)
         elif args.cmd == "heartbeat":
             cmd_heartbeat(args.role, args.interval)
         elif args.cmd == "extract-diff":
