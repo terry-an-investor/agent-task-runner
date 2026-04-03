@@ -75,6 +75,13 @@ class LaneMergeProvenance(TypedDict):
     lane_execution_order: list[str]
     lanes: list[LaneMergeRecord]
     acceptance_checks: list[WorkReportTest]
+    lane_reviews: NotRequired[list["LaneReviewVerdict"]]
+
+
+class LaneReviewVerdict(TypedDict):
+    lane_id: str
+    decision: str
+    blocking_issues: int
 
 
 class ReviewIssue(TypedDict):
@@ -96,6 +103,11 @@ class LaneRuntimeMetrics(TypedDict, total=False):
     output_tokens: int
     total_tokens: int
     cost_cents: int
+    review_decision: str
+    review_status: str
+    review_backend: str
+    review_duration_ms: int
+    review_blocking_issues: int
 
 
 class WorkReport(TypedDict):
@@ -175,6 +187,7 @@ class TaskCard(TypedDict, total=False):
     depends_on: NotRequired[list[str]]
     dependencies: NotRequired[list[str]]
     lanes: NotRequired[list[TaskLane]]
+    lane_review_parallel: NotRequired[bool]
 
 
 # ── single-file architecture boundaries (T-722) ────────────────────────────
@@ -3297,6 +3310,21 @@ def _normalize_lane_runtime_metrics(
         "duration_ms": duration_ms if duration_ms is not None else 0,
     }
     runtime.update(_runtime_cost_and_token_fields(payload, backend=backend))
+    review_decision_raw = payload.get("review_decision")
+    if isinstance(review_decision_raw, str) and review_decision_raw.strip():
+        runtime["review_decision"] = review_decision_raw.strip()
+    review_status_raw = payload.get("review_status")
+    if isinstance(review_status_raw, str) and review_status_raw.strip():
+        runtime["review_status"] = review_status_raw.strip()
+    review_backend_raw = payload.get("review_backend")
+    if isinstance(review_backend_raw, str):
+        runtime["review_backend"] = _normalized_backend_name(review_backend_raw) or review_backend_raw.strip()
+    review_duration_raw = _coerce_non_negative_int(payload.get("review_duration_ms"))
+    if review_duration_raw is not None:
+        runtime["review_duration_ms"] = review_duration_raw
+    review_blocking_raw = _coerce_non_negative_int(payload.get("review_blocking_issues"))
+    if review_blocking_raw is not None:
+        runtime["review_blocking_issues"] = review_blocking_raw
     return runtime
 
 
@@ -4495,7 +4523,13 @@ def _worker_prompt(task_id: str, round_num: int, paths: LoopPaths | None = None)
     return result
 
 
-def _reviewer_prompt(task_id: str, round_num: int, paths: LoopPaths | None = None) -> str:
+def _reviewer_prompt_with_report_path(
+    task_id: str,
+    round_num: int,
+    *,
+    review_report_path: Path,
+    paths: LoopPaths | None = None,
+) -> str:
     resolved_paths = _resolve_paths(paths)
     role_text = _read_text_with_default(
         ROOT / "docs" / "roles" / "reviewer.md",
@@ -4509,12 +4543,53 @@ def _reviewer_prompt(task_id: str, round_num: int, paths: LoopPaths | None = Non
         "task_card_section": "",
         "prior_context_section": "",
         "handoff_section": _render_handoff_context_section(task_id, round_num, paths=resolved_paths),
-        "review_report_path": _display_path(resolved_paths.review_report),
+        "review_report_path": _display_path(review_report_path),
     }
     return _render_prompt_template(
         template_path=_reviewer_prompt_template_path(paths=resolved_paths),
         context=context,
     )
+
+
+def _reviewer_prompt(task_id: str, round_num: int, paths: LoopPaths | None = None) -> str:
+    resolved_paths = _resolve_paths(paths)
+    return _reviewer_prompt_with_report_path(
+        task_id,
+        round_num,
+        review_report_path=resolved_paths.review_report,
+        paths=resolved_paths,
+    )
+
+
+def _lane_reviewer_dispatch_role_name(lane_id: str) -> str:
+    lane_component = _safe_git_component(lane_id, fallback_prefix="lane")
+    return f"reviewer_lane_{lane_component}"
+
+
+def _lane_reviewer_prompt(
+    *,
+    task_id: str,
+    round_num: int,
+    lane_id: str,
+    lane_review_request_path: Path,
+    lane_review_report_path: Path,
+    paths: LoopPaths | None = None,
+) -> str:
+    resolved_paths = _resolve_paths(paths)
+    base_prompt = _reviewer_prompt_with_report_path(
+        task_id,
+        round_num,
+        review_report_path=lane_review_report_path,
+        paths=resolved_paths,
+    )
+    lane_context = (
+        "=== LANE REVIEW CONTEXT ===\n"
+        f"lane_id: {lane_id}\n"
+        f"lane_review_request_path: {_display_path(lane_review_request_path)}\n"
+        f"lane_review_report_path: {_display_path(lane_review_report_path)}\n"
+        "lane_review_scope: pre-integration reviewer gate for this lane only\n"
+    )
+    return f"{base_prompt}\n\n{lane_context}"
 
 
 # ── state ───────────────────────────────────────────────────────────
@@ -4932,6 +5007,30 @@ def _lane_report_path(lane_id: str, *, paths: LoopPaths | None = None) -> Path:
     return _lane_reports_dir(paths=paths) / f"{lane_component}.json"
 
 
+def _lane_review_requests_dir(*, paths: LoopPaths | None = None) -> Path:
+    resolved_paths = _resolve_paths(paths)
+    return resolved_paths.dir / "review_requests"
+
+
+def _lane_review_request_path(lane_id: str, *, paths: LoopPaths | None = None) -> Path:
+    if not lane_id:
+        raise ValidationError("lane_id must be non-empty")
+    lane_component = _safe_git_component(lane_id, fallback_prefix="lane")
+    return _lane_review_requests_dir(paths=paths) / f"{lane_component}.json"
+
+
+def _lane_review_reports_dir(*, paths: LoopPaths | None = None) -> Path:
+    resolved_paths = _resolve_paths(paths)
+    return resolved_paths.dir / "review_reports"
+
+
+def _lane_review_report_path(lane_id: str, *, paths: LoopPaths | None = None) -> Path:
+    if not lane_id:
+        raise ValidationError("lane_id must be non-empty")
+    lane_component = _safe_git_component(lane_id, fallback_prefix="lane")
+    return _lane_review_reports_dir(paths=paths) / f"{lane_component}.json"
+
+
 def _lane_worktree_branch_name(task_id: str, round_num: int, lane_id: str) -> str:
     if not isinstance(round_num, int) or round_num < 1:
         raise ValidationError(f"round_num must be int >= 1, got {round_num!r}")
@@ -5235,6 +5334,16 @@ def _integration_lane_state_entry(*, lane_execution_order: list[str]) -> dict[st
     }
 
 
+def _lane_review_verdict_from_report(lane_id: str, review: ReviewReport) -> LaneReviewVerdict:
+    raw_blocking = review.get("blocking_issues", [])
+    blocking_count = len(raw_blocking) if isinstance(raw_blocking, list) else 0
+    return {
+        "lane_id": lane_id,
+        "decision": str(review.get("decision", "")).strip(),
+        "blocking_issues": blocking_count,
+    }
+
+
 def _merge_lane_work_reports(
     *,
     task_id: str,
@@ -5244,6 +5353,7 @@ def _merge_lane_work_reports(
     merged_head_sha: str,
     integration_tests: list[WorkReportTest] | None = None,
     merge_provenance: LaneMergeProvenance | None = None,
+    lane_reviews: dict[str, ReviewReport] | None = None,
 ) -> WorkReport:
     merged_files: list[str] = []
     seen_files: set[str] = set()
@@ -5281,6 +5391,14 @@ def _merge_lane_work_reports(
             default_backend="",
         )
         if lane_metric is not None:
+            lane_review = lane_reviews.get(lane_id) if isinstance(lane_reviews, dict) else None
+            if isinstance(lane_review, dict):
+                decision = str(lane_review.get("decision", "")).strip()
+                if decision:
+                    lane_metric["review_decision"] = decision
+                lane_metric["review_status"] = "completed"
+                raw_blocking = lane_review.get("blocking_issues", [])
+                lane_metric["review_blocking_issues"] = len(raw_blocking) if isinstance(raw_blocking, list) else 0
             lane_metrics.append(lane_metric)
             duration_ms = cast(int, lane_metric.get("duration_ms", 0))
             total_duration_ms += duration_ms
@@ -5320,6 +5438,12 @@ def _merge_lane_work_reports(
     if notes_chunks:
         merged["notes"] = "; ".join(notes_chunks)
     if merge_provenance is not None:
+        if isinstance(lane_reviews, dict) and lane_reviews:
+            merge_provenance["lane_reviews"] = [
+                _lane_review_verdict_from_report(lane_id, lane_reviews[lane_id])
+                for lane_id in lane_execution_order
+                if lane_id in lane_reviews
+            ]
         merged["merge_provenance"] = merge_provenance
     return merged
 
@@ -5942,6 +6066,11 @@ def _load_task_card_or_raise(task_path: str | Path) -> tuple[Path, TaskCard, str
     task_id = str(task_id_raw).strip() if isinstance(task_id_raw, str) else str(task_id_raw)
     dependencies = _normalize_task_dependencies(task_card_typed, source=tp, task_id=task_id)
     lanes = _normalize_task_lanes(task_card_typed, source=tp)
+    lane_review_parallel_raw = task_card_typed.get("lane_review_parallel")
+    if lane_review_parallel_raw is not None:
+        if not isinstance(lane_review_parallel_raw, bool):
+            raise ConfigError(f"task card {tp}: field 'lane_review_parallel' must be a boolean")
+        task_card_typed["lane_review_parallel"] = lane_review_parallel_raw
     if dependencies:
         task_card_typed["depends_on"] = dependencies
     elif "depends_on" in task_card_typed:
@@ -6372,7 +6501,29 @@ def _validate_report(
                     lane_backend = lane_metric.get("backend")
                     if not isinstance(lane_backend, str):
                         return f"{prefix} lane_metrics[{index}] field 'backend' must be a string"
+                    lane_review_decision = lane_metric.get("review_decision")
+                    if lane_review_decision is not None and (
+                        not isinstance(lane_review_decision, str) or not lane_review_decision.strip()
+                    ):
+                        return f"{prefix} lane_metrics[{index}] field 'review_decision' must be a non-empty string"
+                    lane_review_status = lane_metric.get("review_status")
+                    if lane_review_status is not None and (
+                        not isinstance(lane_review_status, str) or not lane_review_status.strip()
+                    ):
+                        return f"{prefix} lane_metrics[{index}] field 'review_status' must be a non-empty string"
+                    lane_review_backend = lane_metric.get("review_backend")
+                    if lane_review_backend is not None and not isinstance(lane_review_backend, str):
+                        return f"{prefix} lane_metrics[{index}] field 'review_backend' must be a string"
                     for lane_int_field in ("duration_ms", "input_tokens", "output_tokens", "total_tokens", "cost_cents"):
+                        if lane_int_field not in lane_metric:
+                            continue
+                        lane_int_value = lane_metric[lane_int_field]
+                        if type(lane_int_value) is not int or lane_int_value < 0:
+                            return (
+                                f"{prefix} lane_metrics[{index}] field '{lane_int_field}' "
+                                f"must be non-negative int"
+                            )
+                    for lane_int_field in ("review_duration_ms", "review_blocking_issues"):
                         if lane_int_field not in lane_metric:
                             continue
                         lane_int_value = lane_metric[lane_int_field]
@@ -7050,26 +7201,60 @@ def _round_artifact_payload_for_report(
     return cast(dict[str, object], live_data)
 
 
-def _lane_status_map_from_state_payload(state_payload: dict[str, object] | None) -> dict[str, str]:
+def _lane_state_map_from_state_payload(state_payload: dict[str, object] | None) -> dict[str, dict[str, object]]:
     if not isinstance(state_payload, dict):
         return {}
     lanes_raw = state_payload.get("lanes")
     if not isinstance(lanes_raw, dict):
         return {}
-    statuses: dict[str, str] = {}
+    lane_state: dict[str, dict[str, object]] = {}
     for lane_id_raw, lane_payload in lanes_raw.items():
         if not isinstance(lane_id_raw, str):
             continue
         lane_id = lane_id_raw.strip()
         if not lane_id:
             continue
-        lane_status = "unknown"
         if isinstance(lane_payload, dict):
-            status_raw = lane_payload.get("status")
-            if isinstance(status_raw, str) and status_raw.strip():
-                lane_status = status_raw.strip()
+            lane_state[lane_id] = dict(lane_payload)
+        else:
+            lane_state[lane_id] = {}
+    return lane_state
+
+
+def _lane_status_map_from_state_payload(state_payload: dict[str, object] | None) -> dict[str, str]:
+    lane_state = _lane_state_map_from_state_payload(state_payload)
+    statuses: dict[str, str] = {}
+    for lane_id, lane_payload in lane_state.items():
+        lane_status = "unknown"
+        status_raw = lane_payload.get("status")
+        if isinstance(status_raw, str) and status_raw.strip():
+            lane_status = status_raw.strip()
         statuses[lane_id] = lane_status
     return statuses
+
+
+def _apply_lane_review_fields_to_runtime_metric(
+    metric: LaneRuntimeMetrics,
+    *,
+    lane_state_entry: dict[str, object] | None,
+) -> None:
+    if not isinstance(lane_state_entry, dict):
+        return
+    decision_raw = lane_state_entry.get("review_decision")
+    if isinstance(decision_raw, str) and decision_raw.strip():
+        metric["review_decision"] = decision_raw.strip()
+    review_status_raw = lane_state_entry.get("review_status")
+    if isinstance(review_status_raw, str) and review_status_raw.strip():
+        metric["review_status"] = review_status_raw.strip()
+    review_backend_raw = lane_state_entry.get("review_backend")
+    if isinstance(review_backend_raw, str) and review_backend_raw.strip():
+        metric["review_backend"] = review_backend_raw.strip()
+    review_duration_raw = _coerce_non_negative_int(lane_state_entry.get("review_duration_ms"))
+    if review_duration_raw is not None:
+        metric["review_duration_ms"] = review_duration_raw
+    review_blocking_raw = _coerce_non_negative_int(lane_state_entry.get("review_blocking_issues"))
+    if review_blocking_raw is not None:
+        metric["review_blocking_issues"] = review_blocking_raw
 
 
 def _lane_runtime_summary_for_round(
@@ -7077,6 +7262,7 @@ def _lane_runtime_summary_for_round(
     work_payload: dict[str, object] | None,
     state_payload: dict[str, object] | None,
 ) -> dict[str, object] | None:
+    lane_state_map = _lane_state_map_from_state_payload(state_payload)
     lane_statuses = _lane_status_map_from_state_payload(state_payload)
     runtime_rows: list[LaneRuntimeMetrics] = []
     if isinstance(work_payload, dict):
@@ -7095,6 +7281,10 @@ def _lane_runtime_summary_for_round(
                     default_backend="",
                 )
                 if metric is not None:
+                    _apply_lane_review_fields_to_runtime_metric(
+                        metric,
+                        lane_state_entry=lane_state_map.get(cast(str, metric["lane_id"])),
+                    )
                     runtime_rows.append(metric)
         if not runtime_rows:
             default_lane_id = (
@@ -7111,21 +7301,28 @@ def _lane_runtime_summary_for_round(
                 default_backend=default_backend,
             )
             if serial_metric is not None:
+                _apply_lane_review_fields_to_runtime_metric(
+                    serial_metric,
+                    lane_state_entry=lane_state_map.get(cast(str, serial_metric["lane_id"])),
+                )
                 runtime_rows.append(serial_metric)
 
     existing_lane_ids = {str(metric.get("lane_id", "")) for metric in runtime_rows}
     for lane_id in sorted(lane_statuses):
         if lane_id in existing_lane_ids:
             continue
-        runtime_rows.append(
-            {
-                "lane_id": lane_id,
-                "status": lane_statuses[lane_id],
-                "backend": "",
-                "duration_ms": 0,
-                "cost_cents": 0,
-            }
+        row: LaneRuntimeMetrics = {
+            "lane_id": lane_id,
+            "status": lane_statuses[lane_id],
+            "backend": "",
+            "duration_ms": 0,
+            "cost_cents": 0,
+        }
+        _apply_lane_review_fields_to_runtime_metric(
+            row,
+            lane_state_entry=lane_state_map.get(lane_id),
         )
+        runtime_rows.append(row)
     if not runtime_rows:
         return None
 
@@ -7319,10 +7516,16 @@ def _render_task_report_markdown(report: dict[str, object]) -> str:
                 lane_cost = lane.get("cost_cents", 0)
                 lane_total_tokens = lane.get("total_tokens")
                 token_text = lane_total_tokens if isinstance(lane_total_tokens, int) else "n/a"
+                review_decision = lane.get("review_decision")
+                review_suffix = (
+                    f" review_decision={review_decision}"
+                    if isinstance(review_decision, str) and review_decision.strip()
+                    else ""
+                )
                 lines.append(
                     "  - "
                     f"{lane_id}: status={lane_status} backend={lane_backend} "
-                    f"duration_ms={lane_duration} cost_cents={lane_cost} total_tokens={token_text}"
+                    f"duration_ms={lane_duration} cost_cents={lane_cost} total_tokens={token_text}{review_suffix}"
                 )
     else:
         lines.append("- none")
@@ -8267,8 +8470,10 @@ def _run_single_round(
         lane_by_id = {str(lane["lane_id"]): lane for lane in task_lanes}
         lane_handle_by_id = {handle.lane_id: handle for handle in lane_worktrees}
         lane_reports: dict[str, WorkReport] = {}
+        lane_reviews: dict[str, ReviewReport] = {}
         lane_execution_order: list[str] = []
         lane_failures: list[str] = []
+        lane_review_parallel_enabled = bool(task_card.get("lane_review_parallel"))
         lane_report_root = _lane_reports_dir(paths=resolved_paths)
         lane_report_root.mkdir(parents=True, exist_ok=True)
 
@@ -8391,6 +8596,153 @@ def _run_single_round(
             _atomic_write_json(lane_report_target, lane_work)
             return lane_work
 
+        def _dispatch_lane_review(lane_id: str, lane_work: WorkReport) -> tuple[ReviewReport, int, str]:
+            lane = lane_by_id.get(lane_id)
+            if lane is None:
+                raise ValidationError(f"Lane review dispatch missing lane config for lane_id={lane_id!r}")
+            lane_head_sha = str(lane_work["head_sha"]).strip()
+            if not lane_head_sha:
+                raise ValidationError(f"Lane review dispatch missing lane head_sha for lane_id={lane_id!r}")
+            try:
+                lane_diff = _diff(base_sha, lane_head_sha)
+                lane_commits = _log_oneline(base_sha, lane_head_sha)
+            except RuntimeError as e:
+                raise RuntimeError(f"Lane review diff generation failed for lane '{lane_id}': {e}") from e
+
+            lane_review_request_path = _lane_review_request_path(lane_id, paths=resolved_paths)
+            lane_review_request_path.parent.mkdir(parents=True, exist_ok=True)
+            lane_acceptance_checks = [str(item).strip() for item in lane.get("acceptance_checks", []) if str(item).strip()]
+            lane_acceptance_criteria = [item for item in task_card.get("acceptance_criteria", []) if isinstance(item, str)]
+            lane_acceptance_criteria.extend([f"[lane:{lane_id}] {item}" for item in lane_acceptance_checks])
+            lane_review_request: ReviewRequest = {
+                "task_id": task_id,
+                "base_sha": base_sha,
+                "head_sha": lane_head_sha,
+                "commits": lane_commits,
+                "diff": lane_diff,
+                "acceptance_criteria": lane_acceptance_criteria,
+                "constraints": [item for item in task_card.get("constraints", []) if isinstance(item, str)],
+                "round": round_num,
+                "worker_notes": str(lane_work.get("notes", "")),
+                "worker_tests": cast(list[WorkReportTest], lane_work.get("tests", []))
+                if isinstance(lane_work.get("tests"), list)
+                else [],
+            }
+            lane_review_request["lane_id"] = lane_id
+            lane_review_request["lane_owner_paths"] = list(cast(list[str], lane.get("owner_paths", [])))
+            lane_review_request["lane_acceptance_checks"] = lane_acceptance_checks
+            _atomic_write_json(lane_review_request_path, lane_review_request)
+
+            lane_review_report_path = _lane_review_report_path(lane_id, paths=resolved_paths)
+            lane_review_report_path.parent.mkdir(parents=True, exist_ok=True)
+            lane_review_report_path.unlink(missing_ok=True)
+            lane_review_prompt = _lane_reviewer_prompt(
+                task_id=task_id,
+                round_num=round_num,
+                lane_id=lane_id,
+                lane_review_request_path=lane_review_request_path,
+                lane_review_report_path=lane_review_report_path,
+                paths=resolved_paths,
+            )
+            lane_reviewer_backend = config.reviewer_backend.strip().lower()
+            dispatch_role = _lane_reviewer_dispatch_role_name(lane_id)
+            dispatch_started_at = time.monotonic()
+            dispatch_metrics: dict[str, object] = {}
+            dispatch_session_id: str | None = None
+
+            def _dispatch_call() -> None:
+                nonlocal dispatch_session_id
+                dispatch_session_id = _run_auto_dispatch(
+                    role=dispatch_role,
+                    backend=lane_reviewer_backend,
+                    prompt=lane_review_prompt,
+                    timeout_sec=config.dispatch_timeout,
+                    verbose=config.verbose,
+                    dispatch_retries=config.dispatch_retries,
+                    dispatch_retry_base_sec=config.dispatch_retry_base_sec,
+                    heartbeat_enabled=config.require_heartbeat,
+                    heartbeat_ttl_sec=config.heartbeat_ttl,
+                    task_id=task_id,
+                    round_num=round_num,
+                    lane_id=lane_id,
+                    dispatch_started_at=dispatch_started_at,
+                    telemetry=dispatch_metrics,
+                )
+
+            artifact = _dispatch_with_artifact_fallback(
+                role=dispatch_role,
+                dispatch_call=_dispatch_call,
+                artifact_path=lane_review_report_path,
+                task_id=task_id,
+                round_num=round_num,
+                timeout_sec=config.artifact_timeout,
+            )
+            lane_review = cast(ReviewReport, artifact)
+            lane_review_error = _validate_report(
+                lane_review,
+                expected_task_id=task_id,
+                expected_round=round_num,
+                schema="review_report",
+            )
+            if lane_review_error:
+                raise ValidationError(f"lane '{lane_id}' produced invalid review_report: {lane_review_error}")
+
+            artifact_written_latency_ms = max(0, int((time.monotonic() - dispatch_started_at) * 1000))
+            _feed_event(
+                FEED_DISPATCH_ARTIFACT_WRITTEN,
+                data=_feed_data(
+                    task_id=task_id,
+                    round_num=round_num,
+                    role=dispatch_role,
+                    lane_id=lane_id,
+                    backend=lane_reviewer_backend,
+                    artifact_path=lane_review_report_path.name,
+                    latency_ms=artifact_written_latency_ms,
+                    duration_ms=artifact_written_latency_ms,
+                    status="written",
+                ),
+                paths=resolved_paths,
+            )
+            first_stdout_ms = dispatch_metrics.get("first_stdout_ms")
+            startup_ms = first_stdout_ms if isinstance(first_stdout_ms, int) else None
+            first_work_action_ms = dispatch_metrics.get("first_work_action_ms")
+            work_ms = first_work_action_ms if isinstance(first_work_action_ms, int) else None
+            subphase_metrics = _dispatch_subphase_metrics_from_telemetry(
+                dispatch_metrics,
+                artifact_written_latency_ms=artifact_written_latency_ms,
+            )
+            _feed_event(
+                FEED_DISPATCH_PHASE_METRICS,
+                data=_feed_data(
+                    task_id=task_id,
+                    round_num=round_num,
+                    role=dispatch_role,
+                    lane_id=lane_id,
+                    backend=lane_reviewer_backend,
+                    session_id=SessionManager.normalize_session_id(dispatch_session_id),
+                    startup_ms=startup_ms,
+                    context_to_work_ms=_segment_ms(startup_ms, work_ms),
+                    work_to_artifact_ms=_segment_ms(work_ms, artifact_written_latency_ms),
+                    total_ms=artifact_written_latency_ms,
+                    duration_ms=artifact_written_latency_ms,
+                    **subphase_metrics,
+                ),
+                paths=resolved_paths,
+            )
+            _feed_event(
+                FEED_REVIEW_VERDICT,
+                data=_feed_data(
+                    task_id=task_id,
+                    round_num=round_num,
+                    role=dispatch_role,
+                    lane_id=lane_id,
+                    decision=str(lane_review["decision"]),
+                ),
+                paths=resolved_paths,
+            )
+            _atomic_write_json(lane_review_report_path, lane_review)
+            return lane_review, artifact_written_latency_ms, lane_reviewer_backend
+
         for stage_index, stage_lane_ids in enumerate(lane_stages):
             ready_lanes: list[str] = []
             for lane_id in stage_lane_ids:
@@ -8465,6 +8817,76 @@ def _run_single_round(
             )
             return
 
+        if lane_review_parallel_enabled and lane_execution_order:
+            lane_review_failures: list[str] = []
+            lane_review_request_root = _lane_review_requests_dir(paths=resolved_paths)
+            lane_review_report_root = _lane_review_reports_dir(paths=resolved_paths)
+            lane_review_request_root.mkdir(parents=True, exist_ok=True)
+            lane_review_report_root.mkdir(parents=True, exist_ok=True)
+            for lane_id in lane_execution_order:
+                lane_entry = lane_state.get(lane_id)
+                if lane_entry is None:
+                    continue
+                lane_entry["review_status"] = "pending"
+                lane_entry["review_request_path"] = _display_path(_lane_review_request_path(lane_id, paths=resolved_paths))
+                lane_entry["review_report_path"] = _display_path(_lane_review_report_path(lane_id, paths=resolved_paths))
+            _save_lane_state_snapshot(state, lane_state, paths=resolved_paths)
+
+            review_workers = min(config.max_parallel_workers, len(lane_execution_order))
+            _log(
+                f"Lane reviewer fan-out enabled: lanes={lane_execution_order} max_workers={review_workers}",
+                paths=resolved_paths,
+            )
+            with concurrent.futures.ThreadPoolExecutor(max_workers=review_workers) as executor:
+                review_futures: dict[str, concurrent.futures.Future[tuple[ReviewReport, int, str]]] = {}
+                for lane_id in lane_execution_order:
+                    lane_entry = lane_state.get(lane_id)
+                    lane_work = lane_reports.get(lane_id)
+                    if lane_entry is None or lane_work is None:
+                        lane_review_failures.append(f"{lane_id}: missing lane state or work report")
+                        continue
+                    lane_entry["review_status"] = "running"
+                    review_futures[lane_id] = executor.submit(_dispatch_lane_review, lane_id, lane_work)
+                for lane_id in lane_execution_order:
+                    future = review_futures.get(lane_id)
+                    if future is None:
+                        continue
+                    lane_entry = lane_state.get(lane_id)
+                    if lane_entry is None:
+                        continue
+                    try:
+                        lane_review, lane_review_duration_ms, lane_review_backend = future.result()
+                    except Exception as e:
+                        lane_entry["review_status"] = "failed"
+                        lane_entry["review_error"] = str(e)
+                        lane_review_failures.append(f"{lane_id}: {e}")
+                        continue
+                    lane_reviews[lane_id] = lane_review
+                    decision = str(lane_review["decision"])
+                    raw_blocking = lane_review.get("blocking_issues", [])
+                    blocking_count = len(raw_blocking) if isinstance(raw_blocking, list) else 0
+                    lane_entry["review_status"] = "completed"
+                    lane_entry["review_decision"] = decision
+                    lane_entry["review_backend"] = lane_review_backend
+                    lane_entry["review_duration_ms"] = lane_review_duration_ms
+                    lane_entry["review_blocking_issues"] = blocking_count
+                    print(f"  Lane review: {lane_id} -> {decision}")
+                    if decision != "approve":
+                        lane_review_failures.append(f"{lane_id}: decision={decision}")
+            _save_lane_state_snapshot(state, lane_state, paths=resolved_paths)
+            if lane_review_failures:
+                preserve_lane_worktrees = True
+                _fail_single_round(
+                    outcome="lane_review_rejected",
+                    message=(
+                        "Lane review gate rejected integration: "
+                        + "; ".join(lane_review_failures)
+                    ),
+                    exit_code=EXIT_VALIDATION_ERROR,
+                    cleanup_lane_worktrees=False,
+                )
+                return
+
         integration_entry: dict[str, object] | None = None
         if lane_state:
             integration_entry = _integration_lane_state_entry(lane_execution_order=lane_execution_order)
@@ -8538,6 +8960,7 @@ def _run_single_round(
             merged_head_sha=merged_head_sha,
             integration_tests=integration_tests,
             merge_provenance=merge_provenance,
+            lane_reviews=lane_reviews,
         )
         _atomic_write_json(resolved_paths.work_report, work)
     else:

@@ -3939,6 +3939,28 @@ def test_load_task_card_normalizes_valid_lanes(tmp_path: Path) -> None:
     ]
 
 
+def test_load_task_card_rejects_non_boolean_lane_review_parallel(tmp_path: Path, capsys) -> None:
+    task_path = tmp_path / "task_input.json"
+    task_path.write_text(
+        json.dumps(
+            {
+                "task_id": "T-900",
+                "goal": "lane review parallel validation",
+                "lane_review_parallel": "yes",
+                "lanes": [{"lane_id": "lane_core", "owner_paths": ["src/loop_kit/orchestrator.py"]}],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        orchestrator._load_task_card(str(task_path))
+
+    assert exc.value.code == 1
+    assert "field 'lane_review_parallel' must be a boolean" in capsys.readouterr().err
+
+
 def test_load_task_card_rejects_lanes_with_duplicate_lane_id(tmp_path: Path, capsys) -> None:
     task_path = tmp_path / "task_input.json"
     task_path.write_text(
@@ -4782,6 +4804,246 @@ def test_single_round_lane_dispatch_emits_lane_runtime_telemetry_and_report_fiel
     assert len(lane_phase_events) == 1
     assert lane_phase_events[0]["duration_ms"] == 750
     assert lane_phase_events[0]["cost_cents"] == 1
+
+
+def test_single_round_lane_review_parallel_all_approve_proceeds_to_integration(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+
+    task_path = tmp_path / "task_input.json"
+    task_path.write_text(
+        json.dumps(
+            {
+                "task_id": "T-732",
+                "goal": "lane reviewer gate approve",
+                "in_scope": [],
+                "out_of_scope": [],
+                "acceptance_criteria": ["lane reviews must pass"],
+                "constraints": [],
+                "lane_review_parallel": True,
+                "lanes": [
+                    {"lane_id": "lane_core", "owner_paths": ["src/loop_kit/orchestrator.py"]},
+                    {"lane_id": "lane_tests", "owner_paths": ["tests/test_orchestrator.py"]},
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(orchestrator, "_current_sha", lambda: "base-sha")
+    monkeypatch.setattr(
+        orchestrator,
+        "_prepare_lane_worktrees",
+        lambda **kwargs: [
+            orchestrator.LaneWorktreeHandle(
+                task_id="T-732",
+                round_num=1,
+                lane_id="lane_core",
+                path=tmp_path / ".loop" / "worktrees" / "T-732" / "1" / "lane_core",
+                branch="loop/T-732/r1/lane_core",
+            ),
+            orchestrator.LaneWorktreeHandle(
+                task_id="T-732",
+                round_num=1,
+                lane_id="lane_tests",
+                path=tmp_path / ".loop" / "worktrees" / "T-732" / "1" / "lane_tests",
+                branch="loop/T-732/r1/lane_tests",
+            ),
+        ],
+    )
+    monkeypatch.setattr(orchestrator, "_run_auto_dispatch", lambda **kwargs: f"{kwargs['role']}-session")
+
+    def fake_dispatch_with_artifact_fallback(**kwargs):
+        role = kwargs["role"]
+        if role.startswith("worker_lane_"):
+            lane_id = role.removeprefix("worker_lane_")
+            return {
+                "task_id": "T-732",
+                "round": 1,
+                "head_sha": f"{lane_id}-head",
+                "files_changed": [f"{lane_id}.py"],
+                "tests": [],
+                "notes": f"{lane_id} work",
+            }
+        if role.startswith("reviewer_lane_"):
+            return {
+                "task_id": "T-732",
+                "round": 1,
+                "decision": "approve",
+                "blocking_issues": [],
+                "non_blocking_suggestions": [],
+            }
+        raise AssertionError(f"unexpected dispatch role: {role}")
+
+    monkeypatch.setattr(orchestrator, "_dispatch_with_artifact_fallback", fake_dispatch_with_artifact_fallback)
+    monkeypatch.setattr(
+        orchestrator,
+        "_cherry_pick_lane_reports",
+        lambda **kwargs: (
+            "merged-head",
+            [
+                {
+                    "lane_id": "lane_core",
+                    "lane_head_sha": "lane_core-head",
+                    "status": "applied",
+                    "source_commits": ["c1"],
+                    "applied_commits": ["m1"],
+                },
+                {
+                    "lane_id": "lane_tests",
+                    "lane_head_sha": "lane_tests-head",
+                    "status": "applied",
+                    "source_commits": ["c2"],
+                    "applied_commits": ["m2"],
+                },
+            ],
+        ),
+    )
+    monkeypatch.setattr(orchestrator, "_run_integration_acceptance_checks", lambda **kwargs: [])
+    monkeypatch.setattr(orchestrator, "_diff", lambda base, head: f"diff {base}->{head}")
+    monkeypatch.setattr(orchestrator, "_log_oneline", lambda base, head: f"log {base}->{head}")
+    monkeypatch.setattr(orchestrator, "_cleanup_lane_worktrees_for_round", lambda **kwargs: None)
+    final_reviewer_calls: list[str] = []
+
+    def fake_auto_dispatch_role(**kwargs):
+        if kwargs["role"] != "reviewer":
+            return None
+        final_reviewer_calls.append("reviewer")
+        return {
+            "task_id": "T-732",
+            "round": 1,
+            "decision": "approve",
+            "blocking_issues": [],
+            "non_blocking_suggestions": [],
+        }
+
+    monkeypatch.setattr(orchestrator, "_auto_dispatch_role", fake_auto_dispatch_role)
+
+    orchestrator.cmd_run(
+        _run_config(
+            str(task_path),
+            auto_dispatch=True,
+            max_parallel_workers=2,
+            allow_dirty=True,
+        ),
+        single_round=True,
+        round_num=1,
+    )
+
+    assert final_reviewer_calls == ["reviewer"]
+    merged_work = json.loads(orchestrator.WORK_REPORT.read_text(encoding="utf-8"))
+    review_decisions = {
+        item["lane_id"]: item.get("review_decision")
+        for item in merged_work.get("lane_metrics", [])
+        if isinstance(item, dict) and "lane_id" in item
+    }
+    assert review_decisions == {"lane_core": "approve", "lane_tests": "approve"}
+    state = json.loads(orchestrator.STATE_FILE.read_text(encoding="utf-8"))
+    assert state["outcome"] == "approved"
+    assert state["lanes"]["lane_core"]["review_decision"] == "approve"
+    assert state["lanes"]["lane_tests"]["review_decision"] == "approve"
+    assert state["lanes"]["__integration__"]["status"] == "completed"
+
+
+def test_single_round_lane_review_parallel_one_reject_blocks_integration(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+
+    task_path = tmp_path / "task_input.json"
+    task_path.write_text(
+        json.dumps(
+            {
+                "task_id": "T-733",
+                "goal": "lane reviewer gate reject",
+                "in_scope": [],
+                "out_of_scope": [],
+                "acceptance_criteria": ["lane reviews must pass"],
+                "constraints": [],
+                "lane_review_parallel": True,
+                "lanes": [
+                    {"lane_id": "lane_core", "owner_paths": ["src/loop_kit/orchestrator.py"]},
+                    {"lane_id": "lane_tests", "owner_paths": ["tests/test_orchestrator.py"]},
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(orchestrator, "_current_sha", lambda: "base-sha")
+    monkeypatch.setattr(
+        orchestrator,
+        "_prepare_lane_worktrees",
+        lambda **kwargs: [
+            orchestrator.LaneWorktreeHandle(
+                task_id="T-733",
+                round_num=1,
+                lane_id="lane_core",
+                path=tmp_path / ".loop" / "worktrees" / "T-733" / "1" / "lane_core",
+                branch="loop/T-733/r1/lane_core",
+            ),
+            orchestrator.LaneWorktreeHandle(
+                task_id="T-733",
+                round_num=1,
+                lane_id="lane_tests",
+                path=tmp_path / ".loop" / "worktrees" / "T-733" / "1" / "lane_tests",
+                branch="loop/T-733/r1/lane_tests",
+            ),
+        ],
+    )
+    monkeypatch.setattr(orchestrator, "_run_auto_dispatch", lambda **kwargs: f"{kwargs['role']}-session")
+
+    def fake_dispatch_with_artifact_fallback(**kwargs):
+        role = kwargs["role"]
+        if role.startswith("worker_lane_"):
+            lane_id = role.removeprefix("worker_lane_")
+            return {
+                "task_id": "T-733",
+                "round": 1,
+                "head_sha": f"{lane_id}-head",
+                "files_changed": [f"{lane_id}.py"],
+                "tests": [],
+                "notes": f"{lane_id} work",
+            }
+        if role.startswith("reviewer_lane_"):
+            lane_id = role.removeprefix("reviewer_lane_")
+            decision = "changes_required" if lane_id == "lane_tests" else "approve"
+            return {
+                "task_id": "T-733",
+                "round": 1,
+                "decision": decision,
+                "blocking_issues": [],
+                "non_blocking_suggestions": [],
+            }
+        raise AssertionError(f"unexpected dispatch role: {role}")
+
+    monkeypatch.setattr(orchestrator, "_dispatch_with_artifact_fallback", fake_dispatch_with_artifact_fallback)
+    monkeypatch.setattr(orchestrator, "_diff", lambda base, head: f"diff {base}->{head}")
+    monkeypatch.setattr(orchestrator, "_log_oneline", lambda base, head: f"log {base}->{head}")
+    monkeypatch.setattr(orchestrator, "_cleanup_lane_worktrees_for_round", lambda **kwargs: None)
+    final_reviewer_calls: list[str] = []
+    monkeypatch.setattr(
+        orchestrator,
+        "_auto_dispatch_role",
+        lambda **kwargs: final_reviewer_calls.append(kwargs["role"]),
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        orchestrator.cmd_run(
+            _run_config(
+                str(task_path),
+                auto_dispatch=True,
+                max_parallel_workers=2,
+                allow_dirty=True,
+            ),
+            single_round=True,
+            round_num=1,
+        )
+
+    assert exc.value.code == orchestrator.EXIT_VALIDATION_ERROR
+    assert final_reviewer_calls == []
+    state = json.loads(orchestrator.STATE_FILE.read_text(encoding="utf-8"))
+    assert state["outcome"] == "lane_review_rejected"
+    assert state["lanes"]["lane_core"]["review_decision"] == "approve"
+    assert state["lanes"]["lane_tests"]["review_decision"] == "changes_required"
+    assert "__integration__" not in state["lanes"]
 
 
 def test_single_round_with_lanes_falls_back_to_serial_when_parallel_disabled(tmp_path: Path, monkeypatch) -> None:
@@ -6918,8 +7180,8 @@ class TestCmdReport:
                     "task_id": "T-710",
                     "round": 1,
                     "lanes": {
-                        "lane_core": {"status": "completed"},
-                        "lane_docs": {"status": "blocked"},
+                        "lane_core": {"status": "completed", "review_decision": "approve"},
+                        "lane_docs": {"status": "blocked", "review_decision": "changes_required"},
                     },
                 },
                 ensure_ascii=False,
@@ -6932,8 +7194,8 @@ class TestCmdReport:
         out = capsys.readouterr().out
         assert "## Lane Runtime" in out
         assert "r1: lane_count=2 total_duration_ms=321 total_cost_cents=3" in out
-        assert "lane_core: status=completed backend=codex duration_ms=321 cost_cents=3 total_tokens=2100" in out
-        assert "lane_docs: status=blocked backend=<unknown> duration_ms=0 cost_cents=0 total_tokens=n/a" in out
+        assert "lane_core: status=completed backend=codex duration_ms=321 cost_cents=3 total_tokens=2100 review_decision=approve" in out
+        assert "lane_docs: status=blocked backend=<unknown> duration_ms=0 cost_cents=0 total_tokens=n/a review_decision=changes_required" in out
 
         orchestrator.cmd_report("T-710", output_format="json")
         out = capsys.readouterr().out
@@ -6943,6 +7205,11 @@ class TestCmdReport:
         assert payload["lane_runtime"][0]["lane_count"] == 2
         assert payload["lane_runtime"][0]["total_duration_ms"] == 321
         assert payload["lane_runtime"][0]["total_cost_cents"] == 3
+        lane_rows = payload["lane_runtime"][0]["lanes"]
+        assert {row["lane_id"]: row.get("review_decision") for row in lane_rows} == {
+            "lane_core": "approve",
+            "lane_docs": "changes_required",
+        }
 
     def test_uses_state_task_id_when_argument_omitted(self, tmp_path: Path, monkeypatch, capsys) -> None:
         _configure_loop_paths(monkeypatch, tmp_path)

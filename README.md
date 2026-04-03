@@ -144,8 +144,11 @@ When `lanes` run in parallel, Loop Kit adds an explicit internal integration lan
 - Lanes are merged in deterministic `lane_execution_order` (stage order, then task-card declaration order).
 - Merge policy: ordered replay of each lane commit chain (`base..lane_head`) via `git cherry-pick` onto the integration head (rebase-style replay).
 - Conflict handling is fail-safe: `cherry-pick --abort`, stop the round, and keep worktrees for debugging.
+- Optional lane reviewer fan-out: set `lane_review_parallel: true` in the task card to dispatch a reviewer for each completed lane before integration.
+- Lane reviewer gate is deterministic: every enabled lane review must return `approve` before integration can proceed.
 - The merged `work_report.json` includes `merge_provenance` (`base_sha`, merged head, lane order, per-lane commit replay, and integration acceptance checks).
 - Lane worker reports (`.loop/work_reports/{lane_id}.json`) include runtime telemetry: `lane_id`, `backend`, `status`, `duration_ms`, and optional token/cost fields (`input_tokens`, `output_tokens`, `total_tokens`, `cost_cents`).
+- Lane reviewer reports are stored at `.loop/review_reports/{lane_id}.json` when `lane_review_parallel` is enabled.
 
 ### Knowledge System
 
@@ -213,6 +216,7 @@ Resolution order: `CLI args > env vars > config file > built-in defaults`
 - `backend`: backend that executed the lane (`codex`/`claude`/`opencode`)
 - `status`: lane status from state/runtime (`completed`, `blocked`, `failed`, etc.)
 - `duration_ms`: end-to-end lane execution latency
+- Optional lane review fields: `review_decision`, `review_status`, `review_backend`, `review_duration_ms`, `review_blocking_issues`
 - Optional usage/cost fields: `input_tokens`, `output_tokens`, `total_tokens`, `cost_cents`
 
 Cost telemetry is deterministic and estimate-only:
