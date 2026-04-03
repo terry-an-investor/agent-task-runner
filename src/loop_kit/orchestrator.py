@@ -24,6 +24,7 @@ import argparse
 import ast
 import contextlib
 import difflib
+import fnmatch
 import hashlib
 import importlib.metadata
 import importlib.resources
@@ -3621,9 +3622,6 @@ def _build_task_packet(task_card: TaskCard, round_num: int) -> TaskPacket:
                 except ValueError:
                     continue
                 # Check if target relative path matches the pattern (e.g., "src/*.py")
-                # Use fnmatch to ensure target is within the pattern's directory scope
-                import fnmatch
-
                 if not fnmatch.fnmatch(target_rel, pattern):
                     continue
                 matched_path = target_rel
@@ -5022,9 +5020,11 @@ def _normalize_task_dependencies(task_card: dict, *, source: Path, task_id: str)
                 raise ConfigError(f"task card {source}: task_id '{task_id}' must not depend on itself")
             first_seen = seen.get(dependency_id)
             if first_seen is not None:
-                raise ConfigError(
-                    f"task card {source}: duplicate dependency '{dependency_id}' at '{location}' (first seen at '{first_seen}')"
+                msg = (
+                    f"task card {source}: duplicate dependency '{dependency_id}' "
+                    f"at '{location}' (first seen at '{first_seen}')"
                 )
+                raise ConfigError(msg)
             seen[dependency_id] = location
             dependencies.append(dependency_id)
     return dependencies
@@ -5211,7 +5211,7 @@ def _detect_graph_cycle(graph: dict[str, list[str]], *, first_node: str | None =
                 continue
             if dep in in_stack:
                 start_index = stack.index(dep)
-                return stack[start_index:] + [dep]
+                return [*stack[start_index:], dep]
             if dep not in visited:
                 cycle = visit(dep)
                 if cycle is not None:
