@@ -4404,6 +4404,63 @@ def test_cmd_run_resume_uses_existing_state_contract(tmp_path: Path, monkeypatch
     assert resume_state["base_sha"] == "base-sha"
 
 
+@pytest.mark.parametrize(
+    ("persisted_state", "expected_normalized"),
+    [
+        ("task_ready", orchestrator.STATE_AWAITING_WORK),
+        ("work_done", orchestrator.STATE_AWAITING_REVIEW),
+        ("review_done", orchestrator.STATE_DONE),
+    ],
+)
+def test_normalized_state_name_from_persisted_handles_legacy_aliases(
+    persisted_state: str, expected_normalized: str
+) -> None:
+    normalized = orchestrator._normalized_state_name_from_persisted({"state": persisted_state})
+    assert normalized == expected_normalized
+
+
+@pytest.mark.parametrize("legacy_state", ["task_ready", "work_done"])
+def test_cmd_run_resume_legacy_non_terminal_alias_keeps_resuming(
+    tmp_path: Path, monkeypatch, legacy_state: str
+) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+    task_path = tmp_path / "task_input.json"
+    task_path.write_text(
+        json.dumps({"task_id": "T-608", "goal": "resume legacy active alias"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    orchestrator.STATE_FILE.write_text(
+        json.dumps(
+            {
+                "state": legacy_state,
+                "round": 2,
+                "task_id": "T-608",
+                "base_sha": "base-sha",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    captured: dict[str, object] = {}
+
+    def fake_outer(**kwargs) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr(orchestrator, "_run_multi_round_via_subprocess", fake_outer)
+
+    orchestrator.cmd_run(
+        _run_config(str(task_path)),
+        single_round=False,
+        round_num=None,
+        resume=True,
+    )
+
+    resume_state = captured.get("resume_from_state")
+    assert isinstance(resume_state, dict)
+    assert resume_state["state"] == legacy_state
+    assert resume_state["round"] == 2
+
+
 def test_cmd_run_resume_done_approved_exits_cleanly(tmp_path: Path, monkeypatch, capsys) -> None:
     _configure_loop_paths(monkeypatch, tmp_path)
     task_path = tmp_path / "task_input.json"
