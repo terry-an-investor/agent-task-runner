@@ -565,9 +565,7 @@ def _parse_artifact_identity(payload: object, *, artifact_label: str) -> tuple[s
         raise ValidationError(f"{artifact_label} missing required non-empty field 'task_id'")
     raw_round = payload.get("round")
     if type(raw_round) is not int:
-        raise ValidationError(
-            f"{artifact_label} field 'round' must be int, got {type(raw_round).__name__}"
-        )
+        raise ValidationError(f"{artifact_label} field 'round' must be int, got {type(raw_round).__name__}")
     return raw_task_id, raw_round
 
 
@@ -2810,11 +2808,7 @@ def _knowledge_tokens(text: object) -> set[str]:
     if not isinstance(text, str):
         return set()
     normalized = re.sub(r"[^a-z0-9]+", " ", text.lower())
-    return {
-        token
-        for token in normalized.split()
-        if len(token) > 1 and token not in _KNOWLEDGE_STOPWORDS
-    }
+    return {token for token in normalized.split() if len(token) > 1 and token not in _KNOWLEDGE_STOPWORDS}
 
 
 def _knowledge_score(text: object, query_tokens: set[str]) -> int:
@@ -3593,19 +3587,41 @@ def _build_task_packet(task_card: TaskCard, round_num: int) -> TaskPacket:
             _log(f"Ignoring unsafe in_scope pattern: {item!r}")
             continue
         try:
-            matched = sorted(
-                p.relative_to(ROOT).as_posix()
-                for p in ROOT.glob(pattern)
-                if p.is_file() and _is_path_under_root(p, root_resolved)
-            )
+            glob_matched = [p for p in ROOT.glob(pattern) if p.is_file() and _is_path_under_root(p, root_resolved)]
         except (RuntimeError, OSError, ValueError):
             _log(f"Ignoring invalid in_scope pattern: {item!r}")
             continue
-        if matched:
-            for matched_path in matched:
-                if matched_path not in seen_target_files:
-                    target_files.append(matched_path)
-                    seen_target_files.add(matched_path)
+
+        # Process each matched file with symlink target check
+        for p in glob_matched:
+            try:
+                resolved = p.resolve()
+            except OSError:
+                continue  # Skip unreadable symlink target
+
+            # Ensure resolved path is still under repo root
+            if not resolved.is_relative_to(root_resolved):
+                continue
+
+            # For symlinks, require that the resolved (target) path also matches the pattern scope
+            if p.is_symlink():
+                try:
+                    target_rel = resolved.relative_to(ROOT).as_posix()
+                except ValueError:
+                    continue
+                # Check if target relative path matches the pattern (e.g., "src/*.py")
+                # Use fnmatch to ensure target is within the pattern's directory scope
+                import fnmatch
+
+                if not fnmatch.fnmatch(target_rel, pattern):
+                    continue
+                matched_path = target_rel
+            else:
+                matched_path = p.relative_to(ROOT).as_posix()
+
+            if matched_path not in seen_target_files:
+                target_files.append(matched_path)
+                seen_target_files.add(matched_path)
         else:
             try:
                 resolved = (ROOT / pattern).resolve()
@@ -4794,9 +4810,7 @@ def _normalize_task_dependencies(task_card: dict, *, source: Path, task_id: str)
             try:
                 _validate_task_id_arg(dependency_id)
             except ValidationError as e:
-                raise ConfigError(
-                    f"task card {source}: field '{location}' must be a valid task ID: {e}"
-                ) from e
+                raise ConfigError(f"task card {source}: field '{location}' must be a valid task ID: {e}") from e
             if task_id and dependency_id == task_id:
                 raise ConfigError(f"task card {source}: task_id '{task_id}' must not depend on itself")
             first_seen = seen.get(dependency_id)
@@ -4893,9 +4907,7 @@ def _normalize_task_lanes(task_card: dict, *, source: Path) -> list[TaskLane]:
                 raw_value=raw_owner,
             )
             if owner_path in seen_owner_paths:
-                raise ConfigError(
-                    f"task card {source}: duplicate owner_paths entry '{owner_path}' in lane '{lane_id}'"
-                )
+                raise ConfigError(f"task card {source}: duplicate owner_paths entry '{owner_path}' in lane '{lane_id}'")
             seen_owner_paths.add(owner_path)
             owner_paths.append(owner_path)
             owner_claims.append((owner_path, lane_id, owner_location))
@@ -4904,16 +4916,12 @@ def _normalize_task_lanes(task_card: dict, *, source: Path) -> list[TaskLane]:
         depends_on_raw = lane_raw.get("depends_on")
         if depends_on_raw is not None:
             if not isinstance(depends_on_raw, list):
-                raise ConfigError(
-                    f"task card {source}: field '{lane_location}.depends_on' must be a list of lane IDs"
-                )
+                raise ConfigError(f"task card {source}: field '{lane_location}.depends_on' must be a list of lane IDs")
             seen_depends_on: dict[str, str] = {}
             for dep_index, dep_raw in enumerate(depends_on_raw):
                 dep_location = f"{lane_location}.depends_on[{dep_index}]"
                 if not isinstance(dep_raw, str) or not dep_raw.strip():
-                    raise ConfigError(
-                        f"task card {source}: field '{dep_location}' must be a non-empty lane ID string"
-                    )
+                    raise ConfigError(f"task card {source}: field '{dep_location}' must be a non-empty lane ID string")
                 dep_id = dep_raw.strip()
                 if dep_id == lane_id:
                     raise ConfigError(f"task card {source}: lane '{lane_id}' must not depend on itself")
@@ -4963,9 +4971,7 @@ def _normalize_task_lanes(task_card: dict, *, source: Path) -> list[TaskLane]:
         lane = lanes_by_id[lane_id]
         for dep_id in lane.get("depends_on", []):
             if dep_id not in lanes_by_id:
-                raise ConfigError(
-                    f"task card {source}: lane '{lane_id}' depends_on unknown lane_id '{dep_id}'"
-                )
+                raise ConfigError(f"task card {source}: lane '{lane_id}' depends_on unknown lane_id '{dep_id}'")
 
     claim_count = len(owner_claims)
     for first_index in range(claim_count):
@@ -6060,9 +6066,7 @@ def _load_archived_round_artifact(
 ) -> object:
     path = _archive_round_artifact_path(task_id, round_num, artifact_name, paths=paths)
     if not path.exists():
-        raise ValidationError(
-            f"Missing archived artifact for task_id={task_id} round={round_num}: {path.name}"
-        )
+        raise ValidationError(f"Missing archived artifact for task_id={task_id} round={round_num}: {path.name}")
     try:
         payload = _load_json_with_limit(path, label=path.name)
     except (ConfigError, json.JSONDecodeError, OSError) as e:
@@ -6098,9 +6102,7 @@ def cmd_diff(
         if base_round == head_round:
             raise ValidationError("base_round and head_round must differ")
         if artifact != "all" and artifact not in _ROUND_ARTIFACT_NAMES:
-            raise ValidationError(
-                f"artifact must be one of: all, {', '.join(_ROUND_ARTIFACT_NAMES)}; got {artifact!r}"
-            )
+            raise ValidationError(f"artifact must be one of: all, {', '.join(_ROUND_ARTIFACT_NAMES)}; got {artifact!r}")
 
         archive_dir = _task_archive_dir(task_id, paths=resolved_paths)
         if not archive_dir.exists():
@@ -6848,14 +6850,11 @@ def _auto_dispatch_role(
         raise
 
     normalized_dispatch_session_id = SessionManager.normalize_session_id(dispatch_session_id)
-    if (
-        normalized_dispatch_session_id is not None
-        and session_manager.store_session(
-            current_state,
-            backend,
-            normalized_dispatch_session_id,
-            round_num=round_num,
-        )
+    if normalized_dispatch_session_id is not None and session_manager.store_session(
+        current_state,
+        backend,
+        normalized_dispatch_session_id,
+        round_num=round_num,
     ):
         _save_state(current_state)
     return artifact
