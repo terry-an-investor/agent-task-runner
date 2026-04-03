@@ -170,6 +170,9 @@ The feed keeps backward-compatible dispatch events (`dispatch_start`, `dispatch_
   - `context_to_work_ms = t(first_work_action) - t(first_stdout)`
   - `work_to_artifact_ms = t(dispatch_artifact_written) - t(first_work_action)`
   - `total_ms = t(dispatch_artifact_written) - t(dispatch_start)`
+  - within `work_to_artifact_ms`, classified subphases:
+    - `read_ms`, `search_ms`, `edit_ms`, `test_ms`, `unknown_ms`
+    - `read_count`, `search_count`, `edit_count`, `test_count`, `unknown_count`
 
 Interpretation boundaries:
 
@@ -177,8 +180,18 @@ Interpretation boundaries:
 - `context_to_work_ms` captures initial context understanding before real execution begins.
 - `work_to_artifact_ms` captures execution-to-artifact completion.
 - If a boundary is missing (for example no concrete work signal), the missing segment is emitted as `null` while `total_ms` is still reported.
+- Subphase classification is deterministic from streamed backend action events:
+  - `read`: file-read tools/commands
+  - `search`: grep/glob/web-search style tools/commands
+  - `edit`: file-change events and write/edit tools/commands
+  - `test`: test-running commands (for example `pytest`, `go test`, `npm test`)
+  - `unknown`: actionable events that do not match the above
 
-Use `loop dispatch-metrics` to aggregate these events directly from `.loop/logs/feed.jsonl` with `count`, `missing`, `avg_ms`, `p50_ms`, and `p95_ms` per segment.
+`loop dispatch-metrics` now prints:
+- phase latency table (`startup/context_to_work/work_to_artifact/total`)
+- work subphase table (`read/search/edit/test/unknown`)
+
+Use `loop dispatch-metrics` to aggregate these events directly from `.loop/logs/feed.jsonl` with `count`, `missing`, `avg_ms`, `p50_ms`, and `p95_ms` per segment, and use `--task-id`/`--role` filters to scope both tables.
 
 Interpretation limits for the command output:
 
@@ -186,6 +199,8 @@ Interpretation limits for the command output:
 - `missing` counts rows where the segment is null, absent, or non-numeric.
 - `p50_ms`/`p95_ms` use nearest-rank percentiles on the filtered rows.
 - The report only reflects events present in the local feed file; it does not infer missing telemetry from other artifacts.
+- For subphases, durations are bounded by observed action events; missing/truncated boundaries degrade to deterministic partial accounting rather than crashes.
+- `unknown_ms` and `unknown_count` are expected when commands/tools are not recognized by current classifiers.
 
 ### Key JSON schemas
 

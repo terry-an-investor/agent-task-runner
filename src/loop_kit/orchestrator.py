@@ -228,6 +228,8 @@ _WAIT_SAFETY_CAP_SEC = 86400  # 24h absolute cap in _wait_for_file
 _SESSION_ROLES = ("worker", "reviewer")
 _DISPATCH_PHASE_ROLE_CHOICES = ("all", "worker", "reviewer")
 _DISPATCH_PHASE_METRIC_NAMES = ("startup_ms", "context_to_work_ms", "work_to_artifact_ms", "total_ms")
+_DISPATCH_SUBPHASE_NAMES = ("read", "search", "edit", "test", "unknown")
+_DISPATCH_SUBPHASE_METRIC_NAMES = tuple(f"{name}_ms" for name in _DISPATCH_SUBPHASE_NAMES)
 EXIT_OK = 0
 EXIT_GENERAL_ERROR = 1
 EXIT_TIMEOUT = 2
@@ -1204,6 +1206,193 @@ def _extract_read_filename(command_text: str) -> str | None:
     return name or cleaned
 
 
+DispatchActionCategory = Literal["read", "search", "edit", "test", "unknown"]
+
+
+def _split_command_tokens(command_text: str) -> list[str]:
+    command = _strip_powershell_wrapper(command_text)
+    if not command:
+        return []
+    try:
+        import shlex
+
+        tokens = shlex.split(command, posix=False)
+    except ValueError:
+        tokens = command.split()
+    normalized = [_strip_outer_quotes(token).strip() for token in tokens]
+    normalized = [token for token in normalized if token]
+    if normalized and normalized[0] == "&":
+        normalized = normalized[1:]
+    return [token.lower() for token in normalized]
+
+
+def _command_looks_like_test(tokens: list[str]) -> bool:
+    if not tokens:
+        return False
+    token_set = set(tokens)
+    if token_set.intersection(
+        {
+            "pytest",
+            "unittest",
+            "nosetests",
+            "tox",
+            "nox",
+            "jest",
+            "vitest",
+            "ctest",
+            "rspec",
+            "phpunit",
+        }
+    ):
+        return True
+    if tokens[0] in {"go", "cargo", "gradle", "gradlew", "mvn"} and "test" in token_set:
+        return True
+    if tokens[0] in {"npm", "pnpm", "yarn", "bun"} and "test" in tokens[1:]:
+        return True
+    return False
+
+
+def _command_looks_like_search(tokens: list[str]) -> bool:
+    if not tokens:
+        return False
+    first = tokens[0]
+    if first in {"rg", "ripgrep", "grep", "ag", "ack", "findstr", "select-string", "fd"}:
+        return True
+    if first == "git" and len(tokens) > 1 and tokens[1] == "grep":
+        return True
+    return False
+
+
+def _command_looks_like_read(tokens: list[str]) -> bool:
+    if not tokens:
+        return False
+    first = tokens[0]
+    return first in {"cat", "type", "get-content", "more", "less", "head", "tail", "bat"}
+
+
+def _command_looks_like_edit(tokens: list[str]) -> bool:
+    if not tokens:
+        return False
+    first = tokens[0]
+    if first in {
+        "apply_patch",
+        "cp",
+        "copy-item",
+        "mv",
+        "move-item",
+        "rm",
+        "remove-item",
+        "del",
+        "touch",
+        "new-item",
+        "set-content",
+        "add-content",
+        "tee",
+    }:
+        return True
+    if first == "sed" and any(token in {"-i", "--in-place"} for token in tokens[1:]):
+        return True
+    if any(token in {">", ">>", "1>", "1>>", "2>", "2>>"} for token in tokens):
+        return True
+    return False
+
+
+def _classify_command_execution_category(command_text: str) -> DispatchActionCategory:
+    tokens = _split_command_tokens(command_text)
+    if _command_looks_like_test(tokens):
+        return "test"
+    if _command_looks_like_search(tokens):
+        return "search"
+    if _command_looks_like_read(tokens):
+        return "read"
+    if _command_looks_like_edit(tokens):
+        return "edit"
+    return "unknown"
+
+
+def _classify_tool_use_category(tool_name: str, tool_input: object) -> DispatchActionCategory:
+    if tool_name in _TOOL_READ_NAMES:
+        return "read"
+    if tool_name in _TOOL_SEARCH_NAMES or tool_name in _TOOL_FETCH_NAMES:
+        return "search"
+    if tool_name in _TOOL_EDIT_NAMES or tool_name in _TOOL_WRITE_NAMES:
+        return "edit"
+    if tool_name in _TOOL_BASH_NAMES:
+        command_text = ""
+        if isinstance(tool_input, dict):
+            command_text_raw = tool_input.get("command")
+            if isinstance(command_text_raw, str):
+                command_text = command_text_raw
+        return _classify_command_execution_category(command_text)
+    return "unknown"
+
+
+def _classify_dispatch_action(backend: str, line: str) -> dict[str, object] | None:
+    try:
+        payload = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    backend_key = backend.strip().lower()
+    if backend_key == BACKEND_CODEX:
+        payload_type = str(payload.get("type", "")).strip()
+        if payload_type == "file_change":
+            return {"category": "edit", "signal": "file_change"}
+        if payload_type != "item.started":
+            return None
+        item = payload.get("item")
+        if not isinstance(item, dict):
+            return None
+        item_type = str(item.get("type", "")).strip()
+        if item_type == "file_change":
+            return {"category": "edit", "signal": "item.started", "item_type": item_type}
+        if item_type != "command_execution":
+            return None
+        command = _extract_command_summary(item)
+        return {
+            "category": _classify_command_execution_category(command),
+            "signal": "item.started",
+            "item_type": item_type,
+        }
+
+    if backend_key == BACKEND_CLAUDE:
+        if payload.get("type") != "assistant":
+            return None
+        message = payload.get("message")
+        if not isinstance(message, dict):
+            return None
+        for block in message.get("content", []):
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            tool_name = str(block.get("name", "")).strip()
+            return {
+                "category": _classify_tool_use_category(tool_name, block.get("input")),
+                "signal": "assistant.tool_use",
+                "tool_name": tool_name,
+            }
+        return None
+
+    if backend_key == BACKEND_OPENCODE:
+        if payload.get("type") != "tool_use":
+            return None
+        part = payload.get("part")
+        if not isinstance(part, dict):
+            return None
+        state = part.get("state")
+        if not isinstance(state, dict) or state.get("status") == "error":
+            return None
+        tool_name = str(part.get("tool", "")).strip()
+        return {
+            "category": _classify_tool_use_category(tool_name, state.get("input")),
+            "signal": "tool_use",
+            "tool_name": tool_name,
+        }
+
+    return None
+
+
 def _stream_dispatch_stdout_line(
     role: str,
     backend: str,
@@ -2008,6 +2197,22 @@ def _run_auto_dispatch(
     first_stdout_ms: int | None = None
     first_work_action_ms: int | None = None
     first_meaningful_summary_ms: int | None = None
+    subphase_ms: dict[DispatchActionCategory, int] = {
+        "read": 0,
+        "search": 0,
+        "edit": 0,
+        "test": 0,
+        "unknown": 0,
+    }
+    subphase_counts: dict[DispatchActionCategory, int] = {
+        "read": 0,
+        "search": 0,
+        "edit": 0,
+        "test": 0,
+        "unknown": 0,
+    }
+    active_subphase: DispatchActionCategory | None = None
+    active_subphase_started_ms: int | None = None
     _log(f"Auto-dispatch start: role={role} backend={backend} retries={retry_count} retry_base_sec={retry_base_sec}")
     if heartbeat_enabled:
         _start_auto_dispatch_heartbeat(
@@ -2053,6 +2258,8 @@ def _run_auto_dispatch(
             def _on_stdout_line(raw_line: str) -> None:
                 nonlocal first_stdout_ms
                 nonlocal first_work_action_ms
+                nonlocal active_subphase
+                nonlocal active_subphase_started_ms
 
                 if first_stdout_ms is None:
                     first_stdout_ms = _elapsed_ms_now()
@@ -2068,9 +2275,21 @@ def _run_auto_dispatch(
                             latency_ms=first_stdout_ms,
                         ),
                     )
+                line = raw_line.rstrip("\r\n")
+                action = _classify_dispatch_action(backend, line)
+                if action is not None:
+                    category_raw = action.get("category")
+                    if isinstance(category_raw, str) and category_raw in _DISPATCH_SUBPHASE_NAMES:
+                        category = cast(DispatchActionCategory, category_raw)
+                        action_ms = _elapsed_ms_now()
+                        if active_subphase is not None and active_subphase_started_ms is not None:
+                            subphase_ms[active_subphase] += max(0, action_ms - active_subphase_started_ms)
+                        active_subphase = category
+                        active_subphase_started_ms = action_ms
+                        subphase_counts[category] += 1
                 if first_work_action_ms is not None:
                     return
-                signal_data = _extract_dispatch_work_signal(role, backend, raw_line.rstrip("\r\n"))
+                signal_data = _extract_dispatch_work_signal(role, backend, line)
                 if signal_data is None:
                     return
                 first_work_action_ms = _elapsed_ms_now()
@@ -2084,6 +2303,10 @@ def _run_auto_dispatch(
                     latency_ms=first_work_action_ms,
                 )
                 payload.update(signal_data)
+                if action is not None:
+                    action_category = action.get("category")
+                    if isinstance(action_category, str) and action_category in _DISPATCH_SUBPHASE_NAMES:
+                        payload["action_category"] = action_category
                 _feed_event(
                     FEED_DISPATCH_FIRST_WORK_ACTION,
                     data=payload,
@@ -2268,6 +2491,10 @@ def _run_auto_dispatch(
                     telemetry["first_work_action_ms"] = first_work_action_ms
                     telemetry["first_meaningful_action_ms"] = first_meaningful_summary_ms
                     telemetry["dispatch_started_at"] = dispatch_started_at
+                    telemetry["subphase_ms"] = dict(subphase_ms)
+                    telemetry["subphase_counts"] = dict(subphase_counts)
+                    telemetry["active_subphase"] = active_subphase
+                    telemetry["active_subphase_started_ms"] = active_subphase_started_ms
                 _log(f"Auto-dispatch done: role={role} backend={backend} attempts={attempt}")
                 return session_id
 
@@ -2569,12 +2796,61 @@ def _coerce_non_negative_ms(value: object) -> float | None:
     return parsed
 
 
+def _coerce_non_negative_int(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if not isinstance(value, int):
+        return None
+    if value < 0:
+        return None
+    return value
+
+
 def _nearest_rank_percentile(values: list[float], percentile: float) -> float | None:
     if not values:
         return None
     ordered = sorted(values)
     rank = max(1, int(math.ceil(percentile * len(ordered))))
     return ordered[min(len(ordered) - 1, rank - 1)]
+
+
+def _dispatch_subphase_metrics_from_telemetry(
+    telemetry: dict[str, object],
+    *,
+    artifact_written_latency_ms: int,
+) -> dict[str, int | None]:
+    phase_ms: dict[str, int] = {name: 0 for name in _DISPATCH_SUBPHASE_NAMES}
+    phase_counts: dict[str, int] = {name: 0 for name in _DISPATCH_SUBPHASE_NAMES}
+
+    raw_phase_ms = telemetry.get("subphase_ms")
+    if isinstance(raw_phase_ms, dict):
+        for phase_name in _DISPATCH_SUBPHASE_NAMES:
+            value = _coerce_non_negative_int(raw_phase_ms.get(phase_name))
+            if value is not None:
+                phase_ms[phase_name] = value
+
+    raw_phase_counts = telemetry.get("subphase_counts")
+    if isinstance(raw_phase_counts, dict):
+        for phase_name in _DISPATCH_SUBPHASE_NAMES:
+            value = _coerce_non_negative_int(raw_phase_counts.get(phase_name))
+            if value is not None:
+                phase_counts[phase_name] = value
+
+    active_phase = telemetry.get("active_subphase")
+    active_phase_started_ms = _coerce_non_negative_int(telemetry.get("active_subphase_started_ms"))
+    if (
+        isinstance(active_phase, str)
+        and active_phase in _DISPATCH_SUBPHASE_NAMES
+        and active_phase_started_ms is not None
+    ):
+        phase_ms[active_phase] += max(0, artifact_written_latency_ms - active_phase_started_ms)
+
+    metrics: dict[str, int | None] = {}
+    for phase_name in _DISPATCH_SUBPHASE_NAMES:
+        count_value = phase_counts[phase_name]
+        metrics[f"{phase_name}_count"] = count_value
+        metrics[f"{phase_name}_ms"] = phase_ms[phase_name] if count_value > 0 else None
+    return metrics
 
 
 def _collect_dispatch_phase_metrics_events(
@@ -2614,11 +2890,12 @@ def _collect_dispatch_phase_metrics_events(
     return rows
 
 
-def _summarize_dispatch_phase_metrics(
+def _summarize_named_dispatch_metrics(
     rows: list[dict[str, object]],
+    metric_names: tuple[str, ...],
 ) -> dict[str, dict[str, int | float | None]]:
     summary: dict[str, dict[str, int | float | None]] = {}
-    for metric_name in _DISPATCH_PHASE_METRIC_NAMES:
+    for metric_name in metric_names:
         values: list[float] = []
         missing = 0
         for row in rows:
@@ -2636,6 +2913,18 @@ def _summarize_dispatch_phase_metrics(
             "p95": _nearest_rank_percentile(values, 0.95),
         }
     return summary
+
+
+def _summarize_dispatch_phase_metrics(
+    rows: list[dict[str, object]],
+) -> dict[str, dict[str, int | float | None]]:
+    return _summarize_named_dispatch_metrics(rows, _DISPATCH_PHASE_METRIC_NAMES)
+
+
+def _summarize_dispatch_subphase_metrics(
+    rows: list[dict[str, object]],
+) -> dict[str, dict[str, int | float | None]]:
+    return _summarize_named_dispatch_metrics(rows, _DISPATCH_SUBPHASE_METRIC_NAMES)
 
 
 def _format_metric_ms(value: float | None) -> str:
@@ -4566,6 +4855,7 @@ def cmd_dispatch_metrics(
         role=cast(Literal["all", "worker", "reviewer"], normalized_role),
     )
     summary = _summarize_dispatch_phase_metrics(rows)
+    subphase_summary = _summarize_dispatch_subphase_metrics(rows)
     print("Dispatch phase metrics report")
     print(f"Feed file: {feed_path}")
     print(f"Filters: task_id={normalized_task_id or '<all>'} role={normalized_role}")
@@ -4583,6 +4873,20 @@ def cmd_dispatch_metrics(
         for metric_name in _DISPATCH_PHASE_METRIC_NAMES
     ]
     print(_render_table(["metric", "count", "missing", "avg_ms", "p50_ms", "p95_ms"], table_rows))
+    print()
+    print("Work subphase breakdown (within work_to_artifact)")
+    subphase_rows = [
+        [
+            metric_name,
+            str(cast(int, subphase_summary[metric_name]["count"])),
+            str(cast(int, subphase_summary[metric_name]["missing"])),
+            _format_metric_ms(cast(float | None, subphase_summary[metric_name]["avg"])),
+            _format_metric_ms(cast(float | None, subphase_summary[metric_name]["p50"])),
+            _format_metric_ms(cast(float | None, subphase_summary[metric_name]["p95"])),
+        ]
+        for metric_name in _DISPATCH_SUBPHASE_METRIC_NAMES
+    ]
+    print(_render_table(["metric", "count", "missing", "avg_ms", "p50_ms", "p95_ms"], subphase_rows))
     if not rows:
         print()
         print("No matching dispatch_phase_metrics events.")
@@ -4990,6 +5294,10 @@ def _auto_dispatch_role(
         startup_ms = first_stdout_ms if isinstance(first_stdout_ms, int) else None
         first_work_action_ms = dispatch_metrics.get("first_work_action_ms")
         work_ms = first_work_action_ms if isinstance(first_work_action_ms, int) else None
+        subphase_metrics = _dispatch_subphase_metrics_from_telemetry(
+            dispatch_metrics,
+            artifact_written_latency_ms=artifact_written_latency_ms,
+        )
         _feed_event(
             FEED_DISPATCH_PHASE_METRICS,
             data=_feed_data(
@@ -5002,6 +5310,7 @@ def _auto_dispatch_role(
                 context_to_work_ms=_segment_ms(startup_ms, work_ms),
                 work_to_artifact_ms=_segment_ms(work_ms, artifact_written_latency_ms),
                 total_ms=artifact_written_latency_ms,
+                **subphase_metrics,
             ),
         )
     except PermanentDispatchError:

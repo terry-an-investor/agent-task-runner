@@ -1485,6 +1485,10 @@ def test_auto_dispatch_role_emits_dispatch_phase_metrics_with_complete_boundarie
             telemetry["first_stdout_ms"] = 120
             telemetry["first_work_action_ms"] = 420
             telemetry["first_meaningful_action_ms"] = 380
+            telemetry["subphase_ms"] = {"read": 80, "search": 120, "edit": 150, "test": 50, "unknown": 0}
+            telemetry["subphase_counts"] = {"read": 1, "search": 1, "edit": 1, "test": 1, "unknown": 0}
+            telemetry["active_subphase"] = "edit"
+            telemetry["active_subphase_started_ms"] = 900
         return "sid-metric"
 
     def fake_dispatch_with_artifact_fallback(
@@ -1528,6 +1532,16 @@ def test_auto_dispatch_role_emits_dispatch_phase_metrics_with_complete_boundarie
     assert payload["context_to_work_ms"] == 300
     assert payload["work_to_artifact_ms"] == 580
     assert payload["total_ms"] == 1000
+    assert payload["read_ms"] == 80
+    assert payload["search_ms"] == 120
+    assert payload["edit_ms"] == 250
+    assert payload["test_ms"] == 50
+    assert payload["unknown_ms"] is None
+    assert payload["read_count"] == 1
+    assert payload["search_count"] == 1
+    assert payload["edit_count"] == 1
+    assert payload["test_count"] == 1
+    assert payload["unknown_count"] == 0
     assert payload["session_id"] == "sid-metric"
     assert payload["task_id"] == "T-715"
     assert payload["round"] == 2
@@ -1591,6 +1605,16 @@ def test_auto_dispatch_role_phase_metrics_graceful_when_work_boundary_missing(mo
     assert payload["context_to_work_ms"] is None
     assert payload["work_to_artifact_ms"] is None
     assert payload["total_ms"] == 899
+    assert payload["read_ms"] is None
+    assert payload["search_ms"] is None
+    assert payload["edit_ms"] is None
+    assert payload["test_ms"] is None
+    assert payload["unknown_ms"] is None
+    assert payload["read_count"] == 0
+    assert payload["search_count"] == 0
+    assert payload["edit_count"] == 0
+    assert payload["test_count"] == 0
+    assert payload["unknown_count"] == 0
 
 
 def test_auto_dispatch_role_dispatch_event_ordering_includes_artifact_boundary(monkeypatch) -> None:
@@ -2353,6 +2377,70 @@ def test_run_auto_dispatch_first_work_action_ignores_summary_only_lines(monkeypa
     assert work_events[0]["signal"] == "item.started"
     assert work_events[0]["item_type"] == "command_execution"
     assert isinstance(work_events[0]["latency_ms"], int)
+
+
+def test_classify_dispatch_action_categorizes_codex_event_payloads() -> None:
+    search_line = json.dumps(
+        {
+            "type": "item.started",
+            "item": {"type": "command_execution", "command": "rg --line-number dispatch_phase_metrics src/loop_kit/orchestrator.py"},
+        },
+        ensure_ascii=False,
+    )
+    read_line = json.dumps(
+        {
+            "type": "item.started",
+            "item": {"type": "command_execution", "command": "Get-Content README.md"},
+        },
+        ensure_ascii=False,
+    )
+    edit_line = json.dumps(
+        {
+            "type": "item.started",
+            "item": {"type": "file_change", "changes": [{"path": "src/loop_kit/orchestrator.py"}]},
+        },
+        ensure_ascii=False,
+    )
+    test_line = json.dumps(
+        {
+            "type": "item.started",
+            "item": {"type": "command_execution", "command": "uv run --group dev pytest tests/test_orchestrator.py"},
+        },
+        ensure_ascii=False,
+    )
+    unknown_line = json.dumps(
+        {
+            "type": "item.started",
+            "item": {"type": "command_execution", "command": "git status --short"},
+        },
+        ensure_ascii=False,
+    )
+
+    assert orchestrator._classify_dispatch_action(orchestrator.BACKEND_CODEX, search_line) == {
+        "category": "search",
+        "signal": "item.started",
+        "item_type": "command_execution",
+    }
+    assert orchestrator._classify_dispatch_action(orchestrator.BACKEND_CODEX, read_line) == {
+        "category": "read",
+        "signal": "item.started",
+        "item_type": "command_execution",
+    }
+    assert orchestrator._classify_dispatch_action(orchestrator.BACKEND_CODEX, edit_line) == {
+        "category": "edit",
+        "signal": "item.started",
+        "item_type": "file_change",
+    }
+    assert orchestrator._classify_dispatch_action(orchestrator.BACKEND_CODEX, test_line) == {
+        "category": "test",
+        "signal": "item.started",
+        "item_type": "command_execution",
+    }
+    assert orchestrator._classify_dispatch_action(orchestrator.BACKEND_CODEX, unknown_line) == {
+        "category": "unknown",
+        "signal": "item.started",
+        "item_type": "command_execution",
+    }
 
 
 def test_run_auto_dispatch_emits_first_meaningful_action_metric(monkeypatch) -> None:
@@ -5082,6 +5170,11 @@ class TestDispatchMetricsReport:
                     "context_to_work_ms": 300,
                     "work_to_artifact_ms": 500,
                     "total_ms": 600,
+                    "read_ms": 200,
+                    "search_ms": 100,
+                    "edit_ms": 150,
+                    "test_ms": 50,
+                    "unknown_ms": 0,
                 },
             },
             {
@@ -5093,6 +5186,11 @@ class TestDispatchMetricsReport:
                     "context_to_work_ms": None,
                     "work_to_artifact_ms": None,
                     "total_ms": 700,
+                    "read_ms": None,
+                    "search_ms": None,
+                    "edit_ms": 220,
+                    "test_ms": None,
+                    "unknown_ms": 80,
                 },
             },
             {
@@ -5104,6 +5202,11 @@ class TestDispatchMetricsReport:
                     "context_to_work_ms": 300,
                     "work_to_artifact_ms": 500,
                     "total_ms": 800,
+                    "read_ms": 240,
+                    "search_ms": 60,
+                    "edit_ms": 200,
+                    "test_ms": 90,
+                    "unknown_ms": None,
                 },
             },
             {
@@ -5115,6 +5218,11 @@ class TestDispatchMetricsReport:
                     "context_to_work_ms": 20,
                     "work_to_artifact_ms": 70,
                     "total_ms": 140,
+                    "read_ms": 10,
+                    "search_ms": 5,
+                    "edit_ms": 40,
+                    "test_ms": 15,
+                    "unknown_ms": 0,
                 },
             },
             {"event": "dispatch_start", "data": {"task_id": "T-716", "role": "worker"}},
@@ -5150,6 +5258,37 @@ class TestDispatchMetricsReport:
         assert summary["total_ms"]["p50"] == 700
         assert summary["total_ms"]["p95"] == 800
 
+        subphase_summary = orchestrator._summarize_dispatch_subphase_metrics(rows)
+        assert subphase_summary["read_ms"]["count"] == 2
+        assert subphase_summary["read_ms"]["missing"] == 1
+        assert subphase_summary["read_ms"]["avg"] == 220
+        assert subphase_summary["read_ms"]["p50"] == 200
+        assert subphase_summary["read_ms"]["p95"] == 240
+
+        assert subphase_summary["search_ms"]["count"] == 2
+        assert subphase_summary["search_ms"]["missing"] == 1
+        assert subphase_summary["search_ms"]["avg"] == 80
+        assert subphase_summary["search_ms"]["p50"] == 60
+        assert subphase_summary["search_ms"]["p95"] == 100
+
+        assert subphase_summary["edit_ms"]["count"] == 3
+        assert subphase_summary["edit_ms"]["missing"] == 0
+        assert subphase_summary["edit_ms"]["avg"] == pytest.approx(190.0)
+        assert subphase_summary["edit_ms"]["p50"] == 200
+        assert subphase_summary["edit_ms"]["p95"] == 220
+
+        assert subphase_summary["test_ms"]["count"] == 2
+        assert subphase_summary["test_ms"]["missing"] == 1
+        assert subphase_summary["test_ms"]["avg"] == 70
+        assert subphase_summary["test_ms"]["p50"] == 50
+        assert subphase_summary["test_ms"]["p95"] == 90
+
+        assert subphase_summary["unknown_ms"]["count"] == 2
+        assert subphase_summary["unknown_ms"]["missing"] == 1
+        assert subphase_summary["unknown_ms"]["avg"] == 40
+        assert subphase_summary["unknown_ms"]["p50"] == 0
+        assert subphase_summary["unknown_ms"]["p95"] == 80
+
     def test_cli_dispatch_metrics_filters_task_id_and_role(self, tmp_path: Path, monkeypatch, capsys) -> None:
         _configure_loop_paths(monkeypatch, tmp_path)
         feed_entries = [
@@ -5162,6 +5301,11 @@ class TestDispatchMetricsReport:
                     "context_to_work_ms": 20,
                     "work_to_artifact_ms": 30,
                     "total_ms": 60,
+                    "read_ms": 8,
+                    "search_ms": 4,
+                    "edit_ms": 18,
+                    "test_ms": None,
+                    "unknown_ms": 0,
                 },
             },
             {
@@ -5173,6 +5317,11 @@ class TestDispatchMetricsReport:
                     "context_to_work_ms": None,
                     "work_to_artifact_ms": None,
                     "total_ms": 120,
+                    "read_ms": 20,
+                    "search_ms": 35,
+                    "edit_ms": 50,
+                    "test_ms": None,
+                    "unknown_ms": 15,
                 },
             },
             {
@@ -5184,6 +5333,11 @@ class TestDispatchMetricsReport:
                     "context_to_work_ms": 40,
                     "work_to_artifact_ms": 80,
                     "total_ms": 210,
+                    "read_ms": 30,
+                    "search_ms": 25,
+                    "edit_ms": 20,
+                    "test_ms": 5,
+                    "unknown_ms": 0,
                 },
             },
         ]
@@ -5207,6 +5361,13 @@ class TestDispatchMetricsReport:
         context_row = next(line for line in out.splitlines() if line.strip().startswith("context_to_work_ms"))
         context_cells = [cell.strip() for cell in context_row.split("|")]
         assert context_cells == ["context_to_work_ms", "0", "1", "n/a", "n/a", "n/a"]
+        assert "Work subphase breakdown (within work_to_artifact)" in out
+        read_row = next(line for line in out.splitlines() if line.strip().startswith("read_ms"))
+        read_cells = [cell.strip() for cell in read_row.split("|")]
+        assert read_cells == ["read_ms", "1", "0", "20.0", "20.0", "20.0"]
+        test_row = next(line for line in out.splitlines() if line.strip().startswith("test_ms"))
+        test_cells = [cell.strip() for cell in test_row.split("|")]
+        assert test_cells == ["test_ms", "0", "1", "n/a", "n/a", "n/a"]
 
     def test_dispatch_metrics_no_matching_data_is_deterministic(self, tmp_path: Path, monkeypatch, capsys) -> None:
         _configure_loop_paths(monkeypatch, tmp_path)
@@ -5229,6 +5390,9 @@ class TestDispatchMetricsReport:
         startup_row = next(line for line in out.splitlines() if line.strip().startswith("startup_ms"))
         startup_cells = [cell.strip() for cell in startup_row.split("|")]
         assert startup_cells == ["startup_ms", "0", "0", "n/a", "n/a", "n/a"]
+        read_row = next(line for line in out.splitlines() if line.strip().startswith("read_ms"))
+        read_cells = [cell.strip() for cell in read_row.split("|")]
+        assert read_cells == ["read_ms", "0", "0", "n/a", "n/a", "n/a"]
 
 
 class TestCmdExtractDiff:
