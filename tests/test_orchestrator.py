@@ -261,7 +261,10 @@ def test_main_init_creates_prompt_templates_in_loop_dir(tmp_path: Path, monkeypa
     orchestrator.main()
 
     templates_dir = (tmp_path / "my-loop" / "templates").resolve()
+    assert (templates_dir / "worker_prompt.txt").exists()
     assert (templates_dir / "reviewer_prompt.txt").exists()
+    worker_template = (templates_dir / "worker_prompt.txt").read_text(encoding="utf-8")
+    assert "{knowledge_section}" in worker_template
     module_map_path = (tmp_path / "my-loop" / "context" / "module_map.json").resolve()
     module_map = json.loads(module_map_path.read_text(encoding="utf-8"))
     assert module_map["files"] == []
@@ -1088,6 +1091,8 @@ def test_worker_prompt_round1_includes_task_card_section(monkeypatch) -> None:
             return "AGENTS_CONTENT"
         if path.name == "code-writer.md":
             return "CODE_WRITER_CONTENT"
+        if path == orchestrator._worker_prompt_template_path():
+            return orchestrator.DEFAULT_WORKER_PROMPT_TEMPLATE
         return None
 
     def fake_read_json(path: Path) -> dict | None:
@@ -1204,6 +1209,8 @@ def test_worker_prompt_round1_unchanged_includes_agents_and_function_index(monke
             return "AGENTS_CONTENT"
         if "code-writer.md" in str(path):
             return "CODE_WRITER_CONTENT"
+        if path == orchestrator._worker_prompt_template_path():
+            return orchestrator.DEFAULT_WORKER_PROMPT_TEMPLATE
         return None
 
     def fake_read_json(path: Path) -> dict | None:
@@ -1278,6 +1285,74 @@ def test_worker_prompt_round2_no_fix_list(monkeypatch) -> None:
     assert "AGENTS_CONTENT" not in prompt
     assert "=== FIX LIST (round 2) ===" in prompt
     assert "fixes:\n- <none>" in prompt
+
+
+def test_worker_prompt_loads_template_when_file_exists(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+    (tmp_path / "AGENTS.md").write_text("AGENTS_CONTENT", encoding="utf-8")
+    role_path = tmp_path / "docs" / "roles" / "code-writer.md"
+    role_path.parent.mkdir(parents=True, exist_ok=True)
+    role_path.write_text("CODE_WRITER_CONTENT", encoding="utf-8")
+    orchestrator.TASK_CARD.write_text(
+        json.dumps(
+            {
+                "task_id": "T-611",
+                "goal": "Use custom template",
+                "in_scope": [],
+                "out_of_scope": [],
+                "acceptance_criteria": [],
+                "constraints": [],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    template_path = orchestrator._worker_prompt_template_path()
+    template_path.parent.mkdir(parents=True, exist_ok=True)
+    template_path.write_text(
+        "CUSTOM {task_id} {round_num}\n{agents_md}\n{role_md}\n{task_card_section}{prior_context_section}",
+        encoding="utf-8",
+    )
+
+    prompt = orchestrator._worker_prompt("T-611", 1)
+
+    assert prompt.startswith("CUSTOM T-611 1")
+    assert "AGENTS_CONTENT" in prompt
+    assert "CODE_WRITER_CONTENT" in prompt
+    assert "goal: Use custom template" in prompt
+    assert "AGENTS.md (Default)" not in prompt
+    assert "code-writer.md (Default)" not in prompt
+
+
+def test_worker_prompt_raises_when_template_missing(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+    (tmp_path / "AGENTS.md").write_text("AGENTS_CONTENT", encoding="utf-8")
+    role_path = tmp_path / "docs" / "roles" / "code-writer.md"
+    role_path.parent.mkdir(parents=True, exist_ok=True)
+    role_path.write_text("CODE_WRITER_CONTENT", encoding="utf-8")
+    orchestrator.TASK_CARD.write_text(
+        json.dumps(
+            {
+                "task_id": "T-611",
+                "goal": "Fallback template",
+                "in_scope": [],
+                "out_of_scope": [],
+                "acceptance_criteria": [],
+                "constraints": [],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    template_path = orchestrator._worker_prompt_template_path()
+    template_path.unlink(missing_ok=True)
+
+    with pytest.raises(RuntimeError) as exc:
+        orchestrator._worker_prompt("T-611", 1)
+
+    message = str(exc.value)
+    assert "Missing required prompt template" in message
+    assert "Run 'loop init' to create it" in message
 
 
 def test_reviewer_prompt_includes_role_doc(monkeypatch) -> None:
@@ -1540,7 +1615,7 @@ def _configure_loop_paths(monkeypatch, tmp_path: Path) -> None:
     templates_dir = loop_dir / "templates"
     templates_dir.mkdir(parents=True, exist_ok=True)
     (templates_dir / "worker_prompt.txt").write_text(
-        "",
+        orchestrator.DEFAULT_WORKER_PROMPT_TEMPLATE,
         encoding="utf-8",
     )
     (templates_dir / "reviewer_prompt.txt").write_text(
@@ -4483,6 +4558,8 @@ class TestBuildTaskPacket:
                 return "AGENTS_CONTENT"
             if path.name == "code-writer.md":
                 return "CODE_WRITER_CONTENT"
+            if path == orchestrator._worker_prompt_template_path():
+                return orchestrator.DEFAULT_WORKER_PROMPT_TEMPLATE
             return None
 
         def fake_read_json(path: Path) -> dict | None:
