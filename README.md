@@ -1,28 +1,41 @@
-# agent-task-runner
+# AI Code Review Orchestrator | agent-task-runner
 
 [![ci](../../actions/workflows/loop-ci.yml/badge.svg)](../../actions/workflows/loop-ci.yml)
 
-PM-driven review-loop orchestrator for AI coding agents.
+**AI-driven automated code review and development workflow orchestration**
 
-agent-task-runner runs a multi-round review loop: a **Worker** writes code, a **Reviewer** checks it, and the loop repeats until approval or max rounds. It ships with built-in support for **OpenAI Codex**, **Anthropic Claude**, and **OpenCode** as worker/reviewer backends, with automatic dispatch and real-time streaming output. Need something different? Use `register_backend()` to plug in your own — no core modifications required.
+agent-task-runner automates the complete development loop: a **Worker AI writes code**, a **Reviewer AI validates it**, and the system iterates automatically until approval or max rounds reached. Built for teams using AI coding assistants (OpenAI Codex, Anthropic Claude, OpenCode) who want structured, auditable, and efficient code review processes.
+
+## ✨ Why Use This?
+
+- **Automated code review cycles** - No manual back-and-forth between writing and reviewing
+- **Multi-round iteration** - Systematically handles "changes required" feedback
+- **Smart context management** - Retrieves relevant project facts, patterns, and pitfalls per task
+- **Full observability** - Track latency metrics, round history, and decision trails
+- **Extensible by design** - Plug in any AI backend via `register_backend()` without core changes
+- **Git-integrated** - Uses commits as source of truth, works with existing workflows
 
 ## Quick Start
 
 ```bash
-# Install
-pip install agent-task-runner
-# or: uv add agent-task-runner
-
 # Initialize loop directory in your project
 loop init
 
-# (optional) Build offline module map for the codebase
+# (optional) Build offline module map for faster context
 loop index
 
-# Write a task card (see .loop/examples/task_card.json)
-# Then run the loop with auto-dispatch
+# Create task card (see .loop/examples/task_card.json)
+# Run with auto-dispatch
 loop run --task .loop/task_card.json --auto-dispatch --worker-backend codex --reviewer-backend codex
 ```
+
+## 📋 Table of Contents
+
+- [Core Concepts](#core-concepts)
+- [CLI Reference](#cli-reference)
+- [Configuration](#configuration)
+- [Architecture](#architecture)
+- [Development](#development)
 
 ## Prerequisites
 
@@ -163,103 +176,11 @@ Validation rules:
 - Invalid CLI/env/config values fail fast with a validation error (`exit code 3`)
 - JSON payloads loaded from bus/state/config/task files are capped at 5 MiB and rejected when oversized
 
-## File Bus Protocol
+### Archive
 
-All state passes through JSON files in `.loop/`:
+Round artifacts are archived to `.loop/archive/{task_id}/r{N}_{name}.json` using payload identity (`task_id`, `round`) before overwrite, preserving deterministic round history and rejecting cross-task writes.
 
-```
-PM  -> Worker:    task_card.json / fix_list.json
-Worker -> PM:     work_report.json
-PM  -> Reviewer:  review_request.json
-Reviewer -> PM:   review_report.json
-```
-
-### Context files
-
-`loop init` also creates knowledge/context files in `.loop/context/`:
-
-- **project_facts.md** — Project-specific facts and conventions
-- **pitfalls.md** — Known pitfalls (auto-appended from review blocking issues)
-- **patterns.jsonl** — High-confidence patterns (auto-populated from review issues on approval)
-- **module_map.json** — Offline module index (populated by `loop index`)
-- **handoff/** — Per-task role handoff artifacts (`.loop/handoff/{task_id}/{role}_r{round}.json`)
-
-The worker first reads project `AGENTS.md` and `docs/roles/code-writer.md`, and the reviewer first reads project `docs/roles/reviewer.md`.
-If any of those files are missing, agent-task-runner falls back to built-in defaults in `src/loop_kit/defaults/`.
-Project files always override built-in defaults when present.
-
-### Knowledge retrieval in prompts
-
-Worker prompt rendering does deterministic retrieval instead of injecting all context lines:
-
-- Query terms are built from `task_id`, task card fields (`goal`, `in_scope`, `out_of_scope`, `acceptance_criteria`, `constraints`, dependencies), and fix-list issue fields on rounds `> 1`.
-- Facts/pitfalls/patterns are keyword-scored by token overlap and sorted deterministically.
-- Patterns keep the existing confidence gate (`confidence >= PATTERN_HIGH_CONFIDENCE`) before retrieval ranking.
-- Each section is capped to top-k entries, which reduces prompt bloat on large knowledge files.
-- If no entry matches, rendering falls back to a minimal safe subset (single fallback entry per non-empty section) instead of injecting the full context.
-- If context files are missing or empty, the knowledge block remains `- <none>`.
-
-Current tuning knobs in `src/loop_kit/orchestrator.py`:
-
-- `_KNOWLEDGE_RETRIEVAL_FACT_CAP` (default `4`)
-- `_KNOWLEDGE_RETRIEVAL_PITFALL_CAP` (default `4`)
-- `_KNOWLEDGE_RETRIEVAL_PATTERN_CAP` (default `4`)
-- `_KNOWLEDGE_RETRIEVAL_MIN_SCORE` (default `1`)
-- `_KNOWLEDGE_RETRIEVAL_FALLBACK_CAP` (default `1`)
-
-### Quickstart vs Handoff vs Warm Resume
-
-- **Quickstart context**: injected for cold task starts (round 1) with stable project constraints and execution contract.
-- **Handoff context**: structured bridge built every round for both roles (`done`, `open_questions`, `next_actions`, `evidence`, `must_read_files`) and injected into later prompts when available.
-- **Warm resume**: reuses backend session IDs from `state.json` for low-latency continuation.
-- **Session rotation**: set `--max-session-rounds` to intentionally start a fresh backend session after N rounds while preserving continuity via handoff context.
-- **Fallback behavior**: invalid resume sessions are detected, logged, and retried with a fresh session.
-
-### Dispatch phase metrics
-
-The feed keeps backward-compatible dispatch events (`dispatch_start`, `dispatch_artifact_written`) and adds phase markers for timing analysis:
-
-- `dispatch_first_stdout`: first streamed stdout line from the backend process.
-- `dispatch_first_work_action`: first concrete execution signal (for example Codex `item.started` command/tool work), not summary prose.
-- `dispatch_first_meaningful_action`: first meaningful summary signal (message/tool summary). This is intentionally **not** the work-start boundary.
-- `dispatch_phase_metrics`: one aggregated event per role/round with:
-  - `startup_ms = t(first_stdout) - t(dispatch_start)`
-  - `context_to_work_ms = t(first_work_action) - t(first_stdout)`
-  - `work_to_artifact_ms = t(dispatch_artifact_written) - t(first_work_action)`
-  - `total_ms = t(dispatch_artifact_written) - t(dispatch_start)`
-  - within `work_to_artifact_ms`, classified subphases:
-    - `read_ms`, `search_ms`, `edit_ms`, `test_ms`, `unknown_ms`
-    - `read_count`, `search_count`, `edit_count`, `test_count`, `unknown_count`
-
-Interpretation boundaries:
-
-- `startup_ms` captures process startup + first output availability.
-- `context_to_work_ms` captures initial context understanding before real execution begins.
-- `work_to_artifact_ms` captures execution-to-artifact completion.
-- If a boundary is missing (for example no concrete work signal), the missing segment is emitted as `null` while `total_ms` is still reported.
-- Subphase classification is deterministic from streamed backend action events:
-  - `read`: file-read tools/commands
-  - `search`: grep/glob/web-search style tools/commands
-  - `edit`: file-change events and write/edit tools/commands
-  - `test`: test-running commands (for example `pytest`, `go test`, `npm test`)
-  - `unknown`: actionable events that do not match the above
-
-`loop dispatch-metrics` now prints:
-- phase latency table (`startup/context_to_work/work_to_artifact/total`)
-- work subphase table (`read/search/edit/test/unknown`)
-
-Use `loop dispatch-metrics` to aggregate these events directly from `.loop/logs/feed.jsonl` with `count`, `missing`, `avg_ms`, `p50_ms`, and `p95_ms` per segment, and use `--task-id`/`--role` filters to scope both tables.
-
-Interpretation limits for the command output:
-
-- `count` is the number of non-null numeric values for that segment.
-- `missing` counts rows where the segment is null, absent, or non-numeric.
-- `p50_ms`/`p95_ms` use nearest-rank percentiles on the filtered rows.
-- The report only reflects events present in the local feed file; it does not infer missing telemetry from other artifacts.
-- For subphases, durations are bounded by observed action events; missing/truncated boundaries degrade to deterministic partial accounting rather than crashes.
-- `unknown_ms` and `unknown_count` are expected when commands/tools are not recognized by current classifiers.
-
-### Key JSON schemas
+## Performance Metrics
 
 **task_card.json**
 ```json
@@ -356,6 +277,85 @@ When lanes are present and valid, the orchestrator computes deterministic execut
 ```
 
 **state.json** — Internal orchestrator state, the single source of truth between rounds.
+
+## Core Concepts
+
+### Worker-Reviewer Loop
+
+The orchestrator coordinates two AI agents:
+
+1. **Worker** - Writes/updates code based on task requirements
+2. **Reviewer** - Validates against acceptance criteria, provides feedback
+
+The loop continues until:
+- ✅ Reviewer approves
+- ⏰ Max rounds exhausted
+- ❌ Non-recoverable error
+
+### File Bus Protocol
+
+All communication uses JSON files in `.loop/`:
+
+```
+PM → Worker:   task_card.json / fix_list.json
+Worker → PM:   work_report.json
+PM → Reviewer: review_request.json
+Reviewer → PM:   review_report.json
+```
+
+### Knowledge System
+
+- **Facts** - Project-specific conventions (`project_facts.md`)
+- **Pitfalls** - Known issues to avoid (`pitfalls.md`)
+- **Patterns** - High-confidence coding patterns (`patterns.jsonl`)
+- **Module Map** - Offline codebase index (`module_map.json`)
+
+Context is **retrieved by relevance** (keyword scoring) rather than injected wholesale, keeping prompts focused.
+
+### Core Run-Loop State Machine
+
+The orchestrator uses explicit state metadata and trigger-driven transitions:
+
+- `idle` - No active contract
+- `awaiting_work` - Worker phase
+- `awaiting_review` - Reviewer phase
+- `done` - Terminal (approved, timeout, or blocked)
+
+Transitions are trigger-driven:
+
+| Trigger | Transition | Kind |
+|---------|------------|------|
+| `bootstrap` | any → `awaiting_work` | normal |
+| `worker_completed` | `awaiting_work` → `awaiting_review` | normal |
+| `reviewer_approved` | `awaiting_review` → `done` | normal |
+| `reviewer_changes_required` | `awaiting_review` → `awaiting_work` | retry |
+| `*_timeout` | → `done` | timeout |
+| `terminal_error` | any → `done` | error |
+| `max_rounds_exhausted` | → `done` | retry |
+
+### Quickstart vs Handoff vs Warm Resume
+
+- **Quickstart context**: injected for cold task starts (round 1)
+- **Handoff context**: structured bridge built every round for both roles (`done`, `open_questions`, `next_actions`, `evidence`, `must_read_files`)
+- **Warm resume**: reuses backend session IDs from `state.json` for low-latency continuation
+- **Session rotation**: set `--max-session-rounds` to intentionally rotate sessions
+- **Fallback**: invalid resume sessions are detected and retried with fresh sessions
+
+### Archive
+
+Round artifacts are archived to `.loop/archive/{task_id}/r{N}_{name}.json` using payload identity (`task_id`, `round`) before overwrite, preserving deterministic round history.
+
+## Performance Metrics
+
+`loop dispatch-metrics` analyzes `.loop/logs/feed.jsonl` to report:
+
+- **Phase latencies**: `startup_ms`, `context_to_work_ms`, `work_to_artifact_ms`, `total_ms`
+- **Work subphases**: `read/search/edit/test/unknown` (counts & durations)
+
+Interpretation:
+- `startup_ms`: process startup + first output
+- `context_to_work_ms`: initial prompt processing before execution
+- `work_to_artifact_ms`: actual code work duration
 
 ### Core run-loop state machine
 
