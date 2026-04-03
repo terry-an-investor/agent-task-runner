@@ -1193,6 +1193,60 @@ def test_auto_dispatch_role_only_enables_heartbeat_when_required(monkeypatch) ->
     ]
 
 
+class TestSessionManager:
+    def test_normalize_session_id(self) -> None:
+        assert orchestrator.SessionManager.normalize_session_id(None) is None
+        assert orchestrator.SessionManager.normalize_session_id("") is None
+        assert orchestrator.SessionManager.normalize_session_id("  ") is None
+        assert orchestrator.SessionManager.normalize_session_id(" sid-1 ") == "sid-1"
+
+    def test_store_and_get_session(self) -> None:
+        manager = orchestrator.SessionManager(role="worker")
+        state: dict[str, object] = {}
+
+        changed = manager.store_session(state, " CoDeX ", " sid-1 ", round_num=2)
+
+        assert changed is True
+        assert manager.get_session(state, "codex") == "sid-1"
+        assert state["sessions"] == {
+            "worker": {"session_id": "sid-1", "backend": "codex", "started_round": 2}
+        }
+
+    def test_store_session_preserves_started_round_when_session_unchanged(self) -> None:
+        manager = orchestrator.SessionManager(role="worker")
+        state = {
+            "sessions": {"worker": {"session_id": "sid-1", "backend": "codex", "started_round": 2}},
+        }
+
+        changed = manager.store_session(state, "codex", "sid-1", round_num=4)
+
+        assert changed is False
+        assert state["sessions"] == {
+            "worker": {"session_id": "sid-1", "backend": "codex", "started_round": 2}
+        }
+
+    def test_get_session_returns_none_on_backend_mismatch(self) -> None:
+        manager = orchestrator.SessionManager(role="worker")
+        state = {"sessions": {"worker": {"session_id": "sid-1", "backend": "codex", "started_round": 2}}}
+
+        assert manager.get_session(state, "opencode") is None
+
+    def test_invalidate_session(self) -> None:
+        manager = orchestrator.SessionManager(role="worker")
+        state = {"sessions": {"worker": {"session_id": "sid-1", "backend": "codex", "started_round": 2}}}
+
+        assert manager.invalidate_session(state, "opencode") is False
+        assert manager.invalidate_session(state, "codex") is True
+        assert state["sessions"] == {}
+
+    def test_build_resume_context(self) -> None:
+        manager = orchestrator.SessionManager(role="reviewer")
+        state = {"sessions": {"reviewer": {"session_id": "sid-r", "backend": "claude", "started_round": 1}}}
+
+        assert manager.build_resume_context(state, "claude") == "sid-r"
+        assert manager.build_resume_context(state, "codex") is None
+
+
 def test_auto_dispatch_role_reuses_and_persists_worker_session(tmp_path: Path, monkeypatch) -> None:
     _configure_loop_paths(monkeypatch, tmp_path)
     state = {

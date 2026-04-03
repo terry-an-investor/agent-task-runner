@@ -1432,7 +1432,7 @@ def _build_codex_command(
         "-C",
         str(ROOT),
     ]
-    sid = resume_session_id.strip() if isinstance(resume_session_id, str) and resume_session_id.strip() else None
+    sid = SessionManager.normalize_session_id(resume_session_id)
     if sid:
         cmd.extend(["resume", sid])
     cmd.append(
@@ -1456,7 +1456,7 @@ def _build_claude_command(
     prompt: str,
     resume_session_id: str | None = None,
 ) -> tuple[list[str], str | None, str | None]:
-    sid = resume_session_id.strip() if isinstance(resume_session_id, str) and resume_session_id.strip() else ""
+    sid = SessionManager.normalize_session_id(resume_session_id) or ""
     if sid:
         # Resume existing session with --resume flag
         cmd = [
@@ -1503,8 +1503,9 @@ def _agent_command(
     build_cmd_fn, _, _ = _require_registered_backend(backend)
     exe = _resolve_backend_exe(backend)
     backend_key = backend.strip().lower()
-    if resume_session_id is not None and backend_key in {BACKEND_CODEX, BACKEND_CLAUDE, BACKEND_OPENCODE}:
-        return build_cmd_fn(exe, prompt, resume_session_id)
+    sid = SessionManager.normalize_session_id(resume_session_id)
+    if sid is not None and backend_key in {BACKEND_CODEX, BACKEND_CLAUDE, BACKEND_OPENCODE}:
+        return build_cmd_fn(exe, prompt, sid)
     return build_cmd_fn(exe, prompt)
 
 
@@ -1536,7 +1537,7 @@ def _build_opencode_command(
     prompt: str,
     resume_session_id: str | None = None,
 ) -> tuple[list[str], str | None, str | None]:
-    sid = resume_session_id.strip() if isinstance(resume_session_id, str) and resume_session_id.strip() else ""
+    sid = SessionManager.normalize_session_id(resume_session_id) or ""
     if not sid:
         sid = str(uuid.uuid4())
     cmd = [
@@ -1909,10 +1910,7 @@ def _run_auto_dispatch(
     retry_count = max(0, int(dispatch_retries))
     retry_base_sec = max(1, int(dispatch_retry_base_sec))
     max_attempts = retry_count + 1
-    if isinstance(resume_session_id, str):
-        active_resume_session_id = resume_session_id.strip() or None
-    else:
-        active_resume_session_id = None
+    active_resume_session_id = SessionManager.normalize_session_id(resume_session_id)
     _log(f"Auto-dispatch start: role={role} backend={backend} retries={retry_count} retry_base_sec={retry_base_sec}")
     if heartbeat_enabled:
         _start_auto_dispatch_heartbeat(
@@ -4102,29 +4100,120 @@ def _print_round_header(round_num: int, role: str) -> None:
         print(f"  Review request: {REVIEW_REQ}")
 
 
-def _normalize_sessions_map(value: object) -> dict[str, dict[str, str | int]]:
-    normalized: dict[str, dict[str, str | int]] = {}
-    if not isinstance(value, dict):
+class SessionManager:
+    def __init__(self, *, role: str) -> None:
+        self.role = role
+
+    @staticmethod
+    def normalize_session_id(sid: str | None) -> str | None:
+        if not isinstance(sid, str):
+            return None
+        normalized = sid.strip()
+        return normalized or None
+
+    @staticmethod
+    def _normalize_backend(backend: str) -> str:
+        return backend.strip().lower()
+
+    @staticmethod
+    def normalize_sessions_map(value: object) -> dict[str, dict[str, str | int]]:
+        normalized: dict[str, dict[str, str | int]] = {}
+        if not isinstance(value, dict):
+            return normalized
+        for role in _SESSION_ROLES:
+            raw_entry = value.get(role)
+            if not isinstance(raw_entry, dict):
+                continue
+            session_id = SessionManager.normalize_session_id(raw_entry.get("session_id"))
+            backend_raw = raw_entry.get("backend")
+            if session_id is None:
+                continue
+            if not isinstance(backend_raw, str) or not backend_raw.strip():
+                continue
+            entry: dict[str, str | int] = {
+                "session_id": session_id,
+                "backend": SessionManager._normalize_backend(backend_raw),
+            }
+            started_round_raw = raw_entry.get("started_round")
+            if isinstance(started_round_raw, int) and started_round_raw >= 1:
+                entry["started_round"] = started_round_raw
+            normalized[role] = entry
         return normalized
-    for role in _SESSION_ROLES:
-        raw_entry = value.get(role)
-        if not isinstance(raw_entry, dict):
-            continue
-        session_id_raw = raw_entry.get("session_id")
-        backend_raw = raw_entry.get("backend")
-        if not isinstance(session_id_raw, str) or not session_id_raw.strip():
-            continue
-        if not isinstance(backend_raw, str) or not backend_raw.strip():
-            continue
-        entry: dict[str, str | int] = {
-            "session_id": session_id_raw.strip(),
-            "backend": backend_raw.strip().lower(),
+
+    def _normalized_sessions(self, state: dict) -> dict[str, dict[str, str | int]]:
+        sessions = SessionManager.normalize_sessions_map(state.get("sessions"))
+        state["sessions"] = sessions
+        return sessions
+
+    def _entry_for_backend(self, state: dict, backend: str) -> dict[str, str | int] | None:
+        sessions = self._normalized_sessions(state)
+        entry = sessions.get(self.role)
+        if not isinstance(entry, dict):
+            return None
+        if entry.get("backend") != SessionManager._normalize_backend(backend):
+            return None
+        session_id = SessionManager.normalize_session_id(entry.get("session_id"))
+        if session_id is None:
+            return None
+        return entry
+
+    def get_session(self, state: dict, backend: str) -> str | None:
+        entry = self._entry_for_backend(state, backend)
+        if not isinstance(entry, dict):
+            return None
+        return SessionManager.normalize_session_id(entry.get("session_id"))
+
+    def build_resume_context(self, state: dict, backend: str) -> str | None:
+        return self.get_session(state, backend)
+
+    def store_session(
+        self,
+        state: dict,
+        backend: str,
+        session_id: str,
+        *,
+        round_num: int = 1,
+    ) -> bool:
+        normalized_session_id = SessionManager.normalize_session_id(session_id)
+        if normalized_session_id is None:
+            return False
+        sessions = self._normalized_sessions(state)
+        existing = sessions.get(self.role)
+        started_round = round_num
+        if isinstance(existing, dict):
+            existing_session_id = SessionManager.normalize_session_id(existing.get("session_id"))
+            if existing_session_id == normalized_session_id:
+                started_round = _session_started_round(existing, round_num=round_num)
+        next_entry: dict[str, str | int] = {
+            "session_id": normalized_session_id,
+            "backend": SessionManager._normalize_backend(backend),
+            "started_round": started_round,
         }
-        started_round_raw = raw_entry.get("started_round")
-        if isinstance(started_round_raw, int) and started_round_raw >= 1:
-            entry["started_round"] = started_round_raw
-        normalized[role] = entry
-    return normalized
+        if sessions.get(self.role) == next_entry:
+            state["sessions"] = sessions
+            return False
+        sessions[self.role] = next_entry
+        state["sessions"] = sessions
+        return True
+
+    def invalidate_session(self, state: dict, backend: str) -> bool:
+        sessions = self._normalized_sessions(state)
+        entry = sessions.get(self.role)
+        if not isinstance(entry, dict):
+            return False
+        if entry.get("backend") != SessionManager._normalize_backend(backend):
+            return False
+        sessions.pop(self.role, None)
+        state["sessions"] = sessions
+        return True
+
+
+def _session_manager(role: str) -> SessionManager:
+    return SessionManager(role=role)
+
+
+def _normalize_sessions_map(value: object) -> dict[str, dict[str, str | int]]:
+    return SessionManager.normalize_sessions_map(value)
 
 
 def _clear_sessions(state: dict) -> bool:
@@ -4135,18 +4224,11 @@ def _clear_sessions(state: dict) -> bool:
 
 
 def _session_resume_id(state: dict, *, role: str, backend: str) -> str | None:
-    sessions = _normalize_sessions_map(state.get("sessions"))
-    state["sessions"] = sessions
-    entry = sessions.get(role)
-    if not isinstance(entry, dict):
-        return None
-    backend_key = backend.strip().lower()
-    if entry.get("backend") != backend_key:
-        return None
-    session_id = entry.get("session_id")
-    if not isinstance(session_id, str) or not session_id.strip():
-        return None
-    return session_id
+    return _session_manager(role).build_resume_context(state, backend)
+
+
+def _session_entry(state: dict, *, role: str, backend: str) -> dict[str, str | int] | None:
+    return _session_manager(role)._entry_for_backend(state, backend)
 
 
 def _session_started_round(entry: dict[str, str | int], *, round_num: int) -> int:
@@ -4157,27 +4239,15 @@ def _session_started_round(entry: dict[str, str | int], *, round_num: int) -> in
 
 
 def _store_session(state: dict, *, role: str, backend: str, session_id: str | None, round_num: int) -> bool:
-    if not isinstance(session_id, str) or not session_id.strip():
+    normalized_session_id = SessionManager.normalize_session_id(session_id)
+    if normalized_session_id is None:
         return False
-    sessions = _normalize_sessions_map(state.get("sessions"))
-    normalized_session_id = session_id.strip()
-    existing = sessions.get(role)
-    started_round = round_num
-    if isinstance(existing, dict):
-        existing_session_id = existing.get("session_id")
-        if isinstance(existing_session_id, str) and existing_session_id.strip() == normalized_session_id:
-            started_round = _session_started_round(existing, round_num=round_num)
-    next_entry: dict[str, str | int] = {
-        "session_id": normalized_session_id,
-        "backend": backend.strip().lower(),
-        "started_round": started_round,
-    }
-    if sessions.get(role) == next_entry:
-        state["sessions"] = sessions
-        return False
-    sessions[role] = next_entry
-    state["sessions"] = sessions
-    return True
+    return _session_manager(role).store_session(
+        state,
+        backend,
+        normalized_session_id,
+        round_num=round_num,
+    )
 
 
 def _invalidate_sessions_for_dispatch(
@@ -4247,13 +4317,13 @@ def _auto_dispatch_role(
     )
     if state_updated:
         _save_state(current_state)
-    resume_session_id = _session_resume_id(current_state, role=role, backend=backend)
+    session_manager = _session_manager(role)
+    resume_session_id = session_manager.build_resume_context(current_state, backend)
     candidate_session_id = resume_session_id
     resume_status = "resume_miss"
     session_started_round: int | None = None
     if resume_session_id:
-        sessions = _normalize_sessions_map(current_state.get("sessions"))
-        entry = sessions.get(role)
+        entry = _session_entry(current_state, role=role, backend=backend)
         if isinstance(entry, dict):
             session_started_round = _session_started_round(entry, round_num=round_num)
         if config.max_session_rounds > 0 and session_started_round is not None:
@@ -4327,12 +4397,15 @@ def _auto_dispatch_role(
             _save_state(current_state)
         raise
 
-    if _store_session(
-        current_state,
-        role=role,
-        backend=backend,
-        session_id=dispatch_session_id,
-        round_num=round_num,
+    normalized_dispatch_session_id = SessionManager.normalize_session_id(dispatch_session_id)
+    if (
+        normalized_dispatch_session_id is not None
+        and session_manager.store_session(
+            current_state,
+            backend,
+            normalized_dispatch_session_id,
+            round_num=round_num,
+        )
     ):
         _save_state(current_state)
     return artifact
