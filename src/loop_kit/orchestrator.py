@@ -4407,7 +4407,7 @@ def _run_multi_round_via_subprocess(
         _set_feed_round(start_round)
         _log(f"Resuming task: {task_id}")
         _log(f"Resume contract: base_sha={base_sha} round={start_round}")
-        _clean_stale_state(state, *_STALE_STATE_KEYS[:4])
+        _clean_stale_state(state, *_STALE_STATE_KEYS[:3])
         if not isinstance(state.get("round_details"), list):
             state["round_details"] = []
         state["sessions"] = _normalize_sessions_map(state.get("sessions"))

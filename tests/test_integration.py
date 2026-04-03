@@ -279,6 +279,19 @@ def _contains_ordered_pairs(actual: list[tuple[str | None, str | None]], expecte
     return False
 
 
+def _canonical_transition_labels(transitions: list[tuple[str | None, str | None]]) -> list[str]:
+    label_map = {
+        ("task_ready", "awaiting_work"): "task_ready -> work_done",
+        ("awaiting_work", "awaiting_review"): "work_done -> review_done",
+    }
+    labels: list[str] = []
+    for pair in transitions:
+        label = label_map.get(pair)
+        if label is not None:
+            labels.append(label)
+    return labels
+
+
 @pytest.mark.timeout(10)
 def test_full_worker_review_round(tmp_path: Path) -> None:
     base_sha = _init_git_repo(tmp_path)
@@ -337,6 +350,10 @@ def test_full_worker_review_round(tmp_path: Path) -> None:
             ("awaiting_review", "done"),
         ],
     )
+    assert _canonical_transition_labels(transitions) == [
+        "task_ready -> work_done",
+        "work_done -> review_done",
+    ]
 
 
 @pytest.mark.timeout(10)
@@ -380,9 +397,6 @@ def test_session_resume_across_rounds(tmp_path: Path) -> None:
     assert state_after_round1["state"] == "awaiting_work"
     assert state_after_round1["round"] == 2
     worker_sid = state_after_round1["sessions"]["worker"]["session_id"]
-    # Keep base_sha aligned with HEAD before --resume so session invalidation is not triggered.
-    state_after_round1["base_sha"] = state_after_round1["head_sha"]
-    _write_json(loop_dir / "state.json", state_after_round1)
 
     resumed = _run_loop(
         tmp_path,
@@ -458,5 +472,5 @@ def test_dispatch_failure_handling(tmp_path: Path) -> None:
 
     state = json.loads((loop_dir / "state.json").read_text(encoding="utf-8"))
     assert state["state"] == "done"
-    assert str(state.get("outcome", "")).endswith("dispatch_failed")
+    assert state["outcome"] == "worker_dispatch_failed"
     assert "dispatch failed" in str(state.get("error", "")).lower()
