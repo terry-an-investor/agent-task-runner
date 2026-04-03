@@ -708,6 +708,25 @@ def _extract_codex_thread_id(stdout: str) -> str | None:
     return None
 
 
+def _extract_opencode_session_id(stdout: str) -> str | None:
+    """Extract the session ID from step_start JSON events in opencode output."""
+    for raw in stdout.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if obj.get("type") == "step_start":
+            part = obj.get("part")
+            if isinstance(part, dict):
+                session_id = part.get("sessionID")
+                if isinstance(session_id, str) and session_id.strip():
+                    return session_id.strip()
+    return None
+
+
 def _flatten_text_payload(value: object, max_depth: int = 10) -> str:
     def _flatten(value: object, depth: int) -> str:
         if depth <= 0:
@@ -1277,7 +1296,7 @@ def _agent_command(
     build_cmd_fn, _, _ = _require_registered_backend(backend)
     exe = _resolve_backend_exe(backend)
     backend_key = backend.strip().lower()
-    if resume_session_id is not None and backend_key in {BACKEND_CODEX, BACKEND_CLAUDE}:
+    if resume_session_id is not None and backend_key in {BACKEND_CODEX, BACKEND_CLAUDE, BACKEND_OPENCODE}:
         return build_cmd_fn(exe, prompt, resume_session_id)
     return build_cmd_fn(exe, prompt)
 
@@ -1308,22 +1327,25 @@ def _resolve_opencode_exe(backend: str) -> str:
 def _build_opencode_command(
     exe: str,
     prompt: str,
+    resume_session_id: str | None = None,
 ) -> tuple[list[str], str | None, str | None]:
-    return (
-        [
-            exe,
-            "run",
-            "--format",
-            "json",
-            (
-                "Execute the context provided via stdin.  Follow the instructions"
-                " embedded in it and only finish after the required output artifact"
-                " is written."
-            ),
-        ],
-        None,
-        prompt,
-    )
+    sid = resume_session_id.strip() if isinstance(resume_session_id, str) and resume_session_id.strip() else ""
+    if not sid:
+        sid = str(uuid.uuid4())
+    cmd = [
+        exe,
+        "run",
+        "--format",
+        "json",
+        "-s",
+        sid,
+        (
+            "Execute the context provided via stdin.  Follow the instructions"
+            " embedded in it and only finish after the required output artifact"
+            " is written."
+        ),
+    ]
+    return (cmd, sid, prompt)
 
 
 def _opencode_parse_event(role: str, backend: str, line: str) -> str | None:
@@ -1778,6 +1800,10 @@ def _run_auto_dispatch(
             session_id = cmd_sid
             if backend == BACKEND_CODEX:
                 parsed = _extract_codex_thread_id(result.stdout or "")
+                if parsed:
+                    session_id = parsed
+            elif backend == BACKEND_OPENCODE:
+                parsed = _extract_opencode_session_id(result.stdout or "")
                 if parsed:
                     session_id = parsed
             _report_dispatch_result(

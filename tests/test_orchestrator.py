@@ -220,10 +220,37 @@ def test_agent_command_opencode_uses_stdin_and_short_cli_instruction(monkeypatch
 
     assert cmd[0] == "opencode.exe"
     assert "run" in cmd
+    assert "--format" in cmd
+    assert "json" in cmd
+    assert "-s" in cmd
     assert "stdin" in cmd[-1].lower()
     assert long_prompt not in " ".join(cmd)
-    assert session_id is None
+    assert isinstance(session_id, str) and session_id  # cold-start generates UUID
     assert stdin_text == long_prompt
+
+
+def test_agent_command_opencode_uses_resume_session_when_provided(monkeypatch) -> None:
+    monkeypatch.setattr(orchestrator, "_resolve_backend_exe", lambda backend: f"{backend}.exe")
+
+    def fail_uuid4() -> str:
+        raise AssertionError("uuid.uuid4 must not be called when resume_session_id is provided")
+
+    monkeypatch.setattr(orchestrator.uuid, "uuid4", fail_uuid4)
+
+    cmd, session_id, stdin_text = orchestrator._agent_command(
+        "opencode",
+        "opencode prompt payload",
+        resume_session_id="sid-reuse-789",
+    )
+
+    assert cmd[0] == "opencode.exe"
+    assert "run" in cmd
+    assert "--format" in cmd
+    assert "json" in cmd
+    assert "-s" in cmd
+    assert cmd[cmd.index("-s") + 1] == "sid-reuse-789"
+    assert session_id == "sid-reuse-789"
+    assert stdin_text == "opencode prompt payload"
 
 
 def test_agent_command_unknown_backend_lists_available_backends() -> None:
@@ -3178,6 +3205,32 @@ class TestExtractCodexThreadId:
     def test_ignores_malformed_json(self) -> None:
         stdout = "not json\n{}\n"
         assert orchestrator._extract_codex_thread_id(stdout) is None
+
+
+class TestExtractOpencodeSessionId:
+    def test_finds_session_from_step_start(self) -> None:
+        stdout = '{"type":"step_start","part":{"sessionID":"sess_abc123"}}\n{"type":"text","part":{"text":"hello"}}\n'
+        assert orchestrator._extract_opencode_session_id(stdout) == "sess_abc123"
+
+    def test_returns_none_on_no_step_start(self) -> None:
+        stdout = '{"type":"text","part":{"text":"hello"}}\n'
+        assert orchestrator._extract_opencode_session_id(stdout) is None
+
+    def test_ignores_malformed_json(self) -> None:
+        stdout = "not json\n{}\n"
+        assert orchestrator._extract_opencode_session_id(stdout) is None
+
+    def test_strips_whitespace_from_session_id(self) -> None:
+        stdout = '{"type":"step_start","part":{"sessionID":"  sess_ws  "}}\n'
+        assert orchestrator._extract_opencode_session_id(stdout) == "sess_ws"
+
+    def test_returns_none_on_empty_session_id(self) -> None:
+        stdout = '{"type":"step_start","part":{"sessionID":""}}\n'
+        assert orchestrator._extract_opencode_session_id(stdout) is None
+
+    def test_returns_none_when_part_not_dict(self) -> None:
+        stdout = '{"type":"step_start","part":"not a dict"}\n'
+        assert orchestrator._extract_opencode_session_id(stdout) is None
 
 
 class TestFlattenTextPayload:
