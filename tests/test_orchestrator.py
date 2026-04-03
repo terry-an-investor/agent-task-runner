@@ -5046,6 +5046,131 @@ def test_single_round_lane_review_parallel_one_reject_blocks_integration(tmp_pat
     assert "__integration__" not in state["lanes"]
 
 
+def test_lane_review_parallel_dispatch_uses_lane_local_review_request_artifact(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+
+    task_path = tmp_path / "task_input.json"
+    task_path.write_text(
+        json.dumps(
+            {
+                "task_id": "T-734",
+                "goal": "lane reviewer request path regression",
+                "in_scope": [],
+                "out_of_scope": [],
+                "acceptance_criteria": ["lane review request path is lane-scoped"],
+                "constraints": [],
+                "lane_review_parallel": True,
+                "lanes": [
+                    {"lane_id": "lane_core", "owner_paths": ["src/loop_kit/orchestrator.py"]},
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(orchestrator, "_current_sha", lambda: "base-sha")
+    core_worktree = tmp_path / ".loop" / "worktrees" / "T-734" / "1" / "lane_core"
+    core_worktree.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(
+        orchestrator,
+        "_prepare_lane_worktrees",
+        lambda **kwargs: [
+            orchestrator.LaneWorktreeHandle(
+                task_id="T-734",
+                round_num=1,
+                lane_id="lane_core",
+                path=core_worktree,
+                branch="loop/T-734/r1/lane_core",
+            ),
+        ],
+    )
+    run_auto_dispatch_calls: list[dict[str, object]] = []
+
+    def fake_run_auto_dispatch(**kwargs):
+        run_auto_dispatch_calls.append(dict(kwargs))
+        return f"{kwargs['role']}-session"
+
+    def fake_dispatch_with_artifact_fallback(**kwargs):
+        kwargs["dispatch_call"]()
+        role = kwargs["role"]
+        if role == "worker_lane_lane_core":
+            return {
+                "task_id": "T-734",
+                "round": 1,
+                "head_sha": "lane-core-head",
+                "files_changed": ["lane_core.py"],
+                "tests": [],
+                "notes": "lane core work",
+            }
+        if role == "reviewer_lane_lane_core":
+            return {
+                "task_id": "T-734",
+                "round": 1,
+                "decision": "approve",
+                "blocking_issues": [],
+                "non_blocking_suggestions": [],
+            }
+        raise AssertionError(f"unexpected dispatch role: {role}")
+
+    monkeypatch.setattr(orchestrator, "_run_auto_dispatch", fake_run_auto_dispatch)
+    monkeypatch.setattr(orchestrator, "_dispatch_with_artifact_fallback", fake_dispatch_with_artifact_fallback)
+    monkeypatch.setattr(
+        orchestrator,
+        "_cherry_pick_lane_reports",
+        lambda **kwargs: (
+            "merged-head",
+            [
+                {
+                    "lane_id": "lane_core",
+                    "lane_head_sha": "lane-core-head",
+                    "status": "applied",
+                    "source_commits": ["c1"],
+                    "applied_commits": ["m1"],
+                }
+            ],
+        ),
+    )
+    monkeypatch.setattr(orchestrator, "_run_integration_acceptance_checks", lambda **kwargs: [])
+    monkeypatch.setattr(orchestrator, "_diff", lambda base, head: f"diff {base}->{head}")
+    monkeypatch.setattr(orchestrator, "_log_oneline", lambda base, head: f"log {base}->{head}")
+    monkeypatch.setattr(orchestrator, "_cleanup_lane_worktrees_for_round", lambda **kwargs: None)
+    monkeypatch.setattr(
+        orchestrator,
+        "_auto_dispatch_role",
+        lambda **kwargs: {
+            "task_id": "T-734",
+            "round": 1,
+            "decision": "approve",
+            "blocking_issues": [],
+            "non_blocking_suggestions": [],
+        }
+        if kwargs.get("role") == "reviewer"
+        else None,
+    )
+
+    orchestrator.cmd_run(
+        _run_config(
+            str(task_path),
+            auto_dispatch=True,
+            max_parallel_workers=2,
+            allow_dirty=True,
+        ),
+        single_round=True,
+        round_num=1,
+    )
+
+    reviewer_calls = [item for item in run_auto_dispatch_calls if item.get("role") == "reviewer_lane_lane_core"]
+    assert len(reviewer_calls) == 1
+    reviewer_call = reviewer_calls[0]
+    assert reviewer_call.get("cwd") == core_worktree
+    reviewer_prompt = str(reviewer_call.get("prompt", ""))
+    assert "lane_review_request_path:" in reviewer_prompt
+    assert "review_request.json" in reviewer_prompt
+    assert f"lane_review_cwd: {orchestrator._display_path(core_worktree)}" in reviewer_prompt
+    assert (core_worktree / ".loop" / "review_request.json").exists()
+    assert (orchestrator.LOOP_DIR / "review_requests" / "lane_core.json").exists()
+
+
 def test_single_round_with_lanes_falls_back_to_serial_when_parallel_disabled(tmp_path: Path, monkeypatch) -> None:
     _configure_loop_paths(monkeypatch, tmp_path)
 

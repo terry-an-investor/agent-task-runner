@@ -4571,6 +4571,7 @@ def _lane_reviewer_prompt(
     task_id: str,
     round_num: int,
     lane_id: str,
+    lane_cwd: Path,
     lane_review_request_path: Path,
     lane_review_report_path: Path,
     paths: LoopPaths | None = None,
@@ -4585,8 +4586,10 @@ def _lane_reviewer_prompt(
     lane_context = (
         "=== LANE REVIEW CONTEXT ===\n"
         f"lane_id: {lane_id}\n"
+        f"lane_review_cwd: {_display_path(lane_cwd)}\n"
         f"lane_review_request_path: {_display_path(lane_review_request_path)}\n"
         f"lane_review_report_path: {_display_path(lane_review_report_path)}\n"
+        "lane_review_input_source: Read lane_review_request_path as the authoritative request for this lane.\n"
         "lane_review_scope: pre-integration reviewer gate for this lane only\n"
     )
     return f"{base_prompt}\n\n{lane_context}"
@@ -8600,6 +8603,9 @@ def _run_single_round(
             lane = lane_by_id.get(lane_id)
             if lane is None:
                 raise ValidationError(f"Lane review dispatch missing lane config for lane_id={lane_id!r}")
+            lane_handle = lane_handle_by_id.get(lane_id)
+            if lane_handle is None:
+                raise ValidationError(f"Lane review dispatch missing lane worktree handle for lane_id={lane_id!r}")
             lane_head_sha = str(lane_work["head_sha"]).strip()
             if not lane_head_sha:
                 raise ValidationError(f"Lane review dispatch missing lane head_sha for lane_id={lane_id!r}")
@@ -8609,8 +8615,11 @@ def _run_single_round(
             except RuntimeError as e:
                 raise RuntimeError(f"Lane review diff generation failed for lane '{lane_id}': {e}") from e
 
-            lane_review_request_path = _lane_review_request_path(lane_id, paths=resolved_paths)
-            lane_review_request_path.parent.mkdir(parents=True, exist_ok=True)
+            lane_loop_dir = _lane_local_loop_dir(lane_handle)
+            lane_loop_dir.mkdir(parents=True, exist_ok=True)
+            lane_review_request_path = lane_loop_dir / "review_request.json"
+            lane_review_request_snapshot_path = _lane_review_request_path(lane_id, paths=resolved_paths)
+            lane_review_request_snapshot_path.parent.mkdir(parents=True, exist_ok=True)
             lane_acceptance_checks = [str(item).strip() for item in lane.get("acceptance_checks", []) if str(item).strip()]
             lane_acceptance_criteria = [item for item in task_card.get("acceptance_criteria", []) if isinstance(item, str)]
             lane_acceptance_criteria.extend([f"[lane:{lane_id}] {item}" for item in lane_acceptance_checks])
@@ -8632,16 +8641,20 @@ def _run_single_round(
             lane_review_request["lane_owner_paths"] = list(cast(list[str], lane.get("owner_paths", [])))
             lane_review_request["lane_acceptance_checks"] = lane_acceptance_checks
             _atomic_write_json(lane_review_request_path, lane_review_request)
+            _atomic_write_json(lane_review_request_snapshot_path, lane_review_request)
 
-            lane_review_report_path = _lane_review_report_path(lane_id, paths=resolved_paths)
-            lane_review_report_path.parent.mkdir(parents=True, exist_ok=True)
+            lane_review_report_path = lane_loop_dir / "review_report.json"
             lane_review_report_path.unlink(missing_ok=True)
+            lane_review_report_snapshot_path = _lane_review_report_path(lane_id, paths=resolved_paths)
+            lane_review_report_snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+            lane_review_report_snapshot_path.unlink(missing_ok=True)
             lane_review_prompt = _lane_reviewer_prompt(
                 task_id=task_id,
                 round_num=round_num,
                 lane_id=lane_id,
-                lane_review_request_path=lane_review_request_path,
-                lane_review_report_path=lane_review_report_path,
+                lane_cwd=lane_handle.path,
+                lane_review_request_path=Path(".loop/review_request.json"),
+                lane_review_report_path=Path(".loop/review_report.json"),
                 paths=resolved_paths,
             )
             lane_reviewer_backend = config.reviewer_backend.strip().lower()
@@ -8667,6 +8680,7 @@ def _run_single_round(
                     lane_id=lane_id,
                     dispatch_started_at=dispatch_started_at,
                     telemetry=dispatch_metrics,
+                    cwd=lane_handle.path,
                 )
 
             artifact = _dispatch_with_artifact_fallback(
@@ -8696,7 +8710,7 @@ def _run_single_round(
                     role=dispatch_role,
                     lane_id=lane_id,
                     backend=lane_reviewer_backend,
-                    artifact_path=lane_review_report_path.name,
+                    artifact_path=_display_path(lane_review_report_path),
                     latency_ms=artifact_written_latency_ms,
                     duration_ms=artifact_written_latency_ms,
                     status="written",
@@ -8740,7 +8754,7 @@ def _run_single_round(
                 ),
                 paths=resolved_paths,
             )
-            _atomic_write_json(lane_review_report_path, lane_review)
+            _atomic_write_json(lane_review_report_snapshot_path, lane_review)
             return lane_review, artifact_written_latency_ms, lane_reviewer_backend
 
         for stage_index, stage_lane_ids in enumerate(lane_stages):
@@ -8827,9 +8841,13 @@ def _run_single_round(
                 lane_entry = lane_state.get(lane_id)
                 if lane_entry is None:
                     continue
+                lane_handle = lane_handle_by_id.get(lane_id)
                 lane_entry["review_status"] = "pending"
                 lane_entry["review_request_path"] = _display_path(_lane_review_request_path(lane_id, paths=resolved_paths))
                 lane_entry["review_report_path"] = _display_path(_lane_review_report_path(lane_id, paths=resolved_paths))
+                if lane_handle is not None:
+                    lane_entry["review_request_local_path"] = _display_path(_lane_local_loop_dir(lane_handle) / "review_request.json")
+                    lane_entry["review_report_local_path"] = _display_path(_lane_local_loop_dir(lane_handle) / "review_report.json")
             _save_lane_state_snapshot(state, lane_state, paths=resolved_paths)
 
             review_workers = min(config.max_parallel_workers, len(lane_execution_order))
