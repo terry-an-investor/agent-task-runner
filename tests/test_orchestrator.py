@@ -1469,6 +1469,205 @@ def test_auto_dispatch_role_rotates_session_and_emits_artifact_metric(tmp_path: 
     assert isinstance(artifact_events[0]["latency_ms"], int)
 
 
+def test_auto_dispatch_role_emits_dispatch_phase_metrics_with_complete_boundaries(monkeypatch) -> None:
+    events: list[tuple[str, dict[str, object]]] = []
+    state = {
+        "state": orchestrator.STATE_AWAITING_WORK,
+        "round": 3,
+        "task_id": "T-715",
+        "sessions": {},
+    }
+    monotonic_values = iter([10.0, 11.0])
+
+    def fake_run_auto_dispatch(*, telemetry: dict[str, object] | None = None, **kwargs) -> str | None:
+        _ = kwargs
+        if telemetry is not None:
+            telemetry["first_stdout_ms"] = 120
+            telemetry["first_work_action_ms"] = 420
+            telemetry["first_meaningful_action_ms"] = 380
+        return "sid-metric"
+
+    def fake_dispatch_with_artifact_fallback(
+        *,
+        role: str,
+        dispatch_call,
+        artifact_path: Path,
+        task_id: str,
+        round_num: int,
+        timeout_sec: int = orchestrator.DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC,
+    ) -> dict:
+        _ = (role, artifact_path, timeout_sec)
+        dispatch_call()
+        return {"task_id": task_id, "round": round_num}
+
+    def fake_feed_event(event: str, *, level: str = "info", data: dict | None = None) -> None:
+        _ = level
+        events.append((event, dict(data or {})))
+
+    monkeypatch.setattr(orchestrator, "_run_auto_dispatch", fake_run_auto_dispatch)
+    monkeypatch.setattr(orchestrator, "_dispatch_with_artifact_fallback", fake_dispatch_with_artifact_fallback)
+    monkeypatch.setattr(orchestrator, "_feed_event", fake_feed_event)
+    monkeypatch.setattr(orchestrator.time, "monotonic", lambda: next(monotonic_values, 11.0))
+    monkeypatch.setattr(orchestrator, "_save_state", lambda state_data: None)
+
+    result = orchestrator._auto_dispatch_role(
+        role="worker",
+        prompt="prompt",
+        config=orchestrator.RunConfig(auto_dispatch=True, worker_backend="codex"),
+        task_id="T-715",
+        round_num=2,
+        artifact_path=orchestrator.WORK_REPORT,
+        state=state,
+    )
+
+    assert result == {"task_id": "T-715", "round": 2}
+    phase_events = [payload for event, payload in events if event == orchestrator.FEED_DISPATCH_PHASE_METRICS]
+    assert len(phase_events) == 1
+    payload = phase_events[0]
+    assert payload["startup_ms"] == 120
+    assert payload["context_to_work_ms"] == 300
+    assert payload["work_to_artifact_ms"] == 580
+    assert payload["total_ms"] == 1000
+    assert payload["session_id"] == "sid-metric"
+    assert payload["task_id"] == "T-715"
+    assert payload["round"] == 2
+    assert payload["role"] == "worker"
+
+
+def test_auto_dispatch_role_phase_metrics_graceful_when_work_boundary_missing(monkeypatch) -> None:
+    events: list[tuple[str, dict[str, object]]] = []
+    state = {
+        "state": orchestrator.STATE_AWAITING_WORK,
+        "round": 1,
+        "task_id": "T-715",
+        "sessions": {},
+    }
+    monotonic_values = iter([2.0, 2.9])
+
+    def fake_run_auto_dispatch(*, telemetry: dict[str, object] | None = None, **kwargs) -> str | None:
+        _ = kwargs
+        if telemetry is not None:
+            telemetry["first_stdout_ms"] = 200
+            telemetry["first_work_action_ms"] = None
+        return "sid-missing"
+
+    def fake_dispatch_with_artifact_fallback(
+        *,
+        role: str,
+        dispatch_call,
+        artifact_path: Path,
+        task_id: str,
+        round_num: int,
+        timeout_sec: int = orchestrator.DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC,
+    ) -> dict:
+        _ = (role, artifact_path, timeout_sec)
+        dispatch_call()
+        return {"task_id": task_id, "round": round_num}
+
+    def fake_feed_event(event: str, *, level: str = "info", data: dict | None = None) -> None:
+        _ = level
+        events.append((event, dict(data or {})))
+
+    monkeypatch.setattr(orchestrator, "_run_auto_dispatch", fake_run_auto_dispatch)
+    monkeypatch.setattr(orchestrator, "_dispatch_with_artifact_fallback", fake_dispatch_with_artifact_fallback)
+    monkeypatch.setattr(orchestrator, "_feed_event", fake_feed_event)
+    monkeypatch.setattr(orchestrator.time, "monotonic", lambda: next(monotonic_values, 2.9))
+    monkeypatch.setattr(orchestrator, "_save_state", lambda state_data: None)
+
+    orchestrator._auto_dispatch_role(
+        role="worker",
+        prompt="prompt",
+        config=orchestrator.RunConfig(auto_dispatch=True, worker_backend="codex"),
+        task_id="T-715",
+        round_num=1,
+        artifact_path=orchestrator.WORK_REPORT,
+        state=state,
+    )
+
+    phase_events = [payload for event, payload in events if event == orchestrator.FEED_DISPATCH_PHASE_METRICS]
+    assert len(phase_events) == 1
+    payload = phase_events[0]
+    assert payload["startup_ms"] == 200
+    assert payload["context_to_work_ms"] is None
+    assert payload["work_to_artifact_ms"] is None
+    assert payload["total_ms"] == 899
+
+
+def test_auto_dispatch_role_dispatch_event_ordering_includes_artifact_boundary(monkeypatch) -> None:
+    events: list[tuple[str, dict[str, object]]] = []
+    state = {
+        "state": orchestrator.STATE_AWAITING_WORK,
+        "round": 1,
+        "task_id": "T-715",
+        "sessions": {},
+    }
+    monkeypatch.setattr(orchestrator, "_log", lambda msg: None)
+    monkeypatch.setattr(orchestrator, "_write_dispatch_log", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        orchestrator,
+        "_agent_command",
+        lambda backend, prompt, resume_session_id=None: (
+            ["codex.exe", "exec", "short instruction"],
+            resume_session_id,
+            "STDIN_PAYLOAD",
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator.subprocess,
+        "Popen",
+        lambda cmd, **kwargs: _FakeProc(
+            stdout_lines=[
+                '{"type":"thread.started","thread_id":"tid-order"}\n',
+                '{"type":"item.completed","item":{"type":"agent_message","text":"I am analyzing"}}\n',
+                '{"type":"item.started","item":{"type":"command_execution","command":"git status --short"}}\n',
+            ],
+            returncode=0,
+        ),
+    )
+
+    def fake_dispatch_with_artifact_fallback(
+        *,
+        role: str,
+        dispatch_call,
+        artifact_path: Path,
+        task_id: str,
+        round_num: int,
+        timeout_sec: int = orchestrator.DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC,
+    ) -> dict:
+        _ = (role, artifact_path, timeout_sec)
+        dispatch_call()
+        return {"task_id": task_id, "round": round_num}
+
+    def fake_feed_event(event: str, *, level: str = "info", data: dict | None = None) -> None:
+        _ = level
+        events.append((event, dict(data or {})))
+
+    monkeypatch.setattr(orchestrator, "_dispatch_with_artifact_fallback", fake_dispatch_with_artifact_fallback)
+    monkeypatch.setattr(orchestrator, "_feed_event", fake_feed_event)
+    monkeypatch.setattr(orchestrator, "_save_state", lambda state_data: None)
+
+    orchestrator._auto_dispatch_role(
+        role="worker",
+        prompt="prompt",
+        config=orchestrator.RunConfig(auto_dispatch=True, worker_backend="codex", dispatch_retries=0),
+        task_id="T-715",
+        round_num=1,
+        artifact_path=orchestrator.WORK_REPORT,
+        state=state,
+    )
+
+    def _first_index(event_name: str) -> int:
+        return next(idx for idx, (event, _payload) in enumerate(events) if event == event_name)
+
+    assert _first_index(orchestrator.FEED_DISPATCH_START) <= _first_index(orchestrator.FEED_DISPATCH_FIRST_STDOUT)
+    assert _first_index(orchestrator.FEED_DISPATCH_FIRST_STDOUT) <= _first_index(
+        orchestrator.FEED_DISPATCH_FIRST_WORK_ACTION
+    )
+    assert _first_index(orchestrator.FEED_DISPATCH_FIRST_WORK_ACTION) <= _first_index(
+        orchestrator.FEED_DISPATCH_ARTIFACT_WRITTEN
+    )
+
+
 def test_auto_dispatch_role_clears_sessions_on_permanent_dispatch_error(tmp_path: Path, monkeypatch) -> None:
     _configure_loop_paths(monkeypatch, tmp_path)
     state = {
@@ -2007,7 +2206,10 @@ def test_feed_event_constants_defined() -> None:
     assert orchestrator.FEED_DISPATCH_COMPLETE == "dispatch_complete"
     assert orchestrator.FEED_DISPATCH_FAIL == "dispatch_fail"
     assert orchestrator.FEED_DISPATCH_FIRST_ACTION == "dispatch_first_meaningful_action"
+    assert orchestrator.FEED_DISPATCH_FIRST_STDOUT == "dispatch_first_stdout"
+    assert orchestrator.FEED_DISPATCH_FIRST_WORK_ACTION == "dispatch_first_work_action"
     assert orchestrator.FEED_DISPATCH_ARTIFACT_WRITTEN == "dispatch_artifact_written"
+    assert orchestrator.FEED_DISPATCH_PHASE_METRICS == "dispatch_phase_metrics"
     assert orchestrator.FEED_DISPATCH_RESUME == "dispatch_resume"
     assert orchestrator.FEED_ROUND_START == "round_start"
     assert orchestrator.FEED_ROUND_COMPLETE == "round_complete"
@@ -2058,6 +2260,101 @@ def test_run_auto_dispatch_emits_standardized_feed_events(monkeypatch) -> None:
             assert payload["role"] == "worker"
 
 
+def test_run_auto_dispatch_emits_first_stdout_once_after_dispatch_start(monkeypatch) -> None:
+    events: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(orchestrator, "_log", lambda msg: None)
+    monkeypatch.setattr(orchestrator, "_write_dispatch_log", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        orchestrator,
+        "_agent_command",
+        lambda backend, prompt: (["codex.exe", "exec", "short instruction"], None, "STDIN_PAYLOAD"),
+    )
+    monkeypatch.setattr(
+        orchestrator.subprocess,
+        "Popen",
+        lambda cmd, **kwargs: _FakeProc(
+            stdout_lines=[
+                '{"type":"thread.started","thread_id":"tid-1"}\n',
+                '{"type":"item.completed","item":{"type":"agent_message","text":"working..."}}\n',
+            ],
+            returncode=0,
+        ),
+    )
+
+    def fake_feed_event(event: str, *, level: str = "info", data: dict | None = None) -> None:
+        _ = level
+        events.append((event, dict(data or {})))
+
+    monkeypatch.setattr(orchestrator, "_feed_event", fake_feed_event)
+
+    orchestrator._run_auto_dispatch(
+        "worker",
+        "codex",
+        "ignored",
+        30,
+        task_id="T-626",
+        round_num=1,
+    )
+
+    start_indexes = [idx for idx, (event, _payload) in enumerate(events) if event == orchestrator.FEED_DISPATCH_START]
+    stdout_events = [
+        (idx, payload)
+        for idx, (event, payload) in enumerate(events)
+        if event == orchestrator.FEED_DISPATCH_FIRST_STDOUT and payload.get("status") != "not_observed"
+    ]
+    assert start_indexes
+    assert len(stdout_events) == 1
+    assert start_indexes[0] < stdout_events[0][0]
+    assert isinstance(stdout_events[0][1]["latency_ms"], int)
+
+
+def test_run_auto_dispatch_first_work_action_ignores_summary_only_lines(monkeypatch) -> None:
+    events: list[tuple[str, str, dict[str, object]]] = []
+    monkeypatch.setattr(orchestrator, "_log", lambda msg: None)
+    monkeypatch.setattr(orchestrator, "_write_dispatch_log", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        orchestrator,
+        "_agent_command",
+        lambda backend, prompt: (["codex.exe", "exec", "short instruction"], None, "STDIN_PAYLOAD"),
+    )
+    monkeypatch.setattr(
+        orchestrator.subprocess,
+        "Popen",
+        lambda cmd, **kwargs: _FakeProc(
+            stdout_lines=[
+                '{"type":"item.completed","item":{"type":"agent_message","text":"analyzing task"}}\n',
+                '{"type":"item.started","item":{"type":"command_execution","command":"git status --short"}}\n',
+                '{"type":"item.started","item":{"type":"command_execution","command":"git diff --stat"}}\n',
+            ],
+            returncode=0,
+        ),
+    )
+
+    def fake_feed_event(event: str, *, level: str = "info", data: dict | None = None) -> None:
+        events.append((event, level, dict(data or {})))
+
+    monkeypatch.setattr(orchestrator, "_feed_event", fake_feed_event)
+
+    orchestrator._run_auto_dispatch(
+        "worker",
+        "codex",
+        "ignored",
+        30,
+        task_id="T-626",
+        round_num=1,
+    )
+
+    work_events = [
+        payload
+        for event, _level, payload in events
+        if event == orchestrator.FEED_DISPATCH_FIRST_WORK_ACTION and payload.get("status") != "not_observed"
+    ]
+    assert len(work_events) == 1
+    assert work_events[0]["signal"] == "item.started"
+    assert work_events[0]["item_type"] == "command_execution"
+    assert isinstance(work_events[0]["latency_ms"], int)
+
+
 def test_run_auto_dispatch_emits_first_meaningful_action_metric(monkeypatch) -> None:
     events: list[tuple[str, str, dict[str, object]]] = []
     monkeypatch.setattr(orchestrator, "_log", lambda msg: None)
@@ -2100,6 +2397,7 @@ def test_run_auto_dispatch_emits_first_meaningful_action_metric(monkeypatch) -> 
     assert observed[0]["round"] == 1
     assert observed[0]["role"] == "worker"
     assert isinstance(observed[0]["latency_ms"], int)
+    assert observed[0]["signal_type"] == "summary_signal"
     assert str(observed[0].get("summary", "")).startswith("[worker] Running:")
 
 

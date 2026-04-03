@@ -143,6 +143,26 @@ Project files always override built-in defaults when present.
 - **Session rotation**: set `--max-session-rounds` to intentionally start a fresh backend session after N rounds while preserving continuity via handoff context.
 - **Fallback behavior**: invalid resume sessions are detected, logged, and retried with a fresh session.
 
+### Dispatch phase metrics
+
+The feed keeps backward-compatible dispatch events (`dispatch_start`, `dispatch_artifact_written`) and adds phase markers for timing analysis:
+
+- `dispatch_first_stdout`: first streamed stdout line from the backend process.
+- `dispatch_first_work_action`: first concrete execution signal (for example Codex `item.started` command/tool work), not summary prose.
+- `dispatch_first_meaningful_action`: first meaningful summary signal (message/tool summary). This is intentionally **not** the work-start boundary.
+- `dispatch_phase_metrics`: one aggregated event per role/round with:
+  - `startup_ms = t(first_stdout) - t(dispatch_start)`
+  - `context_to_work_ms = t(first_work_action) - t(first_stdout)`
+  - `work_to_artifact_ms = t(dispatch_artifact_written) - t(first_work_action)`
+  - `total_ms = t(dispatch_artifact_written) - t(dispatch_start)`
+
+Interpretation boundaries:
+
+- `startup_ms` captures process startup + first output availability.
+- `context_to_work_ms` captures initial context understanding before real execution begins.
+- `work_to_artifact_ms` captures execution-to-artifact completion.
+- If a boundary is missing (for example no concrete work signal), the missing segment is emitted as `null` while `total_ms` is still reported.
+
 ### Key JSON schemas
 
 **task_card.json**

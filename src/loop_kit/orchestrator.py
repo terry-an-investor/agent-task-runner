@@ -204,7 +204,10 @@ FEED_DISPATCH_START = "dispatch_start"
 FEED_DISPATCH_COMPLETE = "dispatch_complete"
 FEED_DISPATCH_FAIL = "dispatch_fail"
 FEED_DISPATCH_FIRST_ACTION = "dispatch_first_meaningful_action"
+FEED_DISPATCH_FIRST_STDOUT = "dispatch_first_stdout"
+FEED_DISPATCH_FIRST_WORK_ACTION = "dispatch_first_work_action"
 FEED_DISPATCH_ARTIFACT_WRITTEN = "dispatch_artifact_written"
+FEED_DISPATCH_PHASE_METRICS = "dispatch_phase_metrics"
 FEED_DISPATCH_RESUME = "dispatch_resume"
 FEED_ROUND_START = "round_start"
 FEED_ROUND_COMPLETE = "round_complete"
@@ -1718,6 +1721,7 @@ def _collect_streamed_process_output(
     timeout_sec: int,
     verbose: bool,
     summary_callback: Callable[[str], None] | None = None,
+    stdout_line_callback: Callable[[str], None] | None = None,
 ) -> tuple[str, str, int, bool]:
     stdout_chunks: list[str] = []
     stderr_chunks: list[str] = []
@@ -1748,19 +1752,24 @@ def _collect_streamed_process_output(
         stdin_thread = threading.Thread(target=_write_stdin, daemon=True)
         stdin_thread.start()
 
+    def _on_stdout_line(raw_line: str) -> None:
+        if stdout_line_callback is not None:
+            stdout_line_callback(raw_line)
+        _stream_dispatch_stdout_line(
+            role,
+            backend,
+            raw_line,
+            parse_event_fn,
+            verbose=verbose,
+            on_summary=summary_callback,
+        )
+
     stdout_thread = threading.Thread(
         target=_read_pipe,
         args=(
             proc.stdout,
             stdout_chunks,
-            lambda raw_line: _stream_dispatch_stdout_line(
-                role,
-                backend,
-                raw_line,
-                parse_event_fn,
-                verbose=verbose,
-                on_summary=summary_callback,
-            ),
+            _on_stdout_line,
         ),
         daemon=True,
     )
@@ -1895,6 +1904,81 @@ def _is_meaningful_dispatch_summary(role: str, summary: str) -> bool:
     return summary.startswith(prefixes)
 
 
+def _extract_dispatch_work_signal(role: str, backend: str, line: str) -> dict[str, object] | None:
+    try:
+        payload = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    backend_key = backend.strip().lower()
+    if backend_key == BACKEND_CODEX:
+        if payload.get("type") != "item.started":
+            return None
+        item = payload.get("item")
+        if not isinstance(item, dict):
+            return None
+        item_type = str(item.get("type", "")).strip()
+        if item_type not in {"command_execution", "file_change"}:
+            return None
+        signal: dict[str, object] = {"signal": "item.started", "item_type": item_type}
+        if item_type == "command_execution":
+            command = _extract_command_summary(item)
+            if command:
+                signal["summary"] = f"[{role}] Running: {_truncate_summary_text(_strip_powershell_wrapper(command))}"
+        elif item_type == "file_change":
+            paths = _shorten_paths(_extract_file_paths(item))
+            if paths:
+                signal["summary"] = f"[{role}] Editing: {_summarize_paths(paths)}"
+        return signal
+
+    if backend_key == BACKEND_CLAUDE:
+        if payload.get("type") != "assistant":
+            return None
+        message = payload.get("message")
+        if not isinstance(message, dict):
+            return None
+        for block in message.get("content", []):
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            tool_name = str(block.get("name", "")).strip()
+            summary = _tool_action_summary(role, tool_name, block.get("input"))
+            signal = {"signal": "assistant.tool_use"}
+            if tool_name:
+                signal["tool_name"] = tool_name
+            if summary:
+                signal["summary"] = summary
+            return signal
+        return None
+
+    if backend_key == BACKEND_OPENCODE:
+        if payload.get("type") != "tool_use":
+            return None
+        part = payload.get("part")
+        if not isinstance(part, dict):
+            return None
+        state = part.get("state")
+        if not isinstance(state, dict) or state.get("status") == "error":
+            return None
+        tool_name = str(part.get("tool", "")).strip()
+        summary = _tool_action_summary(role, tool_name, state.get("input"))
+        signal = {"signal": "tool_use"}
+        if tool_name:
+            signal["tool_name"] = tool_name
+        if summary:
+            signal["summary"] = summary
+        return signal
+
+    return None
+
+
+def _segment_ms(start_ms: int | None, end_ms: int | None) -> int | None:
+    if start_ms is None or end_ms is None:
+        return None
+    return max(0, end_ms - start_ms)
+
+
 def _run_auto_dispatch(
     role: str,
     backend: str,
@@ -1909,12 +1993,18 @@ def _run_auto_dispatch(
     task_id: str | None = None,
     round_num: int | None = None,
     resume_session_id: str | None = None,
+    dispatch_started_at: float | None = None,
+    telemetry: dict[str, object] | None = None,
 ) -> str | None:
     parse_event_fn = _require_registered_parse_event(backend)
     retry_count = max(0, int(dispatch_retries))
     retry_base_sec = max(1, int(dispatch_retry_base_sec))
     max_attempts = retry_count + 1
     active_resume_session_id = SessionManager.normalize_session_id(resume_session_id)
+    dispatch_anchor_perf: float | None = None
+    first_stdout_ms: int | None = None
+    first_work_action_ms: int | None = None
+    first_meaningful_summary_ms: int | None = None
     _log(f"Auto-dispatch start: role={role} backend={backend} retries={retry_count} retry_base_sec={retry_base_sec}")
     if heartbeat_enabled:
         _start_auto_dispatch_heartbeat(
@@ -1927,16 +2017,21 @@ def _run_auto_dispatch(
     try:
         while attempt < max_attempts:
             attempt += 1
-            attempt_started_at = time.perf_counter()
-            first_meaningful_action_ms: int | None = None
+
+            def _elapsed_ms_now() -> int:
+                nonlocal dispatch_anchor_perf
+                now = time.perf_counter()
+                if dispatch_anchor_perf is None:
+                    dispatch_anchor_perf = now
+                return max(0, int((now - dispatch_anchor_perf) * 1000))
 
             def _on_summary(summary: str) -> None:
-                nonlocal first_meaningful_action_ms
-                if first_meaningful_action_ms is not None:
+                nonlocal first_meaningful_summary_ms
+                if first_meaningful_summary_ms is not None:
                     return
                 if not _is_meaningful_dispatch_summary(role, summary):
                     return
-                first_meaningful_action_ms = max(0, int((time.perf_counter() - attempt_started_at) * 1000))
+                first_meaningful_summary_ms = _elapsed_ms_now()
                 _feed_event(
                     FEED_DISPATCH_FIRST_ACTION,
                     data=_feed_data(
@@ -1946,9 +2041,49 @@ def _run_auto_dispatch(
                         backend=backend,
                         attempt=attempt,
                         max_attempts=max_attempts,
-                        latency_ms=first_meaningful_action_ms,
+                        latency_ms=first_meaningful_summary_ms,
+                        signal_type="summary_signal",
                         summary=summary,
                     ),
+                )
+
+            def _on_stdout_line(raw_line: str) -> None:
+                nonlocal first_stdout_ms
+                nonlocal first_work_action_ms
+
+                if first_stdout_ms is None:
+                    first_stdout_ms = _elapsed_ms_now()
+                    _feed_event(
+                        FEED_DISPATCH_FIRST_STDOUT,
+                        data=_feed_data(
+                            task_id=task_id,
+                            round_num=round_num,
+                            role=role,
+                            backend=backend,
+                            attempt=attempt,
+                            max_attempts=max_attempts,
+                            latency_ms=first_stdout_ms,
+                        ),
+                    )
+                if first_work_action_ms is not None:
+                    return
+                signal_data = _extract_dispatch_work_signal(role, backend, raw_line.rstrip("\r\n"))
+                if signal_data is None:
+                    return
+                first_work_action_ms = _elapsed_ms_now()
+                payload = _feed_data(
+                    task_id=task_id,
+                    round_num=round_num,
+                    role=role,
+                    backend=backend,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    latency_ms=first_work_action_ms,
+                )
+                payload.update(signal_data)
+                _feed_event(
+                    FEED_DISPATCH_FIRST_WORK_ACTION,
+                    data=payload,
                 )
 
             if active_resume_session_id is None:
@@ -1959,6 +2094,8 @@ def _run_auto_dispatch(
                     prompt,
                     resume_session_id=active_resume_session_id,
                 )
+            if dispatch_anchor_perf is None:
+                dispatch_anchor_perf = time.perf_counter()
             _feed_event(
                 FEED_DISPATCH_START,
                 data=_feed_data(
@@ -1992,6 +2129,7 @@ def _run_auto_dispatch(
                     timeout_sec=timeout_sec,
                     verbose=verbose,
                     summary_callback=_on_summary,
+                    stdout_line_callback=_on_stdout_line,
                 )
             except KeyboardInterrupt:
                 _terminate_subprocess_on_interrupt(
@@ -2017,7 +2155,7 @@ def _run_auto_dispatch(
                     round_num=round_num,
                 )
                 raise
-            if first_meaningful_action_ms is None:
+            if first_meaningful_summary_ms is None:
                 _feed_event(
                     FEED_DISPATCH_FIRST_ACTION,
                     level="warning",
@@ -2029,6 +2167,7 @@ def _run_auto_dispatch(
                         attempt=attempt,
                         max_attempts=max_attempts,
                         latency_ms=None,
+                        signal_type="summary_signal",
                         status="not_observed",
                     ),
                 )
@@ -2091,6 +2230,41 @@ def _run_auto_dispatch(
             )
 
             if result.returncode == 0:
+                if first_stdout_ms is None:
+                    _feed_event(
+                        FEED_DISPATCH_FIRST_STDOUT,
+                        level="warning",
+                        data=_feed_data(
+                            task_id=task_id,
+                            round_num=round_num,
+                            role=role,
+                            backend=backend,
+                            attempt=attempt,
+                            max_attempts=max_attempts,
+                            latency_ms=None,
+                            status="not_observed",
+                        ),
+                    )
+                if first_work_action_ms is None:
+                    _feed_event(
+                        FEED_DISPATCH_FIRST_WORK_ACTION,
+                        level="warning",
+                        data=_feed_data(
+                            task_id=task_id,
+                            round_num=round_num,
+                            role=role,
+                            backend=backend,
+                            attempt=attempt,
+                            max_attempts=max_attempts,
+                            latency_ms=None,
+                            status="not_observed",
+                        ),
+                    )
+                if telemetry is not None:
+                    telemetry["first_stdout_ms"] = first_stdout_ms
+                    telemetry["first_work_action_ms"] = first_work_action_ms
+                    telemetry["first_meaningful_action_ms"] = first_meaningful_summary_ms
+                    telemetry["dispatch_started_at"] = dispatch_started_at
                 _log(f"Auto-dispatch done: role={role} backend={backend} attempts={attempt}")
                 return session_id
 
@@ -4642,6 +4816,7 @@ def _auto_dispatch_role(
     )
     dispatch_session_id: str | None = None
     dispatch_started_at = time.monotonic()
+    dispatch_metrics: dict[str, object] = {}
 
     def _dispatch_call() -> None:
         nonlocal dispatch_session_id
@@ -4658,6 +4833,8 @@ def _auto_dispatch_role(
             task_id=task_id,
             round_num=round_num,
             resume_session_id=resume_session_id,
+            dispatch_started_at=dispatch_started_at,
+            telemetry=dispatch_metrics,
         )
 
     try:
@@ -4669,6 +4846,7 @@ def _auto_dispatch_role(
             round_num=round_num,
             timeout_sec=config.artifact_timeout,
         )
+        artifact_written_latency_ms = max(0, int((time.monotonic() - dispatch_started_at) * 1000))
         _feed_event(
             FEED_DISPATCH_ARTIFACT_WRITTEN,
             data=_feed_data(
@@ -4677,8 +4855,26 @@ def _auto_dispatch_role(
                 role=role,
                 backend=backend,
                 artifact_path=artifact_path.name,
-                latency_ms=max(0, int((time.monotonic() - dispatch_started_at) * 1000)),
+                latency_ms=artifact_written_latency_ms,
                 status="written",
+            ),
+        )
+        first_stdout_ms = dispatch_metrics.get("first_stdout_ms")
+        startup_ms = first_stdout_ms if isinstance(first_stdout_ms, int) else None
+        first_work_action_ms = dispatch_metrics.get("first_work_action_ms")
+        work_ms = first_work_action_ms if isinstance(first_work_action_ms, int) else None
+        _feed_event(
+            FEED_DISPATCH_PHASE_METRICS,
+            data=_feed_data(
+                task_id=task_id,
+                round_num=round_num,
+                role=role,
+                backend=backend,
+                session_id=SessionManager.normalize_session_id(dispatch_session_id),
+                startup_ms=startup_ms,
+                context_to_work_ms=_segment_ms(startup_ms, work_ms),
+                work_to_artifact_ms=_segment_ms(work_ms, artifact_written_latency_ms),
+                total_ms=artifact_written_latency_ms,
             ),
         )
     except PermanentDispatchError:
