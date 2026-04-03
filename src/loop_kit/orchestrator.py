@@ -1260,10 +1260,22 @@ def _build_claude_command(
     resume_session_id: str | None = None,
 ) -> tuple[list[str], str | None, str | None]:
     sid = resume_session_id.strip() if isinstance(resume_session_id, str) and resume_session_id.strip() else ""
-    if not sid:
+    if sid:
+        # Resume existing session with --resume flag
+        cmd = [
+            exe,
+            "-p",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--dangerously-skip-permissions",
+            "--resume",
+            sid,
+        ]
+    else:
+        # New session: generate fresh UUID
         sid = str(uuid.uuid4())
-    return (
-        [
+        cmd = [
             exe,
             "-p",
             "--output-format",
@@ -1272,10 +1284,8 @@ def _build_claude_command(
             "--dangerously-skip-permissions",
             "--session-id",
             sid,
-        ],
-        sid,
-        prompt,
-    )
+        ]
+    return (cmd, sid, prompt)
 
 
 def _resolve_backend_exe(backend: str) -> str:
