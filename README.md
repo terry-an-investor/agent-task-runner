@@ -29,21 +29,13 @@ loop index
 loop run --task .loop/task_card.json --auto-dispatch --worker-backend codex --reviewer-backend codex
 ```
 
-## 📋 Table of Contents
-
-- [Core Concepts](#core-concepts)
-- [CLI Reference](#cli-reference)
-- [Configuration](#configuration)
-- [Architecture](#architecture)
-- [Development](#development)
-
 ## Prerequisites
 
 - Python >= 3.11
 - Git repository (the orchestrator uses git commits as the source of truth)
 - At least one AI backend installed: [codex](https://github.com/openai/codex), [claude](https://docs.anthropic.com/en/docs/claude-code), or [opencode](https://opencode.ai)
 
-## CI
+## 📋 Table of Contents
 
 GitHub Actions workflow [`loop-ci.yml`](.github/workflows/loop-ci.yml) runs on `push` to `main`/`master` and on `pull_request`.
 
@@ -352,10 +344,6 @@ Transitions are trigger-driven:
 - **Session rotation**: set `--max-session-rounds` to intentionally rotate sessions
 - **Fallback**: invalid resume sessions are detected and retried with fresh sessions
 
-### Archive
-
-Round artifacts are archived to `.loop/archive/{task_id}/r{N}_{name}.json` using payload identity (`task_id`, `round`) before overwrite, preserving deterministic round history.
-
 ## Performance Metrics
 
 `loop dispatch-metrics` analyzes `.loop/logs/feed.jsonl` to report:
@@ -368,38 +356,7 @@ Interpretation:
 - `context_to_work_ms`: initial prompt processing before execution
 - `work_to_artifact_ms`: actual code work duration
 
-### Core run-loop state machine
-
-The orchestrator run loop uses explicit state metadata and trigger-driven transitions for the core states:
-
-- `idle` (no active contract)
-- `awaiting_work` (worker phase)
-- `awaiting_review` (reviewer phase)
-- `done` (terminal: approved, timeout, or blocked/error outcomes)
-
-State names in `state.json` are unchanged for backward compatibility.
-
-| Trigger | Transition | Kind | Notes |
-|---------|------------|------|-------|
-| `bootstrap` | `idle|done|awaiting_* -> awaiting_work` | normal | Initializes round contract for a task. |
-| `prepare_round` | `awaiting_*|idle|done -> awaiting_work` | normal | Normalizes resumed/single-round execution start. |
-| `worker_completed` | `awaiting_work -> awaiting_review` | normal | Worker artifact validated and review request prepared. |
-| `reviewer_approved` | `awaiting_review -> done` | normal | Approved terminal path (`outcome=approved`). |
-| `reviewer_changes_required` | `awaiting_review -> awaiting_work` | retry | Declarative retry transition (`round += 1`). |
-| `worker_timeout` | `awaiting_work -> done` | timeout | Declarative timeout terminal path. |
-| `reviewer_timeout` | `awaiting_review -> done` | timeout | Declarative timeout terminal path. |
-| `terminal_error` | `any core state -> done` | error | Centralized blocked/error terminal transition. |
-| `max_rounds_exhausted` | `awaiting_work|awaiting_review -> done` | retry | Terminal stop when max rounds reached. |
-
-`state_transition` feed events are emitted through one centralized transition path and include `trigger` plus `transition_kind`.
-
-Dispatch logs (`.loop/logs/*_dispatch.log`) redact common sensitive values before persistence (for example bearer tokens, API keys, and password-like fields).
-
-### Archive
-
-Round artifacts are archived to `.loop/archive/{task_id}/r{N}_{name}.json` using payload identity (`task_id`, `round`) before overwrite, preserving deterministic round history and rejecting cross-task writes.
-
-## Architecture
+## Development
 
 ```
                    ┌──────────┐
@@ -453,6 +410,18 @@ uv run --group dev pytest
 # Run as module
 uv run python -m loop_kit init
 ```
+
+### CI
+
+GitHub Actions workflow [`loop-ci.yml`](.github/workflows/loop-ci.yml) runs on `push` to `main`/`master` and on `pull_request`:
+
+- `uv sync --frozen --group dev`
+- `uv run --group dev --with pytest-cov pytest --cov=src/loop_kit --cov-report=xml`
+- `uv run --group dev pytest -m integration` when integration-marked tests exist
+- `uv run --group dev ruff check src/loop_kit tests`
+- `uv run --group dev --with mypy mypy src/loop_kit` (optional, non-blocking)
+
+The workflow uploads `coverage.xml` to Codecov and stores JUnit XML test results as workflow artifacts.
 
 ## License
 
