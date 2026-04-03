@@ -246,6 +246,25 @@ class PermanentDispatchError(RuntimeError):
     """Dispatch failed with a non-retriable error."""
 
 
+@dataclass(frozen=True, slots=True)
+class LoopPaths:
+    root: Path
+    dir: Path
+    state: Path
+    task_card: Path
+    review_request: Path
+    review_report: Path
+    work_report: Path
+    fix_list: Path
+    summary: Path
+    logs: Path
+    archive: Path
+
+
+# Backward compatibility bridge while path globals are migrated function-by-function.
+_global_paths: LoopPaths | None = None
+
+
 # ── file paths ──────────────────────────────────────────────────────
 def _path(name: str) -> Path:
     return LOOP_DIR / name
@@ -306,7 +325,67 @@ def _resolve_loop_dir(loop_dir: str | Path) -> Path:
     return candidate.resolve()
 
 
-def _configure_loop_paths(loop_dir: str | Path = ".loop") -> None:
+def _build_loop_paths(loop_dir: Path) -> LoopPaths:
+    resolved_dir = _resolve_loop_dir(loop_dir)
+    return LoopPaths(
+        root=ROOT,
+        dir=resolved_dir,
+        state=resolved_dir / "state.json",
+        task_card=resolved_dir / "task_card.json",
+        review_request=resolved_dir / "review_request.json",
+        review_report=resolved_dir / "review_report.json",
+        work_report=resolved_dir / "work_report.json",
+        fix_list=resolved_dir / "fix_list.json",
+        summary=resolved_dir / "summary.json",
+        logs=resolved_dir / "logs",
+        archive=resolved_dir / "archive",
+    )
+
+
+def _snapshot_global_paths() -> LoopPaths:
+    return LoopPaths(
+        root=ROOT,
+        dir=LOOP_DIR,
+        state=STATE_FILE,
+        task_card=TASK_CARD,
+        review_request=REVIEW_REQ,
+        review_report=REVIEW_REPORT,
+        work_report=WORK_REPORT,
+        fix_list=FIX_LIST,
+        summary=LOOP_DIR / "summary.json",
+        logs=LOGS_DIR,
+        archive=ARCHIVE_DIR,
+    )
+
+
+def _paths_match_globals(paths: LoopPaths) -> bool:
+    current = _snapshot_global_paths()
+    return (
+        paths.root == current.root
+        and paths.dir == current.dir
+        and paths.state == current.state
+        and paths.task_card == current.task_card
+        and paths.review_request == current.review_request
+        and paths.review_report == current.review_report
+        and paths.work_report == current.work_report
+        and paths.fix_list == current.fix_list
+        and paths.summary == current.summary
+        and paths.logs == current.logs
+        and paths.archive == current.archive
+    )
+
+
+def _resolve_paths(paths: LoopPaths | None = None) -> LoopPaths:
+    # TODO(paths): _render_fix_list_section/_render_task_packet_section/_resolve_task_path
+    # still consume module globals; keep them synchronized via _global_paths during migration.
+    if paths is not None:
+        return paths
+    if _global_paths is not None and _paths_match_globals(_global_paths):
+        return _global_paths
+    return _snapshot_global_paths()
+
+
+def _apply_loop_paths(paths: LoopPaths) -> None:
     global LOOP_DIR
     global LOGS_DIR
     global RUNTIME_DIR
@@ -332,23 +411,23 @@ def _configure_loop_paths(loop_dir: str | Path = ".loop") -> None:
     global _PATTERNS_FILE
     global _FEED_ROUND
 
-    LOOP_DIR = _resolve_loop_dir(loop_dir)
-    LOGS_DIR = LOOP_DIR / "logs"
-    RUNTIME_DIR = LOOP_DIR / "runtime"
-    ARCHIVE_DIR = LOOP_DIR / "archive"
-    STATE_FILE = LOOP_DIR / "state.json"
-    _STATE_BACKUP = LOOP_DIR / ".state.json.bak"
-    TASK_CARD = _path("task_card.json")
-    FIX_LIST = _path("fix_list.json")
-    WORK_REPORT = _path("work_report.json")
-    REVIEW_REQ = _path("review_request.json")
-    REVIEW_REPORT = _path("review_report.json")
-    LOCK_FILE = _path("lock")
-    _SUMMARY_FILE = LOOP_DIR / "summary.json"
-    _CONFIG_FILE = LOOP_DIR / "config.json"
-    _TASKS_DIR = LOOP_DIR / "tasks"
-    TASK_PACKET = _path("task_packet.json")
-    _CONTEXT_DIR = LOOP_DIR / "context"
+    LOOP_DIR = paths.dir
+    LOGS_DIR = paths.logs
+    RUNTIME_DIR = paths.dir / "runtime"
+    ARCHIVE_DIR = paths.archive
+    STATE_FILE = paths.state
+    _STATE_BACKUP = paths.dir / ".state.json.bak"
+    TASK_CARD = paths.task_card
+    FIX_LIST = paths.fix_list
+    WORK_REPORT = paths.work_report
+    REVIEW_REQ = paths.review_request
+    REVIEW_REPORT = paths.review_report
+    LOCK_FILE = paths.dir / "lock"
+    _SUMMARY_FILE = paths.summary
+    _CONFIG_FILE = paths.dir / "config.json"
+    _TASKS_DIR = paths.dir / "tasks"
+    TASK_PACKET = paths.dir / "task_packet.json"
+    _CONTEXT_DIR = paths.dir / "context"
     _MODULE_MAP_FILE = _CONTEXT_DIR / "module_map.json"
     _PROJECT_FACTS_FILE = _CONTEXT_DIR / "project_facts.md"
     _PITFALLS_FILE = _CONTEXT_DIR / "pitfalls.md"
@@ -358,16 +437,25 @@ def _configure_loop_paths(loop_dir: str | Path = ".loop") -> None:
     _FEED_ROUND = None
 
 
-def _loop_templates_dir() -> Path:
-    return LOOP_DIR / "templates"
+def _configure_loop_paths(loop_dir: str | Path = ".loop") -> LoopPaths:
+    global _global_paths
+    paths = _build_loop_paths(Path(loop_dir))
+    _global_paths = paths
+    _apply_loop_paths(paths)
+    return paths
 
 
-def _worker_prompt_template_path() -> Path:
-    return _loop_templates_dir() / "worker_prompt.txt"
+def _loop_templates_dir(paths: LoopPaths | None = None) -> Path:
+    resolved_paths = _resolve_paths(paths)
+    return resolved_paths.dir / "templates"
 
 
-def _reviewer_prompt_template_path() -> Path:
-    return _loop_templates_dir() / "reviewer_prompt.txt"
+def _worker_prompt_template_path(paths: LoopPaths | None = None) -> Path:
+    return _loop_templates_dir(paths=paths) / "worker_prompt.txt"
+
+
+def _reviewer_prompt_template_path(paths: LoopPaths | None = None) -> Path:
+    return _loop_templates_dir(paths=paths) / "reviewer_prompt.txt"
 
 
 def _display_path(path: Path) -> str:
@@ -378,8 +466,9 @@ def _display_path(path: Path) -> str:
         return resolved.as_posix()
 
 
-def _task_archive_dir(task_id: str) -> Path:
-    return ARCHIVE_DIR / task_id
+def _task_archive_dir(task_id: str, paths: LoopPaths | None = None) -> Path:
+    resolved_paths = _resolve_paths(paths)
+    return resolved_paths.archive / task_id
 
 
 def _archive_bus_file(path: Path, task_id: str, round_num: int, suffix: str) -> Path | None:
@@ -427,23 +516,25 @@ def _completed_proc(
     )
 
 
-def _archive_task_summary(task_id: str) -> Path | None:
-    summary_path = LOOP_DIR / "summary.json"
+def _archive_task_summary(task_id: str, paths: LoopPaths | None = None) -> Path | None:
+    resolved_paths = _resolve_paths(paths)
+    summary_path = resolved_paths.summary
     if not summary_path.exists():
         return None
-    archive_dir = _task_archive_dir(task_id)
+    archive_dir = _task_archive_dir(task_id, paths=resolved_paths)
     archive_dir.mkdir(parents=True, exist_ok=True)
     dest = archive_dir / "summary.json"
     shutil.copy2(summary_path, dest)
     return dest
 
 
-def _archive_state_for_round(task_id: str, round_num: int) -> Path | None:
+def _archive_state_for_round(task_id: str, round_num: int, paths: LoopPaths | None = None) -> Path | None:
     """Capture the pre-round state snapshot once for this round."""
-    dest = _task_archive_dir(task_id) / f"r{round_num}_state.json"
+    resolved_paths = _resolve_paths(paths)
+    dest = _task_archive_dir(task_id, paths=resolved_paths) / f"r{round_num}_state.json"
     if dest.exists():
         return dest
-    return _archive_bus_file(STATE_FILE, task_id, round_num, "state")
+    return _archive_bus_file(resolved_paths.state, task_id, round_num, "state")
 
 
 def _lock_file(handle) -> None:
@@ -521,12 +612,14 @@ def _heartbeat_path(role: str) -> Path:
     return RUNTIME_DIR / f"{role}.heartbeat.json"
 
 
-def _dispatch_log_path(role: str) -> Path:
-    return LOGS_DIR / f"{role}_dispatch.log"
+def _dispatch_log_path(role: str, paths: LoopPaths | None = None) -> Path:
+    resolved_paths = _resolve_paths(paths)
+    return resolved_paths.logs / f"{role}_dispatch.log"
 
 
-def _feed_log_path() -> Path:
-    return LOGS_DIR / "feed.jsonl"
+def _feed_log_path(paths: LoopPaths | None = None) -> Path:
+    resolved_paths = _resolve_paths(paths)
+    return resolved_paths.logs / "feed.jsonl"
 
 
 DEFAULT_LOG_MAX_BYTES = 5 * 1024 * 1024
@@ -588,25 +681,33 @@ def _feed_data(
     return payload
 
 
-def _ensure_logs_dir() -> None:
+def _ensure_logs_dir(paths: LoopPaths | None = None) -> None:
     global _LOGS_DIR_ENSURED
     global _LOGS_DIR_ENSURED_PATH
-    current_logs_dir = _normalized_abs(LOGS_DIR)
-    if _LOGS_DIR_ENSURED and current_logs_dir == _LOGS_DIR_ENSURED_PATH and LOGS_DIR.is_dir():
+    resolved_paths = _resolve_paths(paths)
+    logs_dir = resolved_paths.logs
+    current_logs_dir = _normalized_abs(logs_dir)
+    if _LOGS_DIR_ENSURED and current_logs_dir == _LOGS_DIR_ENSURED_PATH and logs_dir.is_dir():
         return
-    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    logs_dir.mkdir(parents=True, exist_ok=True)
     _LOGS_DIR_ENSURED = True
     _LOGS_DIR_ENSURED_PATH = current_logs_dir
 
 
-def _feed_event(event: str, *, level: str = "info", data: dict | None = None) -> None:
+def _feed_event(
+    event: str,
+    *,
+    level: str = "info",
+    data: dict | None = None,
+    paths: LoopPaths | None = None,
+) -> None:
     if _FEED_TASK_ID and data and data.get("task_id") not in (None, _FEED_TASK_ID):
         return
     payload_data = dict(data or {})
     if _FEED_TASK_ID and "task_id" not in payload_data:
         payload_data["task_id"] = _FEED_TASK_ID
-    _ensure_logs_dir()
-    feed_path = _feed_log_path()
+    _ensure_logs_dir(paths=paths)
+    feed_path = _feed_log_path(paths=paths)
     _rotate_log_file(feed_path)
     payload = {
         "ts": _ts(),
@@ -618,19 +719,20 @@ def _feed_event(event: str, *, level: str = "info", data: dict | None = None) ->
         f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
-def _log(msg: str) -> None:
+def _log(msg: str, paths: LoopPaths | None = None) -> None:
     ts = _ts()
     line = f"[{ts}] {msg}"
     print(line, flush=True)
-    _ensure_logs_dir()
-    log_path = LOGS_DIR / "orchestrator.log"
+    resolved_paths = _resolve_paths(paths)
+    _ensure_logs_dir(paths=resolved_paths)
+    log_path = resolved_paths.logs / "orchestrator.log"
     _rotate_log_file(log_path)
     entry: dict[str, object] = {"ts": ts, "msg": msg}
     if _FEED_TASK_ID:
         entry["task_id"] = _FEED_TASK_ID
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    _feed_event(FEED_LOG, data=_feed_data(role="orchestrator", message=msg))
+    _feed_event(FEED_LOG, data=_feed_data(role="orchestrator", message=msg), paths=resolved_paths)
 
 
 def _normalized_abs(path: Path) -> str:
@@ -2504,8 +2606,9 @@ def _build_prompt_sections(task_id: str, round_num: int) -> list[tuple[str, str]
     return sections
 
 
-def _worker_prompt(task_id: str, round_num: int) -> str:
-    template_path = _worker_prompt_template_path()
+def _worker_prompt(task_id: str, round_num: int, paths: LoopPaths | None = None) -> str:
+    resolved_paths = _resolve_paths(paths)
+    template_path = _worker_prompt_template_path(paths=resolved_paths)
     template_text = _read_text_optional(template_path)
     if template_text is not None:
         agents_text = _read_text_with_default(
@@ -2526,7 +2629,7 @@ def _worker_prompt(task_id: str, round_num: int) -> str:
         context = {
             "task_id": task_id,
             "round_num": str(round_num),
-            "work_report_path": _display_path(WORK_REPORT),
+            "work_report_path": _display_path(resolved_paths.work_report),
             "agents_md": agents_text,
             "role_md": role_text,
             "orchestrator_path": _display_path(orchestrator_path),
@@ -2541,7 +2644,7 @@ def _worker_prompt(task_id: str, round_num: int) -> str:
     header = (
         f"Role: code-writer worker for PM loop.\n"
         f"Current task_id: {task_id}, round: {round_num}.\n"
-        f"Execute the contract below and only finish after writing {_display_path(WORK_REPORT)}."
+        f"Execute the contract below and only finish after writing {_display_path(resolved_paths.work_report)}."
     )
     sections = _build_prompt_sections(task_id, round_num)
     result = header + "\n\n" + _join_prompt_sections(sections)
@@ -2550,7 +2653,8 @@ def _worker_prompt(task_id: str, round_num: int) -> str:
     return result
 
 
-def _reviewer_prompt(task_id: str, round_num: int) -> str:
+def _reviewer_prompt(task_id: str, round_num: int, paths: LoopPaths | None = None) -> str:
+    resolved_paths = _resolve_paths(paths)
     role_text = _read_text_with_default(
         ROOT / "docs" / "roles" / "reviewer.md",
         "reviewer_md_default.txt",
@@ -2562,10 +2666,10 @@ def _reviewer_prompt(task_id: str, round_num: int) -> str:
         "role_md": role_text,
         "task_card_section": "",
         "prior_context_section": "",
-        "review_report_path": _display_path(REVIEW_REPORT),
+        "review_report_path": _display_path(resolved_paths.review_report),
     }
     return _render_prompt_template(
-        template_path=_reviewer_prompt_template_path(),
+        template_path=_reviewer_prompt_template_path(paths=resolved_paths),
         context=context,
     )
 
@@ -2588,16 +2692,19 @@ def _default_state(task_id: str | None = None, round_num: int = 0) -> dict:
     }
 
 
-def _load_state() -> dict:
+def _load_state(paths: LoopPaths | None = None) -> dict:
+    resolved_paths = _resolve_paths(paths)
+    state_file = resolved_paths.state
+    state_backup = resolved_paths.dir / ".state.json.bak"
     default_state = _default_state()
-    if not STATE_FILE.exists():
+    if not state_file.exists():
         return default_state.copy()
 
     def _load_backup_state() -> dict | None:
-        if not _STATE_BACKUP.exists():
+        if not state_backup.exists():
             return None
         try:
-            backup_data = json.loads(_STATE_BACKUP.read_text(encoding="utf-8"))
+            backup_data = json.loads(state_backup.read_text(encoding="utf-8"))
         except json.JSONDecodeError as backup_err:
             _log(f"Warning: backup state file is corrupted: {backup_err}.")
             return None
@@ -2610,12 +2717,12 @@ def _load_state() -> dict:
         return backup_data
 
     try:
-        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        data = json.loads(state_file.read_text(encoding="utf-8"))
     except json.JSONDecodeError as e:
         backup_state = _load_backup_state()
         if backup_state is not None:
             print("state.json corrupted, recovered from backup", file=sys.stderr)
-            _atomic_write_json(STATE_FILE, backup_state)
+            _atomic_write_json(state_file, backup_state)
             return backup_state
         _log(f"Warning: state.json is corrupted: {e}. Using fresh default state.")
         return default_state.copy()
@@ -2623,7 +2730,7 @@ def _load_state() -> dict:
         backup_state = _load_backup_state()
         if backup_state is not None:
             print("state.json corrupted, recovered from backup", file=sys.stderr)
-            _atomic_write_json(STATE_FILE, backup_state)
+            _atomic_write_json(state_file, backup_state)
             return backup_state
         _log(f"Warning: unable to read state.json: {e}. Using fresh default state.")
         return default_state.copy()
@@ -2673,15 +2780,18 @@ def _atomic_write_json(path: Path, data: object) -> None:
         raise
 
 
-def _save_state(state: dict) -> None:
+def _save_state(state: dict, paths: LoopPaths | None = None) -> None:
+    resolved_paths = _resolve_paths(paths)
+    state_file = resolved_paths.state
+    state_backup = resolved_paths.dir / ".state.json.bak"
     previous_state: dict | None = None
-    if STATE_FILE.exists():
-        previous = _read_json_if_exists(STATE_FILE)
+    if state_file.exists():
+        previous = _read_json_if_exists(state_file)
         if isinstance(previous, dict):
             previous_state = previous
-        _STATE_BACKUP.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(STATE_FILE, _STATE_BACKUP)
-    _atomic_write_json(STATE_FILE, state)
+        state_backup.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(state_file, state_backup)
+    _atomic_write_json(state_file, state)
     from_state = previous_state.get("state") if isinstance(previous_state, dict) else None
     from_round = previous_state.get("round") if isinstance(previous_state, dict) else None
     to_state = state.get("state")
@@ -2786,18 +2896,20 @@ def _reset_bus() -> None:
         _log(f"Reset: removed {removed} stale bus file(s)")
 
 
-def _sync_task_card(task_path: str) -> None:
+def _sync_task_card(task_path: str, paths: LoopPaths | None = None) -> None:
     """Copy external task card to .loop/task_card.json if it lives elsewhere."""
+    resolved_paths = _resolve_paths(paths)
+    task_card_path = resolved_paths.task_card
     src = Path(task_path)
     if not src.is_file():
         return
     try:
-        if src.resolve() == TASK_CARD.resolve():
+        if src.resolve() == task_card_path.resolve():
             return
     except OSError:
         pass
-    TASK_CARD.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
-    _log(f"Synced task card: {src} -> {TASK_CARD}")
+    task_card_path.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+    _log(f"Synced task card: {src} -> {task_card_path}")
 
 
 def _resolve_task_path(task_ref: str | None) -> str | None:
@@ -2972,14 +3084,20 @@ def _wait_for_file(
         time.sleep(POLL_INTERVAL_SEC)
 
 
-def _fail_with_state(state: dict, outcome: str, message: str, exit_code: int = EXIT_GENERAL_ERROR) -> None:
+def _fail_with_state(
+    state: dict,
+    outcome: str,
+    message: str,
+    exit_code: int = EXIT_GENERAL_ERROR,
+    paths: LoopPaths | None = None,
+) -> None:
     _log(message)
     print(f"  Error: {message}", file=sys.stderr)
     state["state"] = STATE_DONE
     state["outcome"] = outcome
     state["failed_at"] = _ts()
     state["error"] = message
-    _save_state(state)
+    _save_state(state, paths=paths)
     try:
         # Map exit code to appropriate exception type
         if exit_code == EXIT_VALIDATION_ERROR:
@@ -3159,21 +3277,27 @@ def cmd_index() -> None:
 
 
 # ── init ────────────────────────────────────────────────────────────
-def cmd_init() -> None:
-    LOOP_DIR.mkdir(exist_ok=True)
-    (LOOP_DIR / "examples").mkdir(exist_ok=True)
-    LOGS_DIR.mkdir(exist_ok=True)
-    RUNTIME_DIR.mkdir(exist_ok=True)
-    ARCHIVE_DIR.mkdir(exist_ok=True)
-    _CONTEXT_DIR.mkdir(exist_ok=True)
-    templates_dir = _loop_templates_dir()
+def cmd_init(paths: LoopPaths | None = None) -> None:
+    resolved_paths = _resolve_paths(paths)
+    loop_dir = resolved_paths.dir
+    logs_dir = resolved_paths.logs
+    runtime_dir = loop_dir / "runtime"
+    archive_dir = resolved_paths.archive
+    context_dir = loop_dir / "context"
+    loop_dir.mkdir(exist_ok=True)
+    (loop_dir / "examples").mkdir(exist_ok=True)
+    logs_dir.mkdir(exist_ok=True)
+    runtime_dir.mkdir(exist_ok=True)
+    archive_dir.mkdir(exist_ok=True)
+    context_dir.mkdir(exist_ok=True)
+    templates_dir = _loop_templates_dir(paths=resolved_paths)
     templates_dir.mkdir(exist_ok=True)
-    _log(f"Initialized loop directory: {LOOP_DIR}")
-    print(f"  Created: {LOOP_DIR}")
-    print(f"  Created: {LOGS_DIR}")
-    print(f"  Created: {RUNTIME_DIR}")
-    print(f"  Created: {ARCHIVE_DIR}")
-    print(f"  Created: {_CONTEXT_DIR}")
+    _log(f"Initialized loop directory: {loop_dir}")
+    print(f"  Created: {loop_dir}")
+    print(f"  Created: {logs_dir}")
+    print(f"  Created: {runtime_dir}")
+    print(f"  Created: {archive_dir}")
+    print(f"  Created: {context_dir}")
     print(f"  Created: {templates_dir}")
     if not _MODULE_MAP_FILE.exists():
         _atomic_write_json(_MODULE_MAP_FILE, _empty_module_map())
@@ -3185,7 +3309,7 @@ def cmd_init() -> None:
     if _write_template_if_missing(_PATTERNS_FILE, _default_patterns_content()):
         print(f"  Created: {_PATTERNS_FILE}")
     # copy example task card if not present
-    example = LOOP_DIR / "examples" / "task_card.json"
+    example = loop_dir / "examples" / "task_card.json"
     if not example.exists():
         example.write_text(
             json.dumps(
@@ -3204,17 +3328,18 @@ def cmd_init() -> None:
             encoding="utf-8",
         )
         print(f"  Created: {example}")
-    worker_template = _worker_prompt_template_path()
+    worker_template = _worker_prompt_template_path(paths=resolved_paths)
     if _write_template_if_missing(worker_template, DEFAULT_WORKER_PROMPT_TEMPLATE + "\n"):
         print(f"  Created: {worker_template}")
-    reviewer_template = _reviewer_prompt_template_path()
+    reviewer_template = _reviewer_prompt_template_path(paths=resolved_paths)
     if _write_template_if_missing(reviewer_template, DEFAULT_REVIEWER_PROMPT_TEMPLATE + "\n"):
         print(f"  Created: {reviewer_template}")
 
 
 # ── status ──────────────────────────────────────────────────────────
-def cmd_status() -> None:
-    state = _load_state()
+def cmd_status(paths: LoopPaths | None = None) -> None:
+    resolved_paths = _resolve_paths(paths)
+    state = _load_state(paths=resolved_paths)
     print(f"State: {state.get('state', 'unknown')}")
     print(f"Round: {state.get('round', 0)}")
     task_id = state.get("task_id")
@@ -3225,7 +3350,13 @@ def cmd_status() -> None:
         print(f"Outcome: {outcome}")
     print()
     print("Bus files:")
-    for p in [TASK_CARD, WORK_REPORT, REVIEW_REQ, REVIEW_REPORT, FIX_LIST]:
+    for p in [
+        resolved_paths.task_card,
+        resolved_paths.work_report,
+        resolved_paths.review_request,
+        resolved_paths.review_report,
+        resolved_paths.fix_list,
+    ]:
         marker = "EXISTS" if p.exists() else "missing"
         print(f"  {p.name}: {marker}")
     print()
@@ -3266,12 +3397,13 @@ def _restore_target_name_from_archive(stem: str) -> str:
     return f"{stem}.json"
 
 
-def cmd_archive(task_id: str, restore: str | None = None) -> None:
+def cmd_archive(task_id: str, restore: str | None = None, paths: LoopPaths | None = None) -> None:
+    resolved_paths = _resolve_paths(paths)
     try:
         if ".." in task_id or "/" in task_id or "\\" in task_id:
             print("Error: invalid task_id (path traversal not allowed)", file=sys.stderr)
             raise LoopKitError("Invalid task_id")
-        archive_dir = _task_archive_dir(task_id)
+        archive_dir = _task_archive_dir(task_id, paths=resolved_paths)
         if restore is None:
             if not archive_dir.exists():
                 print(f"No archive directory for task_id={task_id}: {archive_dir}")
@@ -3297,7 +3429,7 @@ def cmd_archive(task_id: str, restore: str | None = None) -> None:
             )
             raise LoopKitError("Archive file not found")
         target_name = _restore_target_name_from_archive(src.stem)
-        dest = LOOP_DIR / target_name
+        dest = resolved_paths.dir / target_name
         shutil.copy2(src, dest)
         print(f"Restored {src.name} -> {dest}")
     except ValidationError:
@@ -3390,11 +3522,14 @@ def _load_task_card(task_path: str) -> tuple[Path, TaskCard, str]:
         sys.exit(EXIT_GENERAL_ERROR)
 
 
-def _sync_task_card_to_bus(task_path: str, round_num: int = 1) -> tuple[TaskCard, str]:
+def _sync_task_card_to_bus(
+    task_path: str, round_num: int = 1, paths: LoopPaths | None = None
+) -> tuple[TaskCard, str]:
+    resolved_paths = _resolve_paths(paths)
     tp, task_card, task_id = _load_task_card(task_path)
-    if _normalized_abs(tp) != _normalized_abs(TASK_CARD):
-        _archive_bus_file(TASK_CARD, task_id, round_num, "task_card")
-        shutil.copy2(tp, TASK_CARD)
+    if _normalized_abs(tp) != _normalized_abs(resolved_paths.task_card):
+        _archive_bus_file(resolved_paths.task_card, task_id, round_num, "task_card")
+        shutil.copy2(tp, resolved_paths.task_card)
     return task_card, task_id
 
 
@@ -3402,7 +3537,9 @@ def _single_round_subprocess_cmd(
     *,
     config: RunConfig,
     round_num: int,
+    paths: LoopPaths | None = None,
 ) -> list[str]:
+    resolved_paths = _resolve_paths(paths)
     cmd = [
         sys.executable,
         "-m",
@@ -3412,9 +3549,9 @@ def _single_round_subprocess_cmd(
         "--round",
         str(round_num),
         "--loop-dir",
-        _display_path(LOOP_DIR),
+        _display_path(resolved_paths.dir),
         "--task",
-        str(TASK_CARD),
+        str(resolved_paths.task_card),
         "--timeout",
         str(config.timeout),
         "--heartbeat-ttl",
@@ -3754,25 +3891,30 @@ def _run_single_round(
     config: RunConfig,
     round_num: int,
     single_round: bool,
+    paths: LoopPaths | None = None,
 ) -> None:
+    # TODO(paths): this function still has direct global path reads/writes; keep _global_paths sync in main loop.
+    resolved_paths = _resolve_paths(paths)
+    task_packet_path = resolved_paths.dir / "task_packet.json"
     _ = single_round
-    task_card, task_id_from_card = _sync_task_card_to_bus(config.task_path, round_num=round_num)
+    task_card, task_id_from_card = _sync_task_card_to_bus(config.task_path, round_num=round_num, paths=resolved_paths)
 
-    state = _load_state()
+    state = _load_state(paths=resolved_paths)
     state_task_id = state.get("task_id")
     state_base_sha = state.get("base_sha")
 
     def _save_single_round_state() -> None:
-        _archive_state_for_round(task_id_from_card, round_num)
-        _save_state(state)
+        _archive_state_for_round(task_id_from_card, round_num, paths=resolved_paths)
+        _save_state(state, paths=resolved_paths)
 
     def _fail_single_round(outcome: str, message: str, exit_code: int = EXIT_VALIDATION_ERROR) -> None:
-        _archive_state_for_round(task_id_from_card, round_num)
+        _archive_state_for_round(task_id_from_card, round_num, paths=resolved_paths)
         _fail_with_state(
             state,
             outcome=outcome,
             message=message,
             exit_code=exit_code,
+            paths=resolved_paths,
         )
 
     if not state_task_id or not state_base_sha:
@@ -3841,14 +3983,14 @@ def _run_single_round(
     )
 
     task_packet: TaskPacket = _build_task_packet(task_card, round_num)
-    TASK_PACKET.write_text(
+    task_packet_path.write_text(
         json.dumps(task_packet, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
 
-    worker_prompt = _worker_prompt(task_id, round_num)
-    _prepare_bus_file(WORK_REPORT, task_id, round_num, "work_report")
-    _prepare_bus_file(REVIEW_REPORT, task_id, round_num, "review_report")
+    worker_prompt = _worker_prompt(task_id, round_num, paths=resolved_paths)
+    _prepare_bus_file(resolved_paths.work_report, task_id, round_num, "work_report")
+    _prepare_bus_file(resolved_paths.review_report, task_id, round_num, "review_report")
 
     _print_round_header(round_num, "worker")
 
@@ -3860,7 +4002,7 @@ def _run_single_round(
             config=config,
             task_id=task_id,
             round_num=round_num,
-            artifact_path=WORK_REPORT,
+            artifact_path=resolved_paths.work_report,
             state=state,
         )
     except RuntimeError as e:
@@ -3874,7 +4016,7 @@ def _run_single_round(
     if work is None:
         work = _wait_for_role_result(
             role="worker",
-            artifact_path=WORK_REPORT,
+            artifact_path=resolved_paths.work_report,
             config=config,
             task_id=task_id,
             round_num=round_num,
@@ -3944,12 +4086,12 @@ def _run_single_round(
         "worker_notes": work.get("notes", ""),
         "worker_tests": work.get("tests", []),
     }
-    _archive_bus_file(REVIEW_REQ, task_id, round_num, "review_request")
-    REVIEW_REQ.write_text(
+    _archive_bus_file(resolved_paths.review_request, task_id, round_num, "review_request")
+    resolved_paths.review_request.write_text(
         json.dumps(review_request, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
-    _prepare_bus_file(REVIEW_REPORT, task_id, round_num, "review_report")
+    _prepare_bus_file(resolved_paths.review_report, task_id, round_num, "review_report")
 
     state["state"] = STATE_AWAITING_REVIEW
     state["head_sha"] = head_sha
@@ -3961,11 +4103,11 @@ def _run_single_round(
     try:
         review = _auto_dispatch_role(
             role="reviewer",
-            prompt=_reviewer_prompt(task_id, round_num),
+            prompt=_reviewer_prompt(task_id, round_num, paths=resolved_paths),
             config=config,
             task_id=task_id,
             round_num=round_num,
-            artifact_path=REVIEW_REPORT,
+            artifact_path=resolved_paths.review_report,
             state=state,
         )
     except RuntimeError as e:
@@ -3979,7 +4121,7 @@ def _run_single_round(
     if review is None:
         review = _wait_for_role_result(
             role="reviewer",
-            artifact_path=REVIEW_REPORT,
+            artifact_path=resolved_paths.review_report,
             config=config,
             task_id=task_id,
             round_num=round_num,
@@ -4050,8 +4192,7 @@ def _run_single_round(
         print(f"  base: {base_sha[:8]}  head: {head_sha[:8]}")
         print(f"{'=' * 60}")
 
-        summary = LOOP_DIR / "summary.json"
-        summary.write_text(
+        resolved_paths.summary.write_text(
             json.dumps(
                 {
                     "task_id": task_id,
@@ -4069,7 +4210,7 @@ def _run_single_round(
             + "\n",
             encoding="utf-8",
         )
-        _archive_task_summary(task_id)
+        _archive_task_summary(task_id, paths=resolved_paths)
         _log("Task approved. Summary written to .loop/summary.json")
         _feed_event(
             FEED_ROUND_COMPLETE,
@@ -4095,15 +4236,15 @@ def _run_single_round(
         "prior_round_notes": work.get("notes", ""),
         "prior_review_non_blocking": review.get("non_blocking_suggestions", []),
     }
-    _archive_bus_file(FIX_LIST, task_id, round_num, "fix_list")
-    FIX_LIST.write_text(
+    _archive_bus_file(resolved_paths.fix_list, task_id, round_num, "fix_list")
+    resolved_paths.fix_list.write_text(
         json.dumps(fix_list, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
-    _prepare_bus_file(WORK_REPORT, task_id, round_num, "work_report")
+    _prepare_bus_file(resolved_paths.work_report, task_id, round_num, "work_report")
 
     _print_blocking_issues(blocking_items)
-    print(f"  Fix list written to {FIX_LIST}")
+    print(f"  Fix list written to {resolved_paths.fix_list}")
     _feed_event(
         FEED_ROUND_COMPLETE,
         data=_feed_data(
@@ -4126,7 +4267,10 @@ def _run_multi_round_via_subprocess(
     config: RunConfig,
     worktree_checked: bool = False,
     resume_from_state: dict | None = None,
+    paths: LoopPaths | None = None,
 ) -> None:
+    # TODO(paths): this function still has direct global path reads/writes; keep _global_paths sync in main loop.
+    resolved_paths = _resolve_paths(paths)
     if not worktree_checked:
         _enforce_clean_worktree_or_exit(allow_dirty=config.allow_dirty)
 
@@ -4134,7 +4278,7 @@ def _run_multi_round_via_subprocess(
     task_id = ""
     base_sha = ""
     if resume_from_state is None:
-        task_card, task_id = _sync_task_card_to_bus(config.task_path, round_num=1)
+        task_card, task_id = _sync_task_card_to_bus(config.task_path, round_num=1, paths=resolved_paths)
         _set_feed_task_id(task_id)
         _set_feed_round(1)
 
@@ -4144,7 +4288,7 @@ def _run_multi_round_via_subprocess(
         base_sha = _current_sha()
         _log(f"Base SHA: {base_sha}")
 
-        state = _load_state()
+        state = _load_state(paths=resolved_paths)
         _clean_stale_state(state, *_STALE_STATE_KEYS)
         state.update(
             {
@@ -4156,7 +4300,7 @@ def _run_multi_round_via_subprocess(
                 "sessions": {},
             }
         )
-        _save_state(state)
+        _save_state(state, paths=resolved_paths)
     else:
         state = dict(resume_from_state)
         state_task_id = state.get("task_id")
@@ -4179,7 +4323,7 @@ def _run_multi_round_via_subprocess(
                 exit_code=EXIT_VALIDATION_ERROR,
             )
             return
-        _, task_card, task_id_from_card = _load_task_card(str(TASK_CARD))
+        _, task_card, task_id_from_card = _load_task_card(str(resolved_paths.task_card))
         if task_id_from_card != state_task_id:
             _fail_with_state(
                 state,
@@ -4207,12 +4351,12 @@ def _run_multi_round_via_subprocess(
         state["state"] = STATE_AWAITING_WORK
         state["round"] = start_round
         state["started_at"] = _ts()
-        _save_state(state)
+        _save_state(state, paths=resolved_paths)
 
-    _prepare_bus_file(WORK_REPORT, task_id, start_round, "work_report")
-    _prepare_bus_file(REVIEW_REPORT, task_id, start_round, "review_report")
+    _prepare_bus_file(resolved_paths.work_report, task_id, start_round, "work_report")
+    _prepare_bus_file(resolved_paths.review_report, task_id, start_round, "review_report")
     for role in ("worker", "reviewer"):
-        _dispatch_log_path(role).unlink(missing_ok=True)
+        _dispatch_log_path(role, paths=resolved_paths).unlink(missing_ok=True)
 
     last_decision = "changes_required"
     interrupted = False
@@ -4238,11 +4382,12 @@ def _run_multi_round_via_subprocess(
             print(f"\n{'=' * 60}")
             print(f"  ROUND {round_num}/{config.max_rounds}  —  Single-Round Subprocess")
             print(f"{'=' * 60}")
-            _archive_bus_file(STATE_FILE, task_id, round_num, "state")
+            _archive_bus_file(resolved_paths.state, task_id, round_num, "state")
 
             cmd = _single_round_subprocess_cmd(
                 config=config,
                 round_num=round_num,
+                paths=resolved_paths,
             )
             _log(f"Launching single-round subprocess: {' '.join(cmd)}")
             if current_proc is not None and current_proc.poll() is None:
@@ -4300,12 +4445,12 @@ def _run_multi_round_via_subprocess(
                 )
                 return
 
-            _ = _load_task_card(str(TASK_CARD))
-            review_data = _read_json_if_exists(REVIEW_REPORT)
+            _ = _load_task_card(str(resolved_paths.task_card))
+            review_data = _read_json_if_exists(resolved_paths.review_report)
             review = cast(ReviewReport, review_data) if isinstance(review_data, dict) else None
-            fix_list_data = _read_json_if_exists(FIX_LIST)
+            fix_list_data = _read_json_if_exists(resolved_paths.fix_list)
             fix_list = cast(FixList, fix_list_data) if isinstance(fix_list_data, dict) else None
-            state = _load_state()
+            state = _load_state(paths=resolved_paths)
 
             if state.get("task_id") != task_id or state.get("base_sha") != base_sha:
                 _fail_with_state(
@@ -4321,7 +4466,7 @@ def _run_multi_round_via_subprocess(
                 return
 
             if state.get("state") == STATE_DONE and state.get("outcome") == "approved":
-                _archive_task_summary(task_id)
+                _archive_task_summary(task_id, paths=resolved_paths)
                 _log(f"Task approved via state contract at round={round_num}")
                 return
 
@@ -4365,20 +4510,40 @@ def _run_multi_round_via_subprocess(
 
     if interrupted:
         _fail_with_state(
-            _load_state(),
+            _load_state(paths=resolved_paths),
             outcome="interrupted",
             message="User interrupted (SIGINT)",
             exit_code=EXIT_INTERRUPTED,
         )
 
-    state = _load_state()
+    state = _load_state(paths=resolved_paths)
     state["state"] = STATE_DONE
     state["outcome"] = "max_rounds_exhausted"
-    _save_state(state)
+    _save_state(state, paths=resolved_paths)
     print(f"\n  MAX ROUNDS ({config.max_rounds}) reached without approval.")
     print(f"  Last review decision: {last_decision}")
     print("  PM should re-evaluate task scope or split the task.")
     raise DispatchError("Max rounds exhausted")
+
+
+def _main_loop(
+    *,
+    config: RunConfig,
+    worktree_checked: bool = False,
+    resume_from_state: dict | None = None,
+    paths: LoopPaths | None = None,
+) -> None:
+    resolved_paths = _resolve_paths(paths)
+    global _global_paths
+    _global_paths = resolved_paths
+    if not _paths_match_globals(resolved_paths):
+        _apply_loop_paths(resolved_paths)
+    _run_multi_round_via_subprocess(
+        config=config,
+        worktree_checked=worktree_checked,
+        resume_from_state=resume_from_state,
+        paths=resolved_paths,
+    )
 
 
 def cmd_run(
@@ -4387,7 +4552,13 @@ def cmd_run(
     round_num: int | None,
     resume: bool = False,
     reset: bool = False,
+    paths: LoopPaths | None = None,
 ) -> None:
+    resolved_paths = _resolve_paths(paths)
+    global _global_paths
+    _global_paths = resolved_paths
+    if not _paths_match_globals(resolved_paths):
+        _apply_loop_paths(resolved_paths)
     try:
         lock: _LoopLock | None = None
         # Single-round subprocesses are spawned by the parent loop which already
@@ -4401,10 +4572,10 @@ def cmd_run(
         try:
             if reset and not single_round:
                 _reset_bus()
-                _sync_task_card(config.task_path)
+                _sync_task_card(config.task_path, paths=resolved_paths)
             elif not single_round:
                 # Still sync task card even without full reset
-                _sync_task_card(config.task_path)
+                _sync_task_card(config.task_path, paths=resolved_paths)
 
             # Single-round subprocesses are spawned by the parent loop which already
             # validated the worktree — skip redundant check to avoid duplicate warnings.
@@ -4423,6 +4594,7 @@ def cmd_run(
                     config=config,
                     round_num=round_num,
                     single_round=single_round,
+                    paths=resolved_paths,
                 )
                 return
 
@@ -4432,7 +4604,7 @@ def cmd_run(
 
             resume_state: dict | None = None
             if resume:
-                resume_state = _load_state()
+                resume_state = _load_state(paths=resolved_paths)
                 outcome = resume_state.get("outcome")
                 state_name = resume_state.get("state")
                 if state_name == STATE_DONE and outcome == "approved":
@@ -4451,10 +4623,11 @@ def cmd_run(
                     print("Re-run without --resume to start a fresh run.", file=sys.stderr)
                     raise ValidationError(f"Cannot resume from failed state: {outcome}")
 
-            _run_multi_round_via_subprocess(
+            _main_loop(
                 config=config,
                 worktree_checked=True,
                 resume_from_state=resume_state,
+                paths=resolved_paths,
             )
         finally:
             if lock is not None:
