@@ -3937,6 +3937,32 @@ def test_load_task_card_rejects_lane_owner_paths_with_traversal(tmp_path: Path, 
     assert "must not contain traversal segments" in capsys.readouterr().err
 
 
+def test_load_task_card_rejects_lane_owner_paths_with_backslash_traversal(tmp_path: Path, capsys) -> None:
+    task_path = tmp_path / "task_input.json"
+    task_path.write_text(
+        json.dumps(
+            {
+                "task_id": "T-900",
+                "goal": "bad owner path",
+                "lanes": [
+                    {
+                        "lane_id": "lane_core",
+                        "owner_paths": ["src\\..\\secrets.py"],
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        orchestrator._load_task_card(str(task_path))
+
+    assert exc.value.code == 1
+    assert "must not contain traversal segments" in capsys.readouterr().err
+
+
 def test_load_task_card_rejects_lane_owner_paths_with_absolute_path(tmp_path: Path, capsys) -> None:
     task_path = tmp_path / "task_input.json"
     task_path.write_text(
@@ -3948,6 +3974,32 @@ def test_load_task_card_rejects_lane_owner_paths_with_absolute_path(tmp_path: Pa
                     {
                         "lane_id": "lane_core",
                         "owner_paths": [str((tmp_path / "outside.py").resolve())],
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        orchestrator._load_task_card(str(task_path))
+
+    assert exc.value.code == 1
+    assert "must not be absolute" in capsys.readouterr().err
+
+
+def test_load_task_card_rejects_lane_owner_paths_with_windows_absolute_path(tmp_path: Path, capsys) -> None:
+    task_path = tmp_path / "task_input.json"
+    task_path.write_text(
+        json.dumps(
+            {
+                "task_id": "T-900",
+                "goal": "bad owner path",
+                "lanes": [
+                    {
+                        "lane_id": "lane_core",
+                        "owner_paths": ["C:\\tmp\\outside.py"],
                     }
                 ],
             },

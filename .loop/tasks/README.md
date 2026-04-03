@@ -118,6 +118,7 @@ Each JSON file follows the task card schema defined in AGENTS.md. Task cards may
 
 Lane validation rules:
 - `lane_id` must be unique across lanes
+- `lane_id` must match `^[A-Za-z0-9][A-Za-z0-9_-]*$`
 - lane `depends_on` can only reference existing lane IDs and cannot self-reference
 - `owner_paths` must be repo-relative literal paths (no absolute path, no `..`, no glob)
 - `owner_paths` cannot overlap across lanes

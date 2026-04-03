@@ -286,6 +286,7 @@ Interpretation limits for the command output:
 
 `depends_on` is optional. A legacy alias field `dependencies` is also accepted.
 `lanes` is optional. Each lane requires `lane_id` and non-empty `owner_paths` (literal repo-relative paths).
+`lane_id` must match `^[A-Za-z0-9][A-Za-z0-9_-]*$`.
 When lanes are provided, the orchestrator validates:
 - `lane_id` values are unique
 - `depends_on` only references existing lane IDs

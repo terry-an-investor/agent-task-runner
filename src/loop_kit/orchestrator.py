@@ -4259,6 +4259,8 @@ TASK_STATUS_DONE = "done"
 TASK_STATUS_BLOCKED = "blocked"
 _DEPENDENCY_FIELDS = ("depends_on", "dependencies")
 _LANE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+_WINDOWS_ABSOLUTE_PATH_PATTERN = re.compile(r"^[A-Za-z]:")
+_PATH_SEPARATOR_PATTERN = re.compile(r"[\\/]+")
 _OWNER_PATH_GLOB_CHARS = frozenset("*?[]")
 TRANSITION_KIND_NORMAL = "normal"
 TRANSITION_KIND_RETRY = "retry"
@@ -4812,11 +4814,10 @@ def _normalize_lane_owner_path(*, source: Path, lane_id: str, location: str, raw
             f"task card {source}: field '{location}' in lane '{lane_id}' must be a non-empty repo-relative path"
         )
     owner_path = raw_value.strip()
-    parsed = Path(owner_path)
-    if parsed.is_absolute() or parsed.drive:
+    if owner_path.startswith(("/", "\\")) or _WINDOWS_ABSOLUTE_PATH_PATTERN.match(owner_path):
         raise ConfigError(f"task card {source}: field '{location}' in lane '{lane_id}' must not be absolute")
     normalized_parts: list[str] = []
-    for part in parsed.parts:
+    for part in _PATH_SEPARATOR_PATTERN.split(owner_path):
         if part in {"", "."}:
             continue
         if part == "..":
