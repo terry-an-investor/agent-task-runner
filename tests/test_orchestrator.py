@@ -6101,6 +6101,21 @@ class TestConfigLoadingPrecedence:
         with pytest.raises(orchestrator.ConfigError, match="exceeds maximum size"):
             orchestrator._load_config()
 
+    def test_main_run_prints_config_error_for_oversized_config(self, tmp_path: Path, monkeypatch, capsys) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        config_json = tmp_path / ".loop" / "config.json"
+        config_json.write_text('{"max_rounds":3,"padding":"' + ("x" * 128) + '"}', encoding="utf-8")
+        monkeypatch.setattr(orchestrator, "MAX_JSON_PAYLOAD_BYTES", 64)
+        monkeypatch.setattr(sys, "argv", ["orchestrator.py", "run", "--loop-dir", ".loop"])
+
+        with pytest.raises(SystemExit) as exc:
+            orchestrator.main()
+
+        assert exc.value.code == orchestrator.EXIT_GENERAL_ERROR
+        err = capsys.readouterr().err
+        assert "config error" in err
+        assert "exceeds maximum size" in err
+
     def test_main_run_env_overrides_file_values(self, tmp_path: Path, monkeypatch) -> None:
         _configure_loop_paths(monkeypatch, tmp_path)
         config_path = tmp_path / ".loop" / "config.json"

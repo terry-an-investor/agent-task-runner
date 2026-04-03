@@ -5076,7 +5076,8 @@ def _load_task_card(task_path: str) -> tuple[Path, TaskCard, str]:
         task_card_typed = cast(TaskCard, task_card)
         task_id = cast(str, task_card_typed.get("task_id", "UNKNOWN"))
         return tp, task_card_typed, task_id
-    except ConfigError:
+    except ConfigError as e:
+        print(f"Error: config error: {e}", file=sys.stderr)
         sys.exit(EXIT_GENERAL_ERROR)
     except LoopKitError:
         sys.exit(EXIT_GENERAL_ERROR)
@@ -6422,7 +6423,8 @@ def cmd_run(
     except ValidationError as e:
         print(f"Error: validation error: {e}", file=sys.stderr)
         sys.exit(EXIT_VALIDATION_ERROR)
-    except ConfigError:
+    except ConfigError as e:
+        print(f"Error: config error: {e}", file=sys.stderr)
         sys.exit(EXIT_GENERAL_ERROR)
     except LoopKitError:
         sys.exit(EXIT_GENERAL_ERROR)
@@ -6699,7 +6701,8 @@ def main() -> None:
     except ValidationError as e:
         print(f"Error: validation error: {e}", file=sys.stderr)
         sys.exit(EXIT_VALIDATION_ERROR)
-    except ConfigError:
+    except ConfigError as e:
+        print(f"Error: config error: {e}", file=sys.stderr)
         sys.exit(EXIT_GENERAL_ERROR)
     except LoopKitError:
         sys.exit(EXIT_GENERAL_ERROR)
