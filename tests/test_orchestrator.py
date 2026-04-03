@@ -1445,6 +1445,8 @@ def test_read_text_with_default_uses_packaged_default_when_project_file_missing(
 
 def test_log_writes_jsonl_feed_entry(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(orchestrator, "LOGS_DIR", tmp_path)
+    orchestrator._set_feed_task_id("T-700")
+    orchestrator._set_feed_round(3)
 
     orchestrator._log("structured log message")
 
@@ -1455,8 +1457,94 @@ def test_log_writes_jsonl_feed_entry(tmp_path: Path, monkeypatch) -> None:
     latest = entries[-1]
     assert set(latest.keys()) == {"ts", "level", "event", "data"}
     assert latest["level"] == "info"
-    assert latest["event"] == "log"
+    assert latest["event"] == orchestrator.FEED_LOG
     assert latest["data"]["message"] == "structured log message"
+    assert latest["data"]["task_id"] == "T-700"
+    assert latest["data"]["round"] == 3
+    assert latest["data"]["role"] == "orchestrator"
+    orchestrator._set_feed_task_id(None)
+
+
+def test_feed_event_constants_defined() -> None:
+    assert orchestrator.FEED_DISPATCH_START == "dispatch_start"
+    assert orchestrator.FEED_DISPATCH_COMPLETE == "dispatch_complete"
+    assert orchestrator.FEED_DISPATCH_FAIL == "dispatch_fail"
+    assert orchestrator.FEED_ROUND_START == "round_start"
+    assert orchestrator.FEED_ROUND_COMPLETE == "round_complete"
+    assert orchestrator.FEED_REVIEW_VERDICT == "review_verdict"
+    assert orchestrator.FEED_HEARTBEAT == "heartbeat"
+    assert orchestrator.FEED_STATE_TRANSITION == "state_transition"
+
+
+def test_run_auto_dispatch_emits_standardized_feed_events(monkeypatch) -> None:
+    events: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(orchestrator, "_log", lambda msg: None)
+    monkeypatch.setattr(orchestrator, "_write_dispatch_log", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        orchestrator,
+        "_agent_command",
+        lambda backend, prompt: (["codex.exe", "exec", "short instruction"], None, "STDIN_PAYLOAD"),
+    )
+    monkeypatch.setattr(
+        orchestrator.subprocess,
+        "Popen",
+        lambda cmd, **kwargs: _FakeProc(stdout_lines=['{"type":"thread.started","thread_id":"tid-1"}\n'], returncode=0),
+    )
+
+    def fake_feed_event(event: str, *, level: str = "info", data: dict | None = None) -> None:
+        _ = level
+        events.append((event, dict(data or {})))
+
+    monkeypatch.setattr(orchestrator, "_feed_event", fake_feed_event)
+
+    orchestrator._run_auto_dispatch(
+        "worker",
+        "codex",
+        "ignored",
+        30,
+        task_id="T-626",
+        round_num=1,
+    )
+
+    assert [event for event, _ in events if event == orchestrator.FEED_DISPATCH_START]
+    assert [event for event, _ in events if event == orchestrator.FEED_DISPATCH_COMPLETE]
+    for event, payload in events:
+        if event in {
+            orchestrator.FEED_DISPATCH_START,
+            orchestrator.FEED_DISPATCH_COMPLETE,
+        }:
+            assert payload["task_id"] == "T-626"
+            assert payload["round"] == 1
+            assert payload["role"] == "worker"
+
+
+def test_save_state_emits_state_transition_feed_event(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+    captured: list[tuple[str, dict[str, object]]] = []
+
+    def fake_feed_event(event: str, *, level: str = "info", data: dict | None = None) -> None:
+        _ = level
+        captured.append((event, dict(data or {})))
+
+    monkeypatch.setattr(orchestrator, "_feed_event", fake_feed_event)
+
+    orchestrator._save_state(
+        {
+            "state": orchestrator.STATE_AWAITING_WORK,
+            "round": 1,
+            "task_id": "T-800",
+            "base_sha": "base-sha",
+        }
+    )
+
+    assert captured
+    event, payload = captured[-1]
+    assert event == orchestrator.FEED_STATE_TRANSITION
+    assert payload["task_id"] == "T-800"
+    assert payload["round"] == 1
+    assert payload["role"] == "orchestrator"
+    assert payload["from_state"] is None
+    assert payload["to_state"] == orchestrator.STATE_AWAITING_WORK
 
 
 def test_configure_loop_paths_resets_log_dir_ensure_flag(tmp_path: Path, monkeypatch) -> None:

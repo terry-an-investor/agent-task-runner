@@ -137,6 +137,15 @@ DEFAULT_DISPATCH_RETRY_BASE_SEC = 5
 MAX_DISPATCH_RETRY_DELAY_SEC = 60
 DEFAULT_GIT_TIMEOUT_SEC = 30
 _STALE_STATE_KEYS = ("outcome", "failed_at", "error", "head_sha", "round_details")
+FEED_DISPATCH_START = "dispatch_start"
+FEED_DISPATCH_COMPLETE = "dispatch_complete"
+FEED_DISPATCH_FAIL = "dispatch_fail"
+FEED_ROUND_START = "round_start"
+FEED_ROUND_COMPLETE = "round_complete"
+FEED_REVIEW_VERDICT = "review_verdict"
+FEED_HEARTBEAT = "heartbeat"
+FEED_STATE_TRANSITION = "state_transition"
+FEED_LOG = "log"
 BACKEND_CODEX = "codex"
 BACKEND_CLAUDE = "claude"
 BACKEND_OPENCODE = "opencode"
@@ -158,6 +167,7 @@ PATTERN_HIGH_CONFIDENCE = 0.7
 _KNOWLEDGE_MAX_PATTERNS = 200
 _KNOWLEDGE_MAX_PITFALL_LINES = 50
 _FEED_TASK_ID: str | None = None
+_FEED_ROUND: int | None = None
 _LOGS_DIR_ENSURED = False
 _LOGS_DIR_ENSURED_PATH: str | None = None
 _stream_local = threading.local()
@@ -254,6 +264,7 @@ def _configure_loop_paths(loop_dir: str | Path = ".loop") -> None:
     global _PROJECT_FACTS_FILE
     global _PITFALLS_FILE
     global _PATTERNS_FILE
+    global _FEED_ROUND
 
     LOOP_DIR = _resolve_loop_dir(loop_dir)
     LOGS_DIR = LOOP_DIR / "logs"
@@ -278,6 +289,7 @@ def _configure_loop_paths(loop_dir: str | Path = ".loop") -> None:
     _PATTERNS_FILE = _CONTEXT_DIR / "patterns.jsonl"
     _LOGS_DIR_ENSURED = False
     _LOGS_DIR_ENSURED_PATH = None
+    _FEED_ROUND = None
 
 
 def _loop_templates_dir() -> Path:
@@ -484,6 +496,30 @@ def _rotate_log_file(
 def _set_feed_task_id(task_id: str | None) -> None:
     global _FEED_TASK_ID
     _FEED_TASK_ID = task_id
+    if task_id is None:
+        _set_feed_round(None)
+
+
+def _set_feed_round(round_num: int | None) -> None:
+    global _FEED_ROUND
+    _FEED_ROUND = round_num
+
+
+def _feed_data(
+    *,
+    task_id: str | None = None,
+    round_num: int | None = None,
+    role: str | None = None,
+    **extra: object,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "task_id": task_id if task_id is not None else _FEED_TASK_ID,
+        "round": round_num if round_num is not None else _FEED_ROUND,
+    }
+    if role is not None:
+        payload["role"] = role
+    payload.update(extra)
+    return payload
 
 
 def _ensure_logs_dir() -> None:
@@ -528,7 +564,7 @@ def _log(msg: str) -> None:
         entry["task_id"] = _FEED_TASK_ID
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    _feed_event("log", data={"message": msg})
+    _feed_event(FEED_LOG, data=_feed_data(role="orchestrator", message=msg))
 
 
 def _normalized_abs(path: Path) -> str:
@@ -599,6 +635,16 @@ def _run_auto_dispatch_heartbeat_writer(
         hb.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
+        )
+        _feed_event(
+            FEED_HEARTBEAT,
+            data=_feed_data(
+                task_id=task_id,
+                round_num=round_num,
+                role=role,
+                source="auto_dispatch",
+                timestamp=payload["timestamp"],
+            ),
         )
         stop_event.wait(sleep_sec)
 
@@ -1365,16 +1411,21 @@ def _report_dispatch_result(
     stdout_len: int | None = None,
     timeout_sec: int | None = None,
     interrupted: bool = False,
+    task_id: str | None = None,
+    round_num: int | None = None,
 ) -> None:
     _write_dispatch_log(role, cmd, result, session_id)
-    data = {
-        "role": role,
-        "mode": DISPATCH_BACKEND_NATIVE,
-        "backend": backend,
-        "returncode": result.returncode,
-        "attempt": attempt,
-        "max_attempts": max_attempts,
-    }
+    event_type = FEED_DISPATCH_COMPLETE if timeout_sec is None and result.returncode == 0 and not interrupted else FEED_DISPATCH_FAIL
+    data = _feed_data(
+        task_id=task_id,
+        round_num=round_num,
+        role=role,
+        mode=DISPATCH_BACKEND_NATIVE,
+        backend=backend,
+        returncode=result.returncode,
+        attempt=attempt,
+        max_attempts=max_attempts,
+    )
     if timeout_sec is not None:
         data["timeout_sec"] = timeout_sec
     if session_id is not None:
@@ -1384,7 +1435,7 @@ def _report_dispatch_result(
     if interrupted:
         data["interrupted"] = True
     _feed_event(
-        "dispatch_summary",
+        event_type,
         level=("info" if timeout_sec is None and result.returncode == 0 else "error"),
         data=data,
     )
@@ -1574,6 +1625,19 @@ def _run_auto_dispatch(
         while attempt < max_attempts:
             attempt += 1
             cmd, cmd_sid, stdin_text = _agent_command(backend, prompt)
+            _feed_event(
+                FEED_DISPATCH_START,
+                data=_feed_data(
+                    task_id=task_id,
+                    round_num=round_num,
+                    role=role,
+                    mode=DISPATCH_BACKEND_NATIVE,
+                    backend=backend,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    timeout_sec=timeout_sec,
+                ),
+            )
             proc = subprocess.Popen(
                 cmd,
                 cwd=str(ROOT),
@@ -1613,6 +1677,8 @@ def _run_auto_dispatch(
                     max_attempts=max_attempts,
                     session_id=cmd_sid,
                     interrupted=True,
+                    task_id=task_id,
+                    round_num=round_num,
                 )
                 raise
             if timed_out:
@@ -1632,6 +1698,8 @@ def _run_auto_dispatch(
                     max_attempts=max_attempts,
                     session_id=cmd_sid,
                     timeout_sec=timeout_sec,
+                    task_id=task_id,
+                    round_num=round_num,
                 )
                 raise DispatchTimeoutError(
                     f"{role} dispatch timeout after {timeout_sec}s (backend={backend})."
@@ -1663,6 +1731,8 @@ def _run_auto_dispatch(
                 max_attempts=max_attempts,
                 session_id=session_id,
                 stdout_len=len(result.stdout or ""),
+                task_id=task_id,
+                round_num=round_num,
             )
 
             if result.returncode == 0:
@@ -2408,10 +2478,34 @@ def _atomic_write_json(path: Path, data: object) -> None:
 
 
 def _save_state(state: dict) -> None:
+    previous_state: dict | None = None
     if STATE_FILE.exists():
+        previous = _read_json_if_exists(STATE_FILE)
+        if isinstance(previous, dict):
+            previous_state = previous
         _STATE_BACKUP.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(STATE_FILE, _STATE_BACKUP)
     _atomic_write_json(STATE_FILE, state)
+    from_state = previous_state.get("state") if isinstance(previous_state, dict) else None
+    from_round = previous_state.get("round") if isinstance(previous_state, dict) else None
+    to_state = state.get("state")
+    to_round = state.get("round")
+    if from_state != to_state or from_round != to_round:
+        task_id_raw = state.get("task_id")
+        task_id = task_id_raw if isinstance(task_id_raw, str) and task_id_raw else None
+        round_num = to_round if isinstance(to_round, int) else None
+        _feed_event(
+            FEED_STATE_TRANSITION,
+            data=_feed_data(
+                task_id=task_id,
+                round_num=round_num,
+                role="orchestrator",
+                from_state=from_state,
+                to_state=to_state,
+                from_round=from_round,
+                to_round=to_round,
+            ),
+        )
 
 
 # ── git helpers ─────────────────────────────────────────────────────
@@ -3016,6 +3110,15 @@ def cmd_heartbeat(role: str, interval: int) -> None:
                 "cwd": str(ROOT),
             }
             hb.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            _feed_event(
+                FEED_HEARTBEAT,
+                data=_feed_data(
+                    role=role,
+                    source="manual",
+                    pid=payload["pid"],
+                    updated_at=payload["updated_at"],
+                ),
+            )
             time.sleep(max(1, interval))
     except KeyboardInterrupt:
         _log(f"Heartbeat stopped for role={role}")
@@ -3346,6 +3449,7 @@ def _run_single_round(
     task_id = str(state_task_id)
     base_sha = str(state_base_sha)
     _set_feed_task_id(task_id)
+    _set_feed_round(round_num)
 
     _log(f"Loaded task card: {task_id}")
     _log(f"Goal: {task_card.get('goal', '<no goal>')}")
@@ -3358,6 +3462,15 @@ def _run_single_round(
     state["round"] = round_num
     state["state"] = STATE_AWAITING_WORK
     _save_single_round_state()
+    _feed_event(
+        FEED_ROUND_START,
+        data=_feed_data(
+            task_id=task_id,
+            round_num=round_num,
+            role="orchestrator",
+            mode="single_round",
+        ),
+    )
 
     task_packet: TaskPacket = _build_task_packet(task_card, round_num)
     TASK_PACKET.write_text(
@@ -3528,6 +3641,15 @@ def _run_single_round(
 
     decision = str(review["decision"])
     _log(f"Reviewer decision: {decision}")
+    _feed_event(
+        FEED_REVIEW_VERDICT,
+        data=_feed_data(
+            task_id=task_id,
+            round_num=round_num,
+            role="reviewer",
+            decision=decision,
+        ),
+    )
     print(f"\n  Reviewer: {decision}")
 
     round_detail = {
@@ -3579,6 +3701,16 @@ def _run_single_round(
         )
         _archive_task_summary(task_id)
         _log("Task approved. Summary written to .loop/summary.json")
+        _feed_event(
+            FEED_ROUND_COMPLETE,
+            data=_feed_data(
+                task_id=task_id,
+                round_num=round_num,
+                role="orchestrator",
+                decision=decision,
+                outcome="approved",
+            ),
+        )
         return
 
     raw_blocking = review.get("blocking_issues", [])
@@ -3602,6 +3734,17 @@ def _run_single_round(
 
     _print_blocking_issues(blocking_items)
     print(f"  Fix list written to {FIX_LIST}")
+    _feed_event(
+        FEED_ROUND_COMPLETE,
+        data=_feed_data(
+            task_id=task_id,
+            round_num=round_num,
+            role="orchestrator",
+            decision=decision,
+            outcome="changes_required",
+            next_round=round_num + 1,
+        ),
+    )
 
     state["state"] = STATE_AWAITING_WORK
     state["round"] = round_num + 1
@@ -3623,6 +3766,7 @@ def _run_multi_round_via_subprocess(
     if resume_from_state is None:
         task_card, task_id = _sync_task_card_to_bus(config.task_path, round_num=1)
         _set_feed_task_id(task_id)
+        _set_feed_round(1)
 
         _log(f"Loaded task card: {task_id}")
         _log(f"Goal: {task_card.get('goal', '<no goal>')}")
@@ -3680,6 +3824,7 @@ def _run_multi_round_via_subprocess(
         base_sha = state_base_sha
         start_round = state_round
         _set_feed_task_id(task_id)
+        _set_feed_round(start_round)
         _log(f"Resuming task: {task_id}")
         _log(f"Resume contract: base_sha={base_sha} round={start_round}")
         _clean_stale_state(state, *_STALE_STATE_KEYS[:4])
@@ -3711,6 +3856,7 @@ def _run_multi_round_via_subprocess(
 
     try:
         for round_num in range(start_round, config.max_rounds + 1):
+            _set_feed_round(round_num)
             if _interrupted_event.is_set():
                 interrupted = True
                 break
