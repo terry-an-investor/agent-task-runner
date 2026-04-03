@@ -155,6 +155,7 @@ DEFAULT_REVIEWER_BACKEND = BACKEND_CODEX
 DEFAULT_DISPATCH_BACKEND = DISPATCH_BACKEND_NATIVE
 DISPATCH_STREAM_POLL_SEC = 0.1
 _WAIT_SAFETY_CAP_SEC = 86400  # 24h absolute cap in _wait_for_file
+_SESSION_ROLES = ("worker", "reviewer")
 EXIT_OK = 0
 EXIT_GENERAL_ERROR = 1
 EXIT_TIMEOUT = 2
@@ -178,6 +179,10 @@ _AUTO_DISPATCH_HEARTBEAT_JOIN_TIMEOUT_SEC = 2.0
 
 class DispatchTimeoutError(RuntimeError):
     """Dispatch command timed out before process exit."""
+
+
+class PermanentDispatchError(RuntimeError):
+    """Dispatch failed with a non-retriable error."""
 
 
 # ── file paths ──────────────────────────────────────────────────────
@@ -1053,7 +1058,7 @@ def _stream_dispatch_stdout_line(
         read_state.pop(state_key, None)
 
 
-BackendBuildFn = Callable[[str, str], tuple[list[str], str | None, str | None]]
+BackendBuildFn = Callable[..., tuple[list[str], str | None, str | None]]
 BackendResolveFn = Callable[[str], str]
 BackendParseEventFn = Callable[[str, str, str], str | None]
 _BACKEND_REGISTRY: dict[str, tuple[BackendBuildFn, BackendResolveFn, BackendParseEventFn]] = {}
@@ -1202,11 +1207,16 @@ def _resolve_claude_exe(backend: str) -> str:
     )
 
 
-def _build_codex_command(exe: str, prompt: str) -> tuple[list[str], str | None, str | None]:
-    return (
+def _build_codex_command(
+    exe: str,
+    prompt: str,
+    resume_session_id: str | None = None,
+) -> tuple[list[str], str | None, str | None]:
+    cmd = [exe, "exec"]
+    if isinstance(resume_session_id, str) and resume_session_id.strip():
+        cmd.extend(["resume", resume_session_id.strip()])
+    cmd.extend(
         [
-            exe,
-            "exec",
             "--json",
             "--dangerously-bypass-approvals-and-sandbox",
             "-C",
@@ -1216,14 +1226,23 @@ def _build_codex_command(exe: str, prompt: str) -> tuple[list[str], str | None, 
                 " embedded in it and only finish after the required output artifact"
                 " is written."
             ),
-        ],
-        None,
+        ]
+    )
+    return (
+        cmd,
+        (resume_session_id.strip() if isinstance(resume_session_id, str) and resume_session_id.strip() else None),
         prompt,
     )
 
 
-def _build_claude_command(exe: str, prompt: str) -> tuple[list[str], str | None, str | None]:
-    sid = str(uuid.uuid4())
+def _build_claude_command(
+    exe: str,
+    prompt: str,
+    resume_session_id: str | None = None,
+) -> tuple[list[str], str | None, str | None]:
+    sid = resume_session_id.strip() if isinstance(resume_session_id, str) and resume_session_id.strip() else ""
+    if not sid:
+        sid = str(uuid.uuid4())
     return (
         [
             exe,
@@ -1245,7 +1264,11 @@ def _resolve_backend_exe(backend: str) -> str:
     return resolve_exe_fn(backend.strip().lower())
 
 
-def _agent_command(backend: str, prompt: str) -> tuple[list[str], str | None, str | None]:
+def _agent_command(
+    backend: str,
+    prompt: str,
+    resume_session_id: str | None = None,
+) -> tuple[list[str], str | None, str | None]:
     """Return (cmd, session_id, stdin_text).
 
     For codex >= 0.118.0 the prompt context is piped via stdin so the
@@ -1253,6 +1276,9 @@ def _agent_command(backend: str, prompt: str) -> tuple[list[str], str | None, st
     """
     build_cmd_fn, _, _ = _require_registered_backend(backend)
     exe = _resolve_backend_exe(backend)
+    backend_key = backend.strip().lower()
+    if resume_session_id is not None and backend_key in {BACKEND_CODEX, BACKEND_CLAUDE}:
+        return build_cmd_fn(exe, prompt, resume_session_id)
     return build_cmd_fn(exe, prompt)
 
 
@@ -1279,7 +1305,12 @@ def _resolve_opencode_exe(backend: str) -> str:
     )
 
 
-def _build_opencode_command(exe: str, prompt: str) -> tuple[list[str], str | None, str | None]:
+def _build_opencode_command(
+    exe: str,
+    prompt: str,
+    resume_session_id: str | None = None,
+) -> tuple[list[str], str | None, str | None]:
+    _ = resume_session_id
     return (
         [
             exe,
@@ -1594,6 +1625,23 @@ def _is_permanent_dispatch_error(stderr: str) -> bool:
     return any(pattern in lowered for pattern in _PERMANENT_DISPATCH_PATTERNS)
 
 
+def _is_invalid_resume_session_error(text: str) -> bool:
+    lowered = text.lower()
+    if "session" not in lowered and "thread" not in lowered:
+        return False
+    return any(
+        token in lowered
+        for token in (
+            "invalid",
+            "not found",
+            "unknown",
+            "expired",
+            "does not exist",
+            "no such",
+        )
+    )
+
+
 def _run_auto_dispatch(
     role: str,
     backend: str,
@@ -1607,11 +1655,16 @@ def _run_auto_dispatch(
     heartbeat_ttl_sec: int = DEFAULT_HEARTBEAT_TTL_SEC,
     task_id: str | None = None,
     round_num: int | None = None,
-) -> None:
+    resume_session_id: str | None = None,
+) -> str | None:
     parse_event_fn = _require_registered_parse_event(backend)
     retry_count = max(0, int(dispatch_retries))
     retry_base_sec = max(1, int(dispatch_retry_base_sec))
     max_attempts = retry_count + 1
+    if isinstance(resume_session_id, str):
+        active_resume_session_id = resume_session_id.strip() or None
+    else:
+        active_resume_session_id = None
     _log(f"Auto-dispatch start: role={role} backend={backend} retries={retry_count} retry_base_sec={retry_base_sec}")
     if heartbeat_enabled:
         _start_auto_dispatch_heartbeat(
@@ -1624,7 +1677,14 @@ def _run_auto_dispatch(
     try:
         while attempt < max_attempts:
             attempt += 1
-            cmd, cmd_sid, stdin_text = _agent_command(backend, prompt)
+            if active_resume_session_id is None:
+                cmd, cmd_sid, stdin_text = _agent_command(backend, prompt)
+            else:
+                cmd, cmd_sid, stdin_text = _agent_command(
+                    backend,
+                    prompt,
+                    resume_session_id=active_resume_session_id,
+                )
             _feed_event(
                 FEED_DISPATCH_START,
                 data=_feed_data(
@@ -1737,11 +1797,22 @@ def _run_auto_dispatch(
 
             if result.returncode == 0:
                 _log(f"Auto-dispatch done: role={role} backend={backend} attempts={attempt}")
-                return
+                return session_id
 
+            stdout_text = (result.stdout or "").strip()
             stderr_text = (result.stderr or "").strip()
+            if active_resume_session_id and (
+                _is_invalid_resume_session_error(stderr_text) or _is_invalid_resume_session_error(stdout_text)
+            ):
+                _log(
+                    f"{role} resume session is invalid for backend={backend}; "
+                    "falling back to a new session."
+                )
+                active_resume_session_id = None
+                max_attempts += 1
+                continue
             if _is_permanent_dispatch_error(stderr_text):
-                raise RuntimeError(
+                raise PermanentDispatchError(
                     f"{role} dispatch failed with permanent error (backend={backend}, rc={result.returncode}): "
                     f"{stderr_text} — permanent error, not retrying."
                     + _dispatch_failure_hint(
@@ -3225,6 +3296,112 @@ def _print_round_header(round_num: int, role: str) -> None:
         print(f"  Review request: {REVIEW_REQ}")
 
 
+def _normalize_sessions_map(value: object) -> dict[str, dict[str, str]]:
+    normalized: dict[str, dict[str, str]] = {}
+    if not isinstance(value, dict):
+        return normalized
+    for role in _SESSION_ROLES:
+        raw_entry = value.get(role)
+        if not isinstance(raw_entry, dict):
+            continue
+        session_id_raw = raw_entry.get("session_id")
+        backend_raw = raw_entry.get("backend")
+        if not isinstance(session_id_raw, str) or not session_id_raw.strip():
+            continue
+        if not isinstance(backend_raw, str) or not backend_raw.strip():
+            continue
+        normalized[role] = {
+            "session_id": session_id_raw.strip(),
+            "backend": backend_raw.strip().lower(),
+        }
+    return normalized
+
+
+def _clear_sessions(state: dict) -> bool:
+    normalized = _normalize_sessions_map(state.get("sessions"))
+    had_meaningful_data = bool(normalized) or (
+        state.get("sessions") is not None and state.get("sessions") != {}
+    )
+    state["sessions"] = {}
+    return had_meaningful_data
+
+
+def _session_resume_id(state: dict, *, role: str, backend: str) -> str | None:
+    sessions = _normalize_sessions_map(state.get("sessions"))
+    state["sessions"] = sessions
+    entry = sessions.get(role)
+    if not isinstance(entry, dict):
+        return None
+    backend_key = backend.strip().lower()
+    if entry.get("backend") != backend_key:
+        return None
+    session_id = entry.get("session_id")
+    if not isinstance(session_id, str) or not session_id.strip():
+        return None
+    return session_id
+
+
+def _store_session(state: dict, *, role: str, backend: str, session_id: str | None) -> bool:
+    if not isinstance(session_id, str) or not session_id.strip():
+        return False
+    sessions = _normalize_sessions_map(state.get("sessions"))
+    next_entry = {"session_id": session_id.strip(), "backend": backend.strip().lower()}
+    if sessions.get(role) == next_entry:
+        state["sessions"] = sessions
+        return False
+    sessions[role] = next_entry
+    state["sessions"] = sessions
+    return True
+
+
+def _invalidate_sessions_for_dispatch(
+    state: dict,
+    *,
+    role: str,
+    task_id: str,
+    round_num: int,
+) -> bool:
+    state["sessions"] = _normalize_sessions_map(state.get("sessions"))
+    if role != "worker":
+        return False
+    sessions = cast(dict[str, dict[str, str]], state.get("sessions"))
+    if not sessions:
+        return False
+
+    state_task_id = state.get("task_id")
+    if isinstance(state_task_id, str) and state_task_id and state_task_id != task_id:
+        _log(
+            f"Clearing dispatch sessions: task_id changed (state={state_task_id!r}, current={task_id!r})"
+        )
+        _clear_sessions(state)
+        return True
+
+    if round_num == 1:
+        _log("Clearing dispatch sessions: round reset to 1")
+        _clear_sessions(state)
+        return True
+
+    state_base_sha = state.get("base_sha")
+    if not isinstance(state_base_sha, str) or not state_base_sha:
+        return False
+    try:
+        current_head = _current_sha()
+    except RuntimeError as e:
+        _log(f"Warning: unable to compare state base_sha to HEAD for session invalidation: {e}")
+        return False
+    if state_base_sha == current_head:
+        return False
+    state_head_sha = state.get("head_sha")
+    if isinstance(state_head_sha, str) and state_head_sha == current_head:
+        return False
+    _log(
+        "Clearing dispatch sessions: state base_sha differs from current HEAD "
+        f"(base_sha={state_base_sha}, head={current_head})"
+    )
+    _clear_sessions(state)
+    return True
+
+
 def _auto_dispatch_role(
     role: str,
     prompt: str,
@@ -3232,13 +3409,26 @@ def _auto_dispatch_role(
     task_id: str,
     round_num: int,
     artifact_path: Path,
+    state: dict | None = None,
 ) -> dict | None:
     if not config.auto_dispatch:
         return None
-    backend = config.worker_backend if role == "worker" else config.reviewer_backend
-    return _dispatch_with_artifact_fallback(
+    backend = (config.worker_backend if role == "worker" else config.reviewer_backend).strip().lower()
+    current_state = state if isinstance(state, dict) else _load_state()
+    state_updated = _invalidate_sessions_for_dispatch(
+        current_state,
         role=role,
-        dispatch_call=lambda: _run_auto_dispatch(
+        task_id=task_id,
+        round_num=round_num,
+    )
+    if state_updated:
+        _save_state(current_state)
+    resume_session_id = _session_resume_id(current_state, role=role, backend=backend)
+    dispatch_session_id: str | None = None
+
+    def _dispatch_call() -> None:
+        nonlocal dispatch_session_id
+        dispatch_session_id = _run_auto_dispatch(
             role=role,
             backend=backend,
             prompt=prompt,
@@ -3250,12 +3440,26 @@ def _auto_dispatch_role(
             heartbeat_ttl_sec=config.heartbeat_ttl,
             task_id=task_id,
             round_num=round_num,
-        ),
-        artifact_path=artifact_path,
-        task_id=task_id,
-        round_num=round_num,
-        timeout_sec=config.artifact_timeout,
-    )
+            resume_session_id=resume_session_id,
+        )
+
+    try:
+        artifact = _dispatch_with_artifact_fallback(
+            role=role,
+            dispatch_call=_dispatch_call,
+            artifact_path=artifact_path,
+            task_id=task_id,
+            round_num=round_num,
+            timeout_sec=config.artifact_timeout,
+        )
+    except PermanentDispatchError:
+        if _clear_sessions(current_state):
+            _save_state(current_state)
+        raise
+
+    if _store_session(current_state, role=role, backend=backend, session_id=dispatch_session_id):
+        _save_state(current_state)
+    return artifact
 
 
 def _wait_for_role_result(
@@ -3432,6 +3636,7 @@ def _run_single_round(
                 "base_sha": state_base_sha,
                 "started_at": _ts(),
                 "round_details": [],
+                "sessions": {},
             }
         )
         _save_single_round_state()
@@ -3458,6 +3663,9 @@ def _run_single_round(
     _clean_stale_state(state, *_STALE_STATE_KEYS[:3])
     if not isinstance(state.get("round_details"), list):
         state["round_details"] = []
+    state["sessions"] = _normalize_sessions_map(state.get("sessions"))
+    if round_num == 1:
+        state["sessions"] = {}
     state["started_at"] = _ts()
     state["round"] = round_num
     state["state"] = STATE_AWAITING_WORK
@@ -3493,6 +3701,7 @@ def _run_single_round(
             task_id=task_id,
             round_num=round_num,
             artifact_path=WORK_REPORT,
+            state=state,
         )
     except RuntimeError as e:
         _fail_single_round(
@@ -3597,6 +3806,7 @@ def _run_single_round(
             task_id=task_id,
             round_num=round_num,
             artifact_path=REVIEW_REPORT,
+            state=state,
         )
     except RuntimeError as e:
         _fail_single_round(
@@ -3783,6 +3993,7 @@ def _run_multi_round_via_subprocess(
                 "task_id": task_id,
                 "base_sha": base_sha,
                 "started_at": _ts(),
+                "sessions": {},
             }
         )
         _save_state(state)
@@ -3830,6 +4041,9 @@ def _run_multi_round_via_subprocess(
         _clean_stale_state(state, *_STALE_STATE_KEYS[:4])
         if not isinstance(state.get("round_details"), list):
             state["round_details"] = []
+        state["sessions"] = _normalize_sessions_map(state.get("sessions"))
+        if start_round == 1:
+            state["sessions"] = {}
         state["state"] = STATE_AWAITING_WORK
         state["round"] = start_round
         state["started_at"] = _ts()

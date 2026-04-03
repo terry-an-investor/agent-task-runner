@@ -163,6 +163,22 @@ def test_agent_command_codex_uses_stdin_and_short_cli_instruction(monkeypatch) -
     assert stdin_text == long_prompt
 
 
+def test_agent_command_codex_uses_resume_session_when_provided(monkeypatch) -> None:
+    monkeypatch.setattr(orchestrator, "_resolve_backend_exe", lambda backend: f"{backend}.exe")
+
+    cmd, session_id, stdin_text = orchestrator._agent_command(
+        "codex",
+        "payload",
+        resume_session_id="tid-resume-123",
+    )
+
+    assert cmd[:4] == ["codex.exe", "exec", "resume", "tid-resume-123"]
+    assert "--json" in cmd
+    assert "--dangerously-bypass-approvals-and-sandbox" in cmd
+    assert session_id == "tid-resume-123"
+    assert stdin_text == "payload"
+
+
 def test_agent_command_claude_passes_prompt_via_stdin(monkeypatch) -> None:
     monkeypatch.setattr(orchestrator, "_resolve_backend_exe", lambda backend: f"{backend}.exe")
     prompt = "claude prompt payload"
@@ -174,6 +190,26 @@ def test_agent_command_claude_passes_prompt_via_stdin(monkeypatch) -> None:
     assert cmd[-1] != prompt
     assert isinstance(session_id, str) and session_id
     assert stdin_text == prompt
+
+
+def test_agent_command_claude_reuses_resume_session_id(monkeypatch) -> None:
+    monkeypatch.setattr(orchestrator, "_resolve_backend_exe", lambda backend: f"{backend}.exe")
+
+    def fail_uuid4() -> str:
+        raise AssertionError("uuid.uuid4 must not be called when resume_session_id is provided")
+
+    monkeypatch.setattr(orchestrator.uuid, "uuid4", fail_uuid4)
+
+    cmd, session_id, stdin_text = orchestrator._agent_command(
+        "claude",
+        "claude prompt payload",
+        resume_session_id="sid-reuse-456",
+    )
+
+    assert cmd[0] == "claude.exe"
+    assert cmd[cmd.index("--session-id") + 1] == "sid-reuse-456"
+    assert session_id == "sid-reuse-456"
+    assert stdin_text == "claude prompt payload"
 
 
 def test_agent_command_opencode_uses_stdin_and_short_cli_instruction(monkeypatch) -> None:
@@ -1052,6 +1088,8 @@ def test_auto_dispatch_role_only_enables_heartbeat_when_required(monkeypatch) ->
 
     monkeypatch.setattr(orchestrator, "_run_auto_dispatch", fake_run_auto_dispatch)
     monkeypatch.setattr(orchestrator, "_dispatch_with_artifact_fallback", fake_dispatch_with_artifact_fallback)
+    monkeypatch.setattr(orchestrator, "_load_state", lambda: {"state": "idle", "round": 0, "task_id": None, "sessions": {}})
+    monkeypatch.setattr(orchestrator, "_save_state", lambda state: None)
 
     config_with_hb = orchestrator.RunConfig(
         auto_dispatch=True,
@@ -1083,6 +1121,154 @@ def test_auto_dispatch_role_only_enables_heartbeat_when_required(monkeypatch) ->
         {"heartbeat_enabled": True},
         {"heartbeat_enabled": False},
     ]
+
+
+def test_auto_dispatch_role_reuses_and_persists_worker_session(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+    state = {
+        "state": orchestrator.STATE_AWAITING_WORK,
+        "round": 2,
+        "task_id": "T-627",
+        "base_sha": "base-sha",
+        "sessions": {"worker": {"session_id": "sid-old", "backend": "codex"}},
+    }
+    orchestrator._save_state(state)
+
+    captured: dict[str, object] = {}
+
+    def fake_run_auto_dispatch(*, resume_session_id: str | None = None, **kwargs) -> str | None:
+        _ = kwargs
+        captured["resume_session_id"] = resume_session_id
+        return "sid-new"
+
+    def fake_dispatch_with_artifact_fallback(
+        *,
+        role: str,
+        dispatch_call,
+        artifact_path: Path,
+        task_id: str,
+        round_num: int,
+        timeout_sec: int = orchestrator.DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC,
+    ) -> dict:
+        _ = (role, artifact_path, timeout_sec)
+        dispatch_call()
+        return {"task_id": task_id, "round": round_num}
+
+    monkeypatch.setattr(orchestrator, "_run_auto_dispatch", fake_run_auto_dispatch)
+    monkeypatch.setattr(orchestrator, "_dispatch_with_artifact_fallback", fake_dispatch_with_artifact_fallback)
+    monkeypatch.setattr(orchestrator, "_current_sha", lambda: "base-sha")
+
+    result = orchestrator._auto_dispatch_role(
+        role="worker",
+        prompt="prompt",
+        config=orchestrator.RunConfig(auto_dispatch=True, worker_backend="codex"),
+        task_id="T-627",
+        round_num=2,
+        artifact_path=orchestrator.WORK_REPORT,
+        state=state,
+    )
+
+    assert result == {"task_id": "T-627", "round": 2}
+    assert captured["resume_session_id"] == "sid-old"
+    saved = json.loads(orchestrator.STATE_FILE.read_text(encoding="utf-8"))
+    assert saved["sessions"]["worker"] == {"session_id": "sid-new", "backend": "codex"}
+
+
+def test_auto_dispatch_role_invalidates_sessions_on_base_sha_mismatch(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+    state = {
+        "state": orchestrator.STATE_AWAITING_WORK,
+        "round": 2,
+        "task_id": "T-627",
+        "base_sha": "base-sha",
+        "sessions": {"worker": {"session_id": "sid-old", "backend": "codex"}},
+    }
+    orchestrator._save_state(state)
+
+    captured: dict[str, object] = {}
+
+    def fake_run_auto_dispatch(*, resume_session_id: str | None = None, **kwargs) -> str | None:
+        _ = kwargs
+        captured["resume_session_id"] = resume_session_id
+        return None
+
+    def fake_dispatch_with_artifact_fallback(
+        *,
+        role: str,
+        dispatch_call,
+        artifact_path: Path,
+        task_id: str,
+        round_num: int,
+        timeout_sec: int = orchestrator.DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC,
+    ) -> dict:
+        _ = (role, artifact_path, timeout_sec)
+        dispatch_call()
+        return {"task_id": task_id, "round": round_num}
+
+    monkeypatch.setattr(orchestrator, "_run_auto_dispatch", fake_run_auto_dispatch)
+    monkeypatch.setattr(orchestrator, "_dispatch_with_artifact_fallback", fake_dispatch_with_artifact_fallback)
+    monkeypatch.setattr(orchestrator, "_current_sha", lambda: "new-head-sha")
+
+    orchestrator._auto_dispatch_role(
+        role="worker",
+        prompt="prompt",
+        config=orchestrator.RunConfig(auto_dispatch=True, worker_backend="codex"),
+        task_id="T-627",
+        round_num=2,
+        artifact_path=orchestrator.WORK_REPORT,
+        state=state,
+    )
+
+    assert captured["resume_session_id"] is None
+    saved = json.loads(orchestrator.STATE_FILE.read_text(encoding="utf-8"))
+    assert saved["sessions"] == {}
+
+
+def test_auto_dispatch_role_clears_sessions_on_permanent_dispatch_error(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+    state = {
+        "state": orchestrator.STATE_AWAITING_WORK,
+        "round": 2,
+        "task_id": "T-627",
+        "base_sha": "base-sha",
+        "sessions": {"worker": {"session_id": "sid-old", "backend": "codex"}},
+    }
+    orchestrator._save_state(state)
+
+    def fake_run_auto_dispatch(**kwargs) -> str | None:
+        _ = kwargs
+        raise orchestrator.PermanentDispatchError("permanent error")
+
+    def fake_dispatch_with_artifact_fallback(
+        *,
+        role: str,
+        dispatch_call,
+        artifact_path: Path,
+        task_id: str,
+        round_num: int,
+        timeout_sec: int = orchestrator.DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC,
+    ) -> dict:
+        _ = (role, artifact_path, task_id, round_num, timeout_sec)
+        dispatch_call()
+        raise AssertionError("dispatch_call should have raised PermanentDispatchError")
+
+    monkeypatch.setattr(orchestrator, "_run_auto_dispatch", fake_run_auto_dispatch)
+    monkeypatch.setattr(orchestrator, "_dispatch_with_artifact_fallback", fake_dispatch_with_artifact_fallback)
+    monkeypatch.setattr(orchestrator, "_current_sha", lambda: "base-sha")
+
+    with pytest.raises(orchestrator.PermanentDispatchError, match="permanent error"):
+        orchestrator._auto_dispatch_role(
+            role="worker",
+            prompt="prompt",
+            config=orchestrator.RunConfig(auto_dispatch=True, worker_backend="codex"),
+            task_id="T-627",
+            round_num=2,
+            artifact_path=orchestrator.WORK_REPORT,
+            state=state,
+        )
+
+    saved = json.loads(orchestrator.STATE_FILE.read_text(encoding="utf-8"))
+    assert saved["sessions"] == {}
 
 
 def test_worker_prompt_round1_includes_task_card_section(monkeypatch) -> None:
