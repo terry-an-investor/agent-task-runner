@@ -34,6 +34,7 @@ loop run --task .loop/task_card.json --auto-dispatch --worker-backend codex --re
 loop init                  Create .loop/ directory structure and templates
 loop index                 Build offline module map for src/loop_kit
 loop run                   Run the full PM-controlled review loop
+loop knowledge             Manage built-in defaults knowledge JSONL files
 loop status                Show current loop state
 loop health                Show worker/reviewer heartbeat health
 loop heartbeat             Write role heartbeat continuously
@@ -66,6 +67,17 @@ loop extract-diff BASE HEAD  Print git diff between two commits
 | `--allow-dirty` | off | Allow starting with dirty tracked files |
 | `--verbose` | off | Stream full backend stdout |
 | `--loop-dir PATH` | .loop | Loop bus directory |
+
+### `loop knowledge` commands
+
+| Command | Description |
+|---------|-------------|
+| `loop knowledge list [--category CAT]` | Print facts, pitfalls, and patterns from `src/loop_kit/defaults/*.jsonl` in a table |
+| `loop knowledge add --pattern TEXT --category CAT --confidence 0..1 --source ORIGIN` | Append a pattern entry to `src/loop_kit/defaults/patterns.jsonl` |
+| `loop knowledge prune --older-than DAYS` | Remove entries whose `source_version` timestamp is older than `DAYS` |
+| `loop knowledge dedupe` | Deduplicate defaults knowledge entries and report removals |
+
+All write operations are atomic (`temp file -> rename`) and modify `src/loop_kit/defaults/*.jsonl` in place.
 
 ### Configuration files and env vars
 

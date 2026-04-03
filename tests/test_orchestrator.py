@@ -2437,6 +2437,207 @@ def _run_config(task_path: str, **overrides: object) -> orchestrator.RunConfig:
     return orchestrator.RunConfig(task_path=task_path, **overrides)
 
 
+def _configure_default_knowledge_paths(monkeypatch, tmp_path: Path) -> tuple[Path, Path, Path]:
+    defaults_dir = tmp_path / "defaults"
+    defaults_dir.mkdir(parents=True, exist_ok=True)
+    facts_path = defaults_dir / "facts.jsonl"
+    pitfalls_path = defaults_dir / "pitfalls.jsonl"
+    patterns_path = defaults_dir / "patterns.jsonl"
+    monkeypatch.setattr(orchestrator, "_DEFAULTS_DIR", defaults_dir)
+    monkeypatch.setattr(orchestrator, "_DEFAULT_FACTS_JSONL", facts_path)
+    monkeypatch.setattr(orchestrator, "_DEFAULT_PITFALLS_JSONL", pitfalls_path)
+    monkeypatch.setattr(orchestrator, "_DEFAULT_PATTERNS_JSONL", patterns_path)
+    monkeypatch.setattr(orchestrator, "_configure_loop_paths", lambda loop_dir=".loop": orchestrator._snapshot_global_paths())
+    return facts_path, pitfalls_path, patterns_path
+
+
+def _write_jsonl(path: Path, entries: list[dict]) -> None:
+    payload = "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in entries)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(payload, encoding="utf-8")
+
+
+class TestKnowledgeCli:
+    def test_knowledge_list_prints_table_with_category_filter(self, tmp_path: Path, monkeypatch, capsys) -> None:
+        facts_path, pitfalls_path, patterns_path = _configure_default_knowledge_paths(monkeypatch, tmp_path)
+        _write_jsonl(facts_path, [{"fact": "single-file rule", "category": "facts"}])
+        _write_jsonl(pitfalls_path, [{"pitfall": "stale lock", "category": "pitfalls"}])
+        _write_jsonl(
+            patterns_path,
+            [
+                {
+                    "pattern": "run tests",
+                    "category": "workflow",
+                    "confidence": 0.9,
+                    "source": "manual",
+                    "source_version": "2026-04-01T00:00:00Z",
+                }
+            ],
+        )
+
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["orchestrator.py", "knowledge", "list", "--category", "workflow"],
+        )
+
+        orchestrator.main()
+        out = capsys.readouterr().out
+        assert "type" in out and "category" in out and "text" in out
+        assert "run tests" in out
+        assert "single-file rule" not in out
+        assert "stale lock" not in out
+
+    def test_knowledge_add_appends_pattern_entry(self, tmp_path: Path, monkeypatch, capsys) -> None:
+        _, _, patterns_path = _configure_default_knowledge_paths(monkeypatch, tmp_path)
+        _write_jsonl(
+            patterns_path,
+            [
+                {
+                    "pattern": "existing pattern",
+                    "category": "quality",
+                    "confidence": 0.5,
+                }
+            ],
+        )
+
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "orchestrator.py",
+                "knowledge",
+                "add",
+                "--pattern",
+                "new pattern",
+                "--category",
+                "workflow",
+                "--confidence",
+                "0.8",
+                "--source",
+                "review",
+            ],
+        )
+
+        orchestrator.main()
+        out = capsys.readouterr().out
+        assert "Added pattern" in out
+        entries = [
+            json.loads(line)
+            for line in patterns_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        assert len(entries) == 2
+        new_entry = entries[-1]
+        assert new_entry["pattern"] == "new pattern"
+        assert new_entry["category"] == "workflow"
+        assert new_entry["confidence"] == 0.8
+        assert new_entry["source"] == "review"
+        assert isinstance(new_entry["source_version"], str) and new_entry["source_version"]
+
+    def test_knowledge_prune_removes_entries_with_old_source_version(
+        self, tmp_path: Path, monkeypatch, capsys
+    ) -> None:
+        facts_path, pitfalls_path, patterns_path = _configure_default_knowledge_paths(monkeypatch, tmp_path)
+        now = datetime.now(UTC)
+        old_iso = (now - timedelta(days=40)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        fresh_iso = (now - timedelta(days=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        _write_jsonl(
+            facts_path,
+            [
+                {"fact": "old fact", "source_version": old_iso},
+                {"fact": "fresh fact", "source_version": fresh_iso},
+            ],
+        )
+        _write_jsonl(
+            pitfalls_path,
+            [
+                {"pitfall": "old pitfall", "source_version": old_iso},
+                {"pitfall": "fresh pitfall", "source_version": fresh_iso},
+            ],
+        )
+        _write_jsonl(
+            patterns_path,
+            [
+                {"pattern": "old pattern", "category": "workflow", "confidence": 0.2, "source_version": old_iso},
+                {"pattern": "keep missing source_version", "category": "workflow", "confidence": 0.3},
+            ],
+        )
+
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["orchestrator.py", "knowledge", "prune", "--older-than", "30"],
+        )
+
+        orchestrator.main()
+        out = capsys.readouterr().out
+        assert "removed_total=3" in out
+
+        facts_entries = [json.loads(line) for line in facts_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        pitfalls_entries = [
+            json.loads(line) for line in pitfalls_path.read_text(encoding="utf-8").splitlines() if line.strip()
+        ]
+        patterns_entries = [
+            json.loads(line) for line in patterns_path.read_text(encoding="utf-8").splitlines() if line.strip()
+        ]
+        assert [entry["fact"] for entry in facts_entries] == ["fresh fact"]
+        assert [entry["pitfall"] for entry in pitfalls_entries] == ["fresh pitfall"]
+        assert {entry["pattern"] for entry in patterns_entries} == {"keep missing source_version"}
+
+    def test_knowledge_dedupe_removes_duplicates_and_keeps_higher_confidence(
+        self, tmp_path: Path, monkeypatch, capsys
+    ) -> None:
+        facts_path, pitfalls_path, patterns_path = _configure_default_knowledge_paths(monkeypatch, tmp_path)
+        _write_jsonl(
+            facts_path,
+            [
+                {"fact": "single-file rule", "category": "facts"},
+                {"fact": "single-file rule", "category": "facts"},
+            ],
+        )
+        _write_jsonl(
+            pitfalls_path,
+            [
+                {"pitfall": "stale lock", "category": "pitfalls"},
+                {"pitfall": "stale lock", "category": "pitfalls"},
+            ],
+        )
+        _write_jsonl(
+            patterns_path,
+            [
+                {"pattern": "run tests", "category": "workflow", "confidence": 0.2},
+                {"pattern": "run tests", "category": "workflow", "confidence": 0.9},
+                {"pattern": "run lint", "category": "workflow", "confidence": 0.5},
+            ],
+        )
+
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["orchestrator.py", "knowledge", "dedupe"],
+        )
+
+        orchestrator.main()
+        out = capsys.readouterr().out
+        assert "facts_removed=1" in out
+        assert "pitfalls_removed=1" in out
+        assert "patterns_removed=1" in out
+
+        facts_entries = [json.loads(line) for line in facts_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        pitfalls_entries = [
+            json.loads(line) for line in pitfalls_path.read_text(encoding="utf-8").splitlines() if line.strip()
+        ]
+        patterns_entries = [
+            json.loads(line) for line in patterns_path.read_text(encoding="utf-8").splitlines() if line.strip()
+        ]
+        assert len(facts_entries) == 1
+        assert len(pitfalls_entries) == 1
+        assert len(patterns_entries) == 2
+        by_pattern = {(entry["category"], entry["pattern"]): entry for entry in patterns_entries}
+        assert by_pattern[("workflow", "run tests")]["confidence"] == 0.9
+
+
 def test_cmd_index_generates_module_map_with_expected_shape(tmp_path: Path, monkeypatch) -> None:
     _configure_loop_paths(monkeypatch, tmp_path)
     src = tmp_path / "src" / "loop_kit"

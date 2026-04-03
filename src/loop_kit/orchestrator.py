@@ -291,6 +291,10 @@ _MODULE_MAP_FILE = _CONTEXT_DIR / "module_map.json"
 _PROJECT_FACTS_FILE = _CONTEXT_DIR / "project_facts.md"
 _PITFALLS_FILE = _CONTEXT_DIR / "pitfalls.md"
 _PATTERNS_FILE = _CONTEXT_DIR / "patterns.jsonl"
+_DEFAULTS_DIR = Path(__file__).resolve().parent / "defaults"
+_DEFAULT_FACTS_JSONL = _DEFAULTS_DIR / "facts.jsonl"
+_DEFAULT_PITFALLS_JSONL = _DEFAULTS_DIR / "pitfalls.jsonl"
+_DEFAULT_PATTERNS_JSONL = _DEFAULTS_DIR / "patterns.jsonl"
 _RESETTABLE_FILES = [
     LOCK_FILE,
     STATE_FILE,
@@ -2357,6 +2361,291 @@ def _write_patterns_jsonl(entries: list[dict]) -> None:
         for item in entries
     )
     _PATTERNS_FILE.write_text(payload, encoding="utf-8")
+
+
+def _read_jsonl_entries(path: Path) -> list[dict]:
+    text = _read_text_optional(path)
+    if not text:
+        return []
+    entries: list[dict] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            entries.append(payload)
+    return entries
+
+
+def _atomic_write_jsonl(path: Path, entries: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in entries)
+    tmp = path.with_suffix(".tmp")
+    try:
+        tmp.write_text(payload, encoding="utf-8")
+        try:
+            tmp.replace(path)
+        except PermissionError:
+            if os.name == "nt":
+                time.sleep(0.05)
+                tmp.replace(path)
+            else:
+                raise
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _knowledge_default_specs() -> list[tuple[str, Path, str]]:
+    return [
+        ("facts", _DEFAULT_FACTS_JSONL, "fact"),
+        ("pitfalls", _DEFAULT_PITFALLS_JSONL, "pitfall"),
+        ("patterns", _DEFAULT_PATTERNS_JSONL, "pattern"),
+    ]
+
+
+def _render_table(headers: list[str], rows: list[list[str]]) -> str:
+    if not rows:
+        return ""
+    widths = [len(header) for header in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(cell))
+
+    def _fmt(cells: list[str]) -> str:
+        return " | ".join(cell.ljust(widths[i]) for i, cell in enumerate(cells))
+
+    divider = "-+-".join("-" * width for width in widths)
+    lines = [_fmt(headers), divider]
+    lines.extend(_fmt(row) for row in rows)
+    return "\n".join(lines)
+
+
+def _collect_default_knowledge_rows(*, category: str | None = None) -> list[list[str]]:
+    rows: list[list[str]] = []
+    for kind, path, text_field in _knowledge_default_specs():
+        entries = _read_jsonl_entries(path)
+        for entry in entries:
+            text_value = entry.get(text_field)
+            if not isinstance(text_value, str) or not text_value.strip():
+                continue
+            row_category_raw = entry.get("category", kind)
+            row_category = str(row_category_raw).strip() if row_category_raw is not None else kind
+            if not row_category:
+                row_category = kind
+            if category is not None and row_category != category:
+                continue
+            confidence = ""
+            if kind == "patterns":
+                confidence = f"{_coerce_confidence(entry.get('confidence'), default=0.0):.2f}"
+            source = str(entry.get("source", "")).strip()
+            source_version = str(entry.get("source_version", "")).strip()
+            rows.append(
+                [
+                    kind,
+                    row_category,
+                    text_value.strip(),
+                    confidence,
+                    source,
+                    source_version,
+                ]
+            )
+    rows.sort(key=lambda item: (item[0], item[1], item[2]))
+    return rows
+
+
+def _prune_jsonl_by_source_version(path: Path, older_than_days: int) -> tuple[int, int]:
+    entries = _read_jsonl_entries(path)
+    if not entries:
+        return 0, 0
+    cutoff = datetime.now(UTC) - timedelta(days=older_than_days)
+    kept: list[dict] = []
+    removed = 0
+    for entry in entries:
+        parsed = _parse_utc_iso8601(entry.get("source_version"))
+        if parsed is not None and parsed < cutoff:
+            removed += 1
+            continue
+        kept.append(entry)
+    if removed > 0:
+        _atomic_write_jsonl(path, kept)
+    return removed, len(kept)
+
+
+def _dedupe_text_knowledge_entries(entries: list[dict], *, text_field: str, default_category: str) -> tuple[list[dict], int]:
+    deduped: dict[tuple[str, str], dict] = {}
+    duplicates = 0
+    for entry in entries:
+        text_value = entry.get(text_field)
+        if not isinstance(text_value, str) or not text_value.strip():
+            continue
+        category_value = entry.get("category", default_category)
+        category = str(category_value).strip() if category_value is not None else default_category
+        if not category:
+            category = default_category
+        normalized: dict[str, object] = {
+            text_field: text_value.strip(),
+            "category": category,
+        }
+        source = entry.get("source")
+        if isinstance(source, str) and source.strip():
+            normalized["source"] = source.strip()
+        source_version = entry.get("source_version")
+        if isinstance(source_version, str) and source_version.strip():
+            normalized["source_version"] = source_version.strip()
+        key = (category, normalized[text_field])
+        if key in deduped:
+            duplicates += 1
+            continue
+        deduped[key] = normalized
+    return list(deduped.values()), duplicates
+
+
+def _dedupe_pattern_entries(entries: list[dict]) -> tuple[list[dict], int]:
+    deduped: dict[tuple[str, str], dict] = {}
+    duplicates = 0
+    for entry in entries:
+        pattern_value = entry.get("pattern")
+        category_value = entry.get("category")
+        if not isinstance(pattern_value, str) or not pattern_value.strip():
+            continue
+        if not isinstance(category_value, str) or not category_value.strip():
+            continue
+        normalized: dict[str, object] = {
+            "pattern": pattern_value.strip(),
+            "category": category_value.strip(),
+            "confidence": _coerce_confidence(entry.get("confidence"), default=0.0),
+        }
+        source = entry.get("source")
+        if isinstance(source, str) and source.strip():
+            normalized["source"] = source.strip()
+        source_version = entry.get("source_version")
+        if isinstance(source_version, str) and source_version.strip():
+            normalized["source_version"] = source_version.strip()
+        last_verified = entry.get("last_verified")
+        if isinstance(last_verified, str) and last_verified.strip():
+            normalized["last_verified"] = last_verified.strip()
+        key = (normalized["category"], normalized["pattern"])
+        existing = deduped.get(key)
+        if existing is None:
+            deduped[key] = normalized
+            continue
+        duplicates += 1
+        if _coerce_confidence(normalized.get("confidence"), default=0.0) > _coerce_confidence(
+            existing.get("confidence"), default=0.0
+        ):
+            deduped[key] = normalized
+    return list(deduped.values()), duplicates
+
+
+def _parse_confidence_arg(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("confidence must be a number between 0 and 1") from exc
+    if parsed < 0.0 or parsed > 1.0:
+        raise argparse.ArgumentTypeError("confidence must be between 0 and 1")
+    return parsed
+
+
+def _parse_non_negative_int_arg(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("value must be a non-negative integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be a non-negative integer")
+    return parsed
+
+
+def cmd_knowledge_list(category: str | None = None) -> None:
+    rows = _collect_default_knowledge_rows(category=category)
+    if not rows:
+        if category is not None:
+            print(f"No knowledge entries found for category='{category}'.")
+        else:
+            print("No knowledge entries found.")
+        return
+    table = _render_table(
+        ["type", "category", "text", "confidence", "source", "source_version"],
+        rows,
+    )
+    print(table)
+    print()
+    print(f"Total entries: {len(rows)}")
+
+
+def cmd_knowledge_add(pattern: str, category: str, confidence: float, source: str) -> None:
+    normalized_pattern = pattern.strip()
+    normalized_category = category.strip()
+    normalized_source = source.strip()
+    if not normalized_pattern:
+        raise ValidationError("pattern must be non-empty")
+    if not normalized_category:
+        raise ValidationError("category must be non-empty")
+    if not normalized_source:
+        raise ValidationError("source must be non-empty")
+    now_iso = _ts()
+    entries = _read_jsonl_entries(_DEFAULT_PATTERNS_JSONL)
+    entries.append(
+        {
+            "pattern": normalized_pattern,
+            "category": normalized_category,
+            "confidence": _coerce_confidence(confidence, default=0.0),
+            "source": normalized_source,
+            "source_version": now_iso,
+            "last_verified": now_iso,
+        }
+    )
+    _atomic_write_jsonl(_DEFAULT_PATTERNS_JSONL, entries)
+    print(
+        f"Added pattern: category='{normalized_category}' confidence={_coerce_confidence(confidence, default=0.0):.2f} "
+        f"source='{normalized_source}'"
+    )
+    print(f"Updated: {_display_path(_DEFAULT_PATTERNS_JSONL)} (entries={len(entries)})")
+
+
+def cmd_knowledge_prune(older_than: int) -> None:
+    removed_total = 0
+    for _, path, _ in _knowledge_default_specs():
+        removed, kept = _prune_jsonl_by_source_version(path, older_than)
+        removed_total += removed
+        print(f"{path.name}: removed={removed} kept={kept}")
+    print(f"Pruned entries older than {older_than} day(s): removed_total={removed_total}")
+
+
+def cmd_knowledge_dedupe() -> None:
+    facts_entries = _read_jsonl_entries(_DEFAULT_FACTS_JSONL)
+    deduped_facts, facts_removed = _dedupe_text_knowledge_entries(
+        facts_entries,
+        text_field="fact",
+        default_category="facts",
+    )
+    if facts_removed > 0:
+        _atomic_write_jsonl(_DEFAULT_FACTS_JSONL, deduped_facts)
+
+    pitfalls_entries = _read_jsonl_entries(_DEFAULT_PITFALLS_JSONL)
+    deduped_pitfalls, pitfalls_removed = _dedupe_text_knowledge_entries(
+        pitfalls_entries,
+        text_field="pitfall",
+        default_category="pitfalls",
+    )
+    if pitfalls_removed > 0:
+        _atomic_write_jsonl(_DEFAULT_PITFALLS_JSONL, deduped_pitfalls)
+
+    pattern_entries = _read_jsonl_entries(_DEFAULT_PATTERNS_JSONL)
+    deduped_patterns, patterns_removed = _dedupe_pattern_entries(pattern_entries)
+    if patterns_removed > 0:
+        _atomic_write_jsonl(_DEFAULT_PATTERNS_JSONL, deduped_patterns)
+
+    print(
+        "Deduplicated defaults knowledge: "
+        f"facts_removed={facts_removed}, pitfalls_removed={pitfalls_removed}, patterns_removed={patterns_removed}"
+    )
 
 
 def _load_patterns_with_governance(*, persist: bool = False) -> tuple[list[dict], int]:
@@ -5372,6 +5661,32 @@ def main() -> None:
         help="Archive file stem/name to restore into current loop dir (e.g. r1_work_report)",
     )
 
+    knowledge_p = sub.add_parser("knowledge", parents=[shared], help="Manage built-in defaults knowledge JSONL files")
+    knowledge_sub = knowledge_p.add_subparsers(dest="knowledge_cmd")
+    knowledge_list_p = knowledge_sub.add_parser("list", help="List facts/pitfalls/patterns from defaults JSONL files")
+    knowledge_list_p.add_argument("--category", help="Filter rows by category value")
+    knowledge_add_p = knowledge_sub.add_parser("add", help="Append a pattern entry to defaults/patterns.jsonl")
+    knowledge_add_p.add_argument("--pattern", required=True, help="Pattern text")
+    knowledge_add_p.add_argument("--category", required=True, help="Pattern category")
+    knowledge_add_p.add_argument(
+        "--confidence",
+        required=True,
+        type=_parse_confidence_arg,
+        help="Confidence score between 0 and 1",
+    )
+    knowledge_add_p.add_argument("--source", required=True, help="Source/origin label")
+    knowledge_prune_p = knowledge_sub.add_parser(
+        "prune",
+        help="Remove defaults entries with source_version older than N days",
+    )
+    knowledge_prune_p.add_argument(
+        "--older-than",
+        required=True,
+        type=_parse_non_negative_int_arg,
+        help="Remove entries older than this many days",
+    )
+    knowledge_sub.add_parser("dedupe", help="Deduplicate defaults knowledge files and report removals")
+
     run_p = sub.add_parser("run", parents=[shared], help="Run the full PM-controlled review loop")
     run_p.add_argument("task_ref", nargs="?", default=None, help="Task ID (e.g. T-601) or path to task card JSON")
     run_p.add_argument("--task", default=None, help="Path to task card JSON (overrides positional task_ref)")
@@ -5456,6 +5771,18 @@ def main() -> None:
             cmd_extract_diff(args.base, args.head)
         elif args.cmd == "archive":
             cmd_archive(args.task_id, args.restore)
+        elif args.cmd == "knowledge":
+            if args.knowledge_cmd == "list":
+                cmd_knowledge_list(args.category)
+            elif args.knowledge_cmd == "add":
+                cmd_knowledge_add(args.pattern, args.category, args.confidence, args.source)
+            elif args.knowledge_cmd == "prune":
+                cmd_knowledge_prune(args.older_than)
+            elif args.knowledge_cmd == "dedupe":
+                cmd_knowledge_dedupe()
+            else:
+                knowledge_p.print_help()
+                raise ValidationError("knowledge subcommand required")
         elif args.cmd == "run":
             file_cfg = _load_config()
             env_cfg = _load_env_config()
