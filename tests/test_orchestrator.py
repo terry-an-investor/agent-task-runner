@@ -4471,6 +4471,178 @@ def test_single_round_dispatch_failure_marks_task_status_blocked(tmp_path: Path,
     assert src_after["status"] == "blocked"
 
 
+def test_single_round_lane_failure_preserves_worktrees_and_marks_blocked_dependencies(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+
+    task_path = tmp_path / "task_input.json"
+    task_path.write_text(
+        json.dumps(
+            {
+                "task_id": "T-729",
+                "goal": "lane failure",
+                "in_scope": [],
+                "out_of_scope": [],
+                "acceptance_criteria": ["lane failure isolation"],
+                "constraints": [],
+                "lanes": [
+                    {"lane_id": "lane_core", "owner_paths": ["src/loop_kit/orchestrator.py"]},
+                    {
+                        "lane_id": "lane_docs",
+                        "owner_paths": ["docs/roles/code-writer.md"],
+                        "depends_on": ["lane_core"],
+                    },
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(orchestrator, "_current_sha", lambda: "base-sha")
+
+    core_worktree = tmp_path / ".loop" / "worktrees" / "T-729" / "1" / "lane_core"
+    docs_worktree = tmp_path / ".loop" / "worktrees" / "T-729" / "1" / "lane_docs"
+    core_worktree.mkdir(parents=True, exist_ok=True)
+    docs_worktree.mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(
+        orchestrator,
+        "_prepare_lane_worktrees",
+        lambda **kwargs: [
+            orchestrator.LaneWorktreeHandle(
+                task_id="T-729",
+                round_num=1,
+                lane_id="lane_core",
+                path=core_worktree,
+                branch="loop/T-729/r1/lane_core",
+            ),
+            orchestrator.LaneWorktreeHandle(
+                task_id="T-729",
+                round_num=1,
+                lane_id="lane_docs",
+                path=docs_worktree,
+                branch="loop/T-729/r1/lane_docs",
+            ),
+        ],
+    )
+    monkeypatch.setattr(orchestrator, "_run_auto_dispatch", lambda **kwargs: "lane-session")
+
+    def fake_dispatch_with_artifact_fallback(**kwargs):
+        role = kwargs["role"]
+        if role == "worker_lane_lane_core":
+            raise RuntimeError("lane core failed")
+        raise AssertionError(f"unexpected lane dispatch role: {role}")
+
+    monkeypatch.setattr(orchestrator, "_dispatch_with_artifact_fallback", fake_dispatch_with_artifact_fallback)
+
+    with pytest.raises(SystemExit) as exc:
+        orchestrator.cmd_run(
+            _run_config(
+                str(task_path),
+                auto_dispatch=True,
+                max_parallel_workers=2,
+                allow_dirty=True,
+            ),
+            single_round=True,
+            round_num=1,
+        )
+
+    assert exc.value.code == orchestrator.EXIT_VALIDATION_ERROR
+    state = json.loads(orchestrator.STATE_FILE.read_text(encoding="utf-8"))
+    assert state["outcome"] == "lane_dispatch_failed"
+    assert state["lanes"]["lane_core"]["status"] == "failed"
+    assert state["lanes"]["lane_docs"]["status"] == "blocked"
+    assert "lane_core:failed" in state["lanes"]["lane_docs"]["blocked_by"]
+    assert core_worktree.exists()
+    assert docs_worktree.exists()
+
+
+def test_single_round_with_lanes_falls_back_to_serial_when_parallel_disabled(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+
+    task_path = tmp_path / "task_input.json"
+    task_path.write_text(
+        json.dumps(
+            {
+                "task_id": "T-729",
+                "goal": "lane serial fallback",
+                "in_scope": [],
+                "out_of_scope": [],
+                "acceptance_criteria": ["serial fallback"],
+                "constraints": [],
+                "lanes": [
+                    {"lane_id": "lane_core", "owner_paths": ["src/loop_kit/orchestrator.py"]},
+                    {"lane_id": "lane_tests", "owner_paths": ["tests/test_orchestrator.py"]},
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(orchestrator, "_current_sha", lambda: "base-sha")
+    monkeypatch.setattr(
+        orchestrator,
+        "_prepare_lane_worktrees",
+        lambda **kwargs: [
+            orchestrator.LaneWorktreeHandle(
+                task_id="T-729",
+                round_num=1,
+                lane_id="lane_core",
+                path=tmp_path / ".loop" / "worktrees" / "T-729" / "1" / "lane_core",
+                branch="loop/T-729/r1/lane_core",
+            ),
+            orchestrator.LaneWorktreeHandle(
+                task_id="T-729",
+                round_num=1,
+                lane_id="lane_tests",
+                path=tmp_path / ".loop" / "worktrees" / "T-729" / "1" / "lane_tests",
+                branch="loop/T-729/r1/lane_tests",
+            ),
+        ],
+    )
+
+    dispatch_roles: list[str] = []
+
+    def fake_auto_dispatch_role(**kwargs):
+        role = kwargs["role"]
+        dispatch_roles.append(role)
+        if role == "worker":
+            return {
+                "task_id": "T-729",
+                "round": 1,
+                "head_sha": "head-sha",
+                "files_changed": ["src/loop_kit/orchestrator.py"],
+                "tests": [],
+                "notes": "serial worker",
+            }
+        if role == "reviewer":
+            return {
+                "task_id": "T-729",
+                "round": 1,
+                "decision": "approve",
+                "blocking_issues": [],
+                "non_blocking_suggestions": [],
+            }
+        raise AssertionError(f"unexpected role: {role}")
+
+    monkeypatch.setattr(orchestrator, "_auto_dispatch_role", fake_auto_dispatch_role)
+    monkeypatch.setattr(orchestrator, "_diff", lambda base, head: f"diff {base}->{head}")
+    monkeypatch.setattr(orchestrator, "_log_oneline", lambda base, head: f"log {base}->{head}")
+
+    orchestrator.cmd_run(
+        _run_config(
+            str(task_path),
+            auto_dispatch=True,
+            max_parallel_workers=1,
+            allow_dirty=True,
+        ),
+        single_round=True,
+        round_num=1,
+    )
+
+    assert dispatch_roles == ["worker", "reviewer"]
+    assert not (orchestrator.LOOP_DIR / "work_reports" / "lane_core.json").exists()
+
+
 def test_outer_loop_spawns_single_round_subprocess(tmp_path: Path, monkeypatch) -> None:
     _configure_loop_paths(monkeypatch, tmp_path)
 

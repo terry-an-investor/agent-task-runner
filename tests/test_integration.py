@@ -63,6 +63,7 @@ def _write_fake_opencode_backend(bin_dir: Path) -> Path:
             "import re\n"
             "import subprocess\n"
             "import sys\n"
+            "import time\n"
             "from pathlib import Path\n"
             "\n"
             "# Force UTF-8 output on Windows where default console encoding may differ\n"
@@ -102,10 +103,25 @@ def _write_fake_opencode_backend(bin_dir: Path) -> Path:
             "    return proc.stdout.strip()\n"
             "\n"
             "\n"
+            "def _emit_trace(trace_file: str, payload: dict[str, object]) -> None:\n"
+            "    if not trace_file:\n"
+            "        return\n"
+            "    trace_path = Path(trace_file)\n"
+            "    trace_path.parent.mkdir(parents=True, exist_ok=True)\n"
+            "    with trace_path.open('a', encoding='utf-8') as fh:\n"
+            "        fh.write(json.dumps(payload, ensure_ascii=False) + '\\n')\n"
+            "\n"
+            "\n"
             "def main() -> int:\n"
             "    argv = sys.argv[1:]\n"
             '    mode = os.environ.get("FAKE_OPENCODE_MODE", "ok").strip().lower()\n'
             '    reviewer_decision = os.environ.get("FAKE_OPENCODE_REVIEW_DECISION", "approve").strip()\n'
+            '    sleep_raw = os.environ.get("FAKE_OPENCODE_SLEEP_SEC", "0").strip()\n'
+            "    try:\n"
+            "        sleep_sec = float(sleep_raw) if sleep_raw else 0.0\n"
+            "    except ValueError:\n"
+            "        sleep_sec = 0.0\n"
+            '    trace_file = os.environ.get("FAKE_OPENCODE_TRACE_FILE", "").strip()\n'
             '    session_id = _arg_value("-s", argv) or "fake-session"\n'
             "\n"
             "    sys.stdout.write(\n"
@@ -122,7 +138,7 @@ def _write_fake_opencode_backend(bin_dir: Path) -> Path:
             '    handoff_visible = "=== HANDOFF CONTEXT ===" in prompt and "role: " in prompt\n'
             '    quickstart_visible = "project_baseline:" in prompt\n'
             '    loop_dir = Path.cwd() / ".loop"\n'
-            '    task_id = _prompt_value(r"Current task_id:\\\\s*([^,\\\\n]+)", prompt, "UNKNOWN")\n'
+            '    task_id = _prompt_value(r"Current task_id:\\s*([^,\\n]+)", prompt, "UNKNOWN")\n'
             '    if task_id == "UNKNOWN":\n'
             '        task_card_path = loop_dir / "task_card.json"\n'
             "        if task_card_path.exists():\n"
@@ -134,7 +150,7 @@ def _write_fake_opencode_backend(bin_dir: Path) -> Path:
             '                task_card_id = task_card.get("task_id")\n'
             "                if isinstance(task_card_id, str) and task_card_id.strip():\n"
             "                    task_id = task_card_id.strip()\n"
-            '    round_text = _prompt_value(r"round:\\\\s*(\\\\d+)", prompt, "")\n'
+            '    round_text = _prompt_value(r"round:\\s*(\\d+)", prompt, "")\n'
             "    if not round_text.isdigit():\n"
             '        state_path = loop_dir / "state.json"\n'
             "        if state_path.exists():\n"
@@ -147,9 +163,26 @@ def _write_fake_opencode_backend(bin_dir: Path) -> Path:
             "    if not round_text.isdigit():\n"
             '        round_text = "1"\n'
             "    round_num = int(round_text)\n"
+            '    lane_id = _prompt_value(r"lane_id:\\s*([^\\n]+)", prompt, "").strip()\n'
+            "    _emit_trace(\n"
+            "        trace_file,\n"
+            "        {\n"
+            '            "event": "start",\n'
+            '            "ts": time.time(),\n'
+            '            "cwd": str(Path.cwd()),\n'
+            '            "lane_id": lane_id,\n'
+            '            "role": "worker" if "Role: code-writer worker for PM loop." in prompt else "reviewer",\n'
+            "        },\n"
+            "    )\n"
+            "    if sleep_sec > 0:\n"
+            "        time.sleep(sleep_sec)\n"
             "\n"
             '    if "Role: code-writer worker for PM loop." in prompt:\n'
-            '        changed_file = Path.cwd() / f"worker_round_{round_num}.txt"\n'
+            "        if lane_id:\n"
+            '            changed_name = f"{lane_id}_round_{round_num}.txt"\n'
+            "        else:\n"
+            '            changed_name = f"worker_round_{round_num}.txt"\n'
+            "        changed_file = Path.cwd() / changed_name\n"
             '        changed_file.write_text(f"round {round_num}\\n", encoding="utf-8")\n'
             '        _git("add", changed_file.name)\n'
             '        _git("commit", "-m", f"worker round {round_num}")\n'
@@ -187,6 +220,16 @@ def _write_fake_opencode_backend(bin_dir: Path) -> Path:
             '        json.dumps({"type": "done", "part": {"artifact": str(target)}}) + "\\n"\n'
             "    )\n"
             "    sys.stdout.flush()\n"
+            "    _emit_trace(\n"
+            "        trace_file,\n"
+            "        {\n"
+            '            "event": "finish",\n'
+            '            "ts": time.time(),\n'
+            '            "cwd": str(Path.cwd()),\n'
+            '            "lane_id": lane_id,\n'
+            '            "role": "worker" if "Role: code-writer worker for PM loop." in prompt else "reviewer",\n'
+            "        },\n"
+            "    )\n"
             "\n"
             "    return 0\n"
             "\n"
@@ -218,12 +261,24 @@ def _install_fake_opencode(bin_dir: Path) -> None:
     unix_launcher.chmod(unix_launcher.stat().st_mode | stat.S_IEXEC)
 
 
-def _subprocess_env(tmp_path: Path, *, mode: str = "ok", reviewer_decision: str = "approve") -> dict[str, str]:
+def _subprocess_env(
+    tmp_path: Path,
+    *,
+    mode: str = "ok",
+    reviewer_decision: str = "approve",
+    sleep_sec: float = 0.0,
+    trace_file: Path | None = None,
+) -> dict[str, str]:
     env = os.environ.copy()
     bin_dir = tmp_path / "bin"
     env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", "")
     env["FAKE_OPENCODE_MODE"] = mode
     env["FAKE_OPENCODE_REVIEW_DECISION"] = reviewer_decision
+    env["FAKE_OPENCODE_SLEEP_SEC"] = str(sleep_sec)
+    if trace_file is not None:
+        env["FAKE_OPENCODE_TRACE_FILE"] = str(trace_file)
+    else:
+        env.pop("FAKE_OPENCODE_TRACE_FILE", None)
     # Force UTF-8 encoding for Python subprocesses on Windows
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
@@ -272,11 +327,19 @@ def _run_loop(
     *,
     mode: str = "ok",
     reviewer_decision: str = "approve",
+    sleep_sec: float = 0.0,
+    trace_file: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, "-m", "loop_kit", *args],
         cwd=tmp_path,
-        env=_subprocess_env(tmp_path, mode=mode, reviewer_decision=reviewer_decision),
+        env=_subprocess_env(
+            tmp_path,
+            mode=mode,
+            reviewer_decision=reviewer_decision,
+            sleep_sec=sleep_sec,
+            trace_file=trace_file,
+        ),
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -388,6 +451,94 @@ def test_full_worker_review_round(tmp_path: Path) -> None:
         "task_ready -> work_done",
         "work_done -> review_done",
     ]
+
+
+@pytest.mark.timeout(15)
+def test_parallel_lane_dispatch_writes_lane_reports_and_merges_work_report(tmp_path: Path) -> None:
+    base_sha = _init_git_repo(tmp_path)
+    _install_fake_opencode(tmp_path / "bin")
+    loop_dir = _prepare_loop_contract(
+        tmp_path,
+        task_id="T-729",
+        base_sha=base_sha,
+        state_name="task_ready",
+        round_num=1,
+    )
+    _write_json(
+        loop_dir / "task_card.json",
+        {
+            "task_id": "T-729",
+            "goal": "Parallel lane dispatch integration",
+            "in_scope": [],
+            "out_of_scope": [],
+            "acceptance_criteria": ["parallel lanes"],
+            "constraints": [],
+            "lanes": [
+                {"lane_id": "lane_core", "owner_paths": ["src/lane_core.py"]},
+                {"lane_id": "lane_tests", "owner_paths": ["tests/lane_tests.py"]},
+            ],
+        },
+    )
+    trace_file = tmp_path / "dispatch_trace.jsonl"
+
+    result = _run_loop(
+        tmp_path,
+        [
+            "run",
+            "--loop-dir",
+            ".loop",
+            "--task",
+            ".loop/task_card.json",
+            "--single-round",
+            "--round",
+            "1",
+            "--auto-dispatch",
+            "--worker-backend",
+            "opencode",
+            "--reviewer-backend",
+            "opencode",
+            "--dispatch-retries",
+            "0",
+            "--artifact-timeout",
+            "2",
+            "--max-parallel-workers",
+            "2",
+        ],
+        reviewer_decision="approve",
+        sleep_sec=0.8,
+        trace_file=trace_file,
+    )
+
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+
+    lane_core_report = loop_dir / "work_reports" / "lane_core.json"
+    lane_tests_report = loop_dir / "work_reports" / "lane_tests.json"
+    assert lane_core_report.exists()
+    assert lane_tests_report.exists()
+
+    merged_work = json.loads((loop_dir / "work_report.json").read_text(encoding="utf-8"))
+    assert merged_work["task_id"] == "T-729"
+    assert merged_work["round"] == 1
+    files_changed = merged_work.get("files_changed", [])
+    assert "lane_core_round_1.txt" in files_changed
+    assert "lane_tests_round_1.txt" in files_changed
+
+    state = json.loads((loop_dir / "state.json").read_text(encoding="utf-8"))
+    assert state["state"] == "done"
+    assert state["outcome"] == "approved"
+    assert state["lanes"]["lane_core"]["status"] == "completed"
+    assert state["lanes"]["lane_tests"]["status"] == "completed"
+
+    trace_rows = [
+        json.loads(line)
+        for line in trace_file.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    worker_starts = [row for row in trace_rows if row.get("event") == "start" and row.get("role") == "worker"]
+    lane_worker_starts = [row for row in worker_starts if isinstance(row.get("lane_id"), str) and row["lane_id"]]
+    assert {row["lane_id"] for row in lane_worker_starts} == {"lane_core", "lane_tests"}
+    lane_worker_starts.sort(key=lambda row: float(row["ts"]))
+    assert float(lane_worker_starts[1]["ts"]) - float(lane_worker_starts[0]["ts"]) < 0.5
 
 
 @pytest.mark.timeout(10)

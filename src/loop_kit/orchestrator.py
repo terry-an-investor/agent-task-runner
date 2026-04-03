@@ -23,6 +23,7 @@ All messages are JSON. Git commits are the single source of truth.
 import argparse
 import ast
 import contextlib
+import concurrent.futures
 import difflib
 import fnmatch
 import hashlib
@@ -204,6 +205,8 @@ DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC = 90
 DEFAULT_DISPATCH_RETRIES = 2
 DEFAULT_DISPATCH_RETRY_BASE_SEC = 5
 DEFAULT_MAX_SESSION_ROUNDS = 0
+DEFAULT_MAX_PARALLEL_WORKERS = 2
+DEFAULT_MAX_PARALLEL_WORKERS_CAP = 4
 MAX_DISPATCH_RETRY_DELAY_SEC = 60
 DEFAULT_GIT_TIMEOUT_SEC = 30
 MAX_JSON_PAYLOAD_BYTES = 5 * 1024 * 1024
@@ -388,6 +391,8 @@ class RunConfig:
     dispatch_retries: int = DEFAULT_DISPATCH_RETRIES
     dispatch_retry_base_sec: int = DEFAULT_DISPATCH_RETRY_BASE_SEC
     max_session_rounds: int = DEFAULT_MAX_SESSION_ROUNDS
+    max_parallel_workers: int = DEFAULT_MAX_PARALLEL_WORKERS
+    aggressive_parallelism: bool = False
     artifact_timeout: int = DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC
     allow_dirty: bool = False
     verbose: bool = False
@@ -1834,6 +1839,44 @@ def _agent_command(
     return build_cmd_fn(exe, prompt)
 
 
+def _codex_command_with_repo_root(cmd: list[str], *, repo_root: Path) -> list[str]:
+    updated = list(cmd)
+    for idx, token in enumerate(updated):
+        if token == "-C" and idx + 1 < len(updated):
+            updated[idx + 1] = str(repo_root)
+            return updated
+    return updated
+
+
+def _git_is_ancestor(
+    ancestor_ref: str,
+    descendant_ref: str,
+    *,
+    timeout: float | None = DEFAULT_GIT_TIMEOUT_SEC,
+) -> bool:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(ROOT), "merge-base", "--is-ancestor", ancestor_ref, descendant_ref],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        timeout_value = exc.timeout if exc.timeout is not None else timeout
+        raise RuntimeError(
+            f"git merge-base --is-ancestor {ancestor_ref} {descendant_ref} timed out after {timeout_value}s"
+        ) from exc
+    if result.returncode == 0:
+        return True
+    if result.returncode == 1:
+        return False
+    raise RuntimeError(
+        "git merge-base --is-ancestor "
+        f"{ancestor_ref} {descendant_ref} failed: {result.stderr.strip()}"
+    )
+
+
 def _require_registered_parse_event(backend: str) -> BackendParseEventFn:
     _, _, parse_event_fn = _require_registered_backend(backend)
     return parse_event_fn
@@ -2315,6 +2358,7 @@ def _run_auto_dispatch(
     resume_session_id: str | None = None,
     dispatch_started_at: float | None = None,
     telemetry: dict[str, object] | None = None,
+    cwd: Path | None = None,
 ) -> str | None:
     parse_event_fn = _require_registered_parse_event(backend)
     retry_count = max(0, int(dispatch_retries))
@@ -2460,6 +2504,8 @@ def _run_auto_dispatch(
                     prompt,
                     resume_session_id=active_resume_session_id,
                 )
+            if cwd is not None and backend.strip().lower() == BACKEND_CODEX:
+                cmd = _codex_command_with_repo_root(cmd, repo_root=cwd)
             if dispatch_anchor_perf is None:
                 dispatch_anchor_perf = time.perf_counter()
             _feed_event(
@@ -2478,7 +2524,7 @@ def _run_auto_dispatch(
             )
             proc = subprocess.Popen(
                 cmd,
-                cwd=str(ROOT),
+                cwd=str(cwd if cwd is not None else ROOT),
                 stdin=(subprocess.PIPE if stdin_text is not None else None),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -4679,6 +4725,18 @@ def _lane_worktrees_round_dir(task_id: str, round_num: int, *, paths: LoopPaths 
     return _lane_worktrees_task_dir(task_id, paths=paths) / str(round_num)
 
 
+def _lane_reports_dir(*, paths: LoopPaths | None = None) -> Path:
+    resolved_paths = _resolve_paths(paths)
+    return resolved_paths.dir / "work_reports"
+
+
+def _lane_report_path(lane_id: str, *, paths: LoopPaths | None = None) -> Path:
+    if not lane_id:
+        raise ValidationError("lane_id must be non-empty")
+    lane_component = _safe_git_component(lane_id, fallback_prefix="lane")
+    return _lane_reports_dir(paths=paths) / f"{lane_component}.json"
+
+
 def _lane_worktree_branch_name(task_id: str, round_num: int, lane_id: str) -> str:
     if not isinstance(round_num, int) or round_num < 1:
         raise ValidationError(f"round_num must be int >= 1, got {round_num!r}")
@@ -4861,6 +4919,200 @@ def _prepare_lane_worktrees(
         )
         raise
     return prepared
+
+
+def _lane_local_loop_dir(handle: LaneWorktreeHandle) -> Path:
+    return handle.path / ".loop"
+
+
+def _lane_local_work_report_path(handle: LaneWorktreeHandle) -> Path:
+    return _lane_local_loop_dir(handle) / "work_report.json"
+
+
+def _lane_dispatch_role_name(lane_id: str) -> str:
+    lane_component = _safe_git_component(lane_id, fallback_prefix="lane")
+    return f"worker_lane_{lane_component}"
+
+
+def _lane_backend_for_dispatch(lane: TaskLane, config: RunConfig) -> str:
+    preferred_backend_raw = lane.get("backend_preference")
+    if isinstance(preferred_backend_raw, str):
+        preferred_backend = preferred_backend_raw.strip().lower()
+        if preferred_backend:
+            if preferred_backend in _BACKEND_REGISTRY:
+                return preferred_backend
+            _log(
+                f"Lane backend_preference {preferred_backend!r} is not registered; "
+                f"falling back to worker_backend={config.worker_backend!r}"
+            )
+    return config.worker_backend.strip().lower()
+
+
+def _prepare_lane_loop_inputs(
+    *,
+    handle: LaneWorktreeHandle,
+    source_task_card: Path,
+    source_fix_list: Path,
+    round_num: int,
+) -> None:
+    lane_loop_dir = _lane_local_loop_dir(handle)
+    lane_loop_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source_task_card, lane_loop_dir / "task_card.json")
+    lane_fix_list_path = lane_loop_dir / "fix_list.json"
+    if round_num > 1 and source_fix_list.exists():
+        shutil.copy2(source_fix_list, lane_fix_list_path)
+    else:
+        lane_fix_list_path.unlink(missing_ok=True)
+    _lane_local_work_report_path(handle).unlink(missing_ok=True)
+
+
+def _build_lane_worker_prompt(
+    *,
+    base_prompt: str,
+    lane: TaskLane,
+    lane_report_path: Path,
+) -> str:
+    lane_id = str(lane["lane_id"])
+    owner_paths = cast(list[str], lane.get("owner_paths", []))
+    depends_on = cast(list[str], lane.get("depends_on", []))
+    acceptance_checks = cast(list[str], lane.get("acceptance_checks", []))
+    lane_context = (
+        "=== LANE CONTEXT ===\n"
+        f"lane_id: {lane_id}\n"
+        "owner_paths:\n"
+        f"{_as_prompt_list(owner_paths)}\n"
+        "depends_on:\n"
+        f"{_as_prompt_list(depends_on)}\n"
+        "lane_acceptance_checks:\n"
+        f"{_as_prompt_list(acceptance_checks)}\n"
+        f"lane_work_report_path: {lane_report_path}\n"
+    )
+    return f"{base_prompt}\n\n{lane_context}"
+
+
+def _initialize_lane_state(task_lanes: list[TaskLane], *, paths: LoopPaths | None = None) -> dict[str, dict[str, object]]:
+    lane_state: dict[str, dict[str, object]] = {}
+    for lane in task_lanes:
+        lane_id = str(lane["lane_id"]).strip()
+        if not lane_id:
+            continue
+        lane_state[lane_id] = {
+            "status": "pending",
+            "owner_paths": list(cast(list[str], lane.get("owner_paths", []))),
+            "depends_on": list(cast(list[str], lane.get("depends_on", []))),
+            "report_path": _display_path(_lane_report_path(lane_id, paths=paths)),
+        }
+    return lane_state
+
+
+def _save_lane_state_snapshot(
+    state: dict,
+    lane_state: dict[str, dict[str, object]],
+    *,
+    paths: LoopPaths | None = None,
+) -> None:
+    state["lanes"] = lane_state
+    _save_state(state, paths=paths)
+
+
+def _lane_dependency_blockers(
+    lane_state: dict[str, dict[str, object]],
+    *,
+    lane: TaskLane,
+) -> list[str]:
+    blockers: list[str] = []
+    for dep_id in cast(list[str], lane.get("depends_on", [])):
+        dep_state = lane_state.get(dep_id)
+        if not isinstance(dep_state, dict):
+            blockers.append(f"depends_on missing lane '{dep_id}'")
+            continue
+        dep_status = dep_state.get("status")
+        if dep_status != "completed":
+            blockers.append(f"{dep_id}:{dep_status}")
+    return blockers
+
+
+def _merge_lane_work_reports(
+    *,
+    task_id: str,
+    round_num: int,
+    lane_execution_order: list[str],
+    lane_reports: dict[str, WorkReport],
+    merged_head_sha: str,
+) -> WorkReport:
+    merged_files: list[str] = []
+    seen_files: set[str] = set()
+    merged_tests: list[WorkReportTest] = []
+    notes_chunks: list[str] = []
+    for lane_id in lane_execution_order:
+        report = lane_reports.get(lane_id)
+        if report is None:
+            continue
+        files_changed = report.get("files_changed", [])
+        if isinstance(files_changed, list):
+            for file_path in files_changed:
+                if isinstance(file_path, str) and file_path and file_path not in seen_files:
+                    merged_files.append(file_path)
+                    seen_files.add(file_path)
+        tests = report.get("tests", [])
+        if isinstance(tests, list):
+            merged_tests.extend(cast(list[WorkReportTest], tests))
+        notes = str(report.get("notes", "")).strip()
+        if notes:
+            notes_chunks.append(f"{lane_id}: {notes}")
+    merged: WorkReport = {
+        "task_id": task_id,
+        "head_sha": merged_head_sha,
+        "round": round_num,
+    }
+    if merged_files:
+        merged["files_changed"] = merged_files
+    if merged_tests:
+        merged["tests"] = merged_tests
+    if notes_chunks:
+        merged["notes"] = "; ".join(notes_chunks)
+    return merged
+
+
+def _cherry_pick_lane_reports(
+    *,
+    base_sha: str,
+    lane_execution_order: list[str],
+    lane_reports: dict[str, WorkReport],
+) -> str:
+    current_head = _current_sha()
+    if current_head != base_sha:
+        raise ValidationError(
+            "Lane merge requires clean base head before cherry-pick: "
+            f"expected {base_sha}, got {current_head}"
+        )
+
+    for lane_id in lane_execution_order:
+        report = lane_reports.get(lane_id)
+        if report is None:
+            continue
+        lane_head = str(report["head_sha"]).strip()
+        if not lane_head or lane_head == base_sha:
+            continue
+        if _git_is_ancestor(lane_head, "HEAD"):
+            continue
+        commit_text = _git("rev-list", "--reverse", f"{base_sha}..{lane_head}")
+        commit_chain = [item.strip() for item in commit_text.splitlines() if item.strip()]
+        if not commit_chain:
+            continue
+        for commit_sha in commit_chain:
+            if _git_is_ancestor(commit_sha, "HEAD"):
+                continue
+            try:
+                _git("cherry-pick", commit_sha)
+            except RuntimeError as e:
+                with contextlib.suppress(RuntimeError):
+                    _git("cherry-pick", "--abort")
+                raise RuntimeError(
+                    f"Lane merge failed for lane '{lane_id}' on commit {commit_sha}: {e}"
+                ) from e
+        current_head = _current_sha()
+    return current_head
 
 
 def _is_valid_ref(ref: str) -> bool:
@@ -5631,6 +5883,7 @@ def _validate_run_config(config: RunConfig) -> None:
         ("dispatch_retries", config.dispatch_retries, 0),
         ("dispatch_retry_base_sec", config.dispatch_retry_base_sec, 0),
         ("max_session_rounds", config.max_session_rounds, 0),
+        ("max_parallel_workers", config.max_parallel_workers, 1),
         ("artifact_timeout", config.artifact_timeout, 0),
     )
     for field_name, value, minimum in int_rules:
@@ -5640,8 +5893,18 @@ def _validate_run_config(config: RunConfig) -> None:
         ("auto_dispatch", config.auto_dispatch),
         ("allow_dirty", config.allow_dirty),
         ("verbose", config.verbose),
+        ("aggressive_parallelism", config.aggressive_parallelism),
     ):
         _coerce_bool_config(value, field_name=bool_name)
+    if (
+        not config.aggressive_parallelism
+        and config.max_parallel_workers > DEFAULT_MAX_PARALLEL_WORKERS_CAP
+    ):
+        raise ValidationError(
+            "max_parallel_workers exceeds safe cap: "
+            f"{config.max_parallel_workers} > {DEFAULT_MAX_PARALLEL_WORKERS_CAP}. "
+            "Use --aggressive-parallelism to override."
+        )
     _coerce_str_config(config.task_path, field_name="task_path")
     dispatch_backend = _coerce_str_config(config.dispatch_backend, field_name="dispatch_backend")
     if dispatch_backend.strip().lower() != DISPATCH_BACKEND_NATIVE:
@@ -5673,6 +5936,14 @@ def _load_env_config() -> dict:
     dispatch_timeout_raw = os.getenv("LOOP_DISPATCH_TIMEOUT")
     if dispatch_timeout_raw is not None and dispatch_timeout_raw.strip():
         env_cfg["dispatch_timeout"] = dispatch_timeout_raw
+
+    max_parallel_workers_raw = os.getenv("LOOP_MAX_PARALLEL_WORKERS")
+    if max_parallel_workers_raw is not None and max_parallel_workers_raw.strip():
+        env_cfg["max_parallel_workers"] = max_parallel_workers_raw
+
+    aggressive_parallelism_raw = os.getenv("LOOP_AGGRESSIVE_PARALLELISM")
+    if aggressive_parallelism_raw is not None and aggressive_parallelism_raw.strip():
+        env_cfg["aggressive_parallelism"] = aggressive_parallelism_raw
 
     backend_pref_raw = os.getenv("LOOP_BACKEND_PREFERENCE")
     if backend_pref_raw is not None:
@@ -6705,6 +6976,8 @@ def _single_round_subprocess_cmd(
         str(config.dispatch_retry_base_sec),
         "--max-session-rounds",
         str(config.max_session_rounds),
+        "--max-parallel-workers",
+        str(config.max_parallel_workers),
         "--artifact-timeout",
         str(config.artifact_timeout),
     ]
@@ -6714,6 +6987,8 @@ def _single_round_subprocess_cmd(
         cmd.append("--auto-dispatch")
     if config.allow_dirty:
         cmd.append("--allow-dirty")
+    if config.aggressive_parallelism:
+        cmd.append("--aggressive-parallelism")
     if config.verbose:
         cmd.append("--verbose")
     return cmd
@@ -7264,10 +7539,15 @@ def _run_single_round(
     lane_cleanup_task_id: str | None = None
     lane_cleanup_ids: list[str] = []
     lane_cleanup_done = False
+    preserve_lane_worktrees = False
 
     def _cleanup_lane_worktrees() -> None:
         nonlocal lane_cleanup_done
         if lane_cleanup_done or lane_cleanup_task_id is None or not lane_cleanup_ids:
+            return
+        if preserve_lane_worktrees:
+            _log("Preserving lane worktrees for debugging after lane failure.")
+            lane_cleanup_done = True
             return
         lane_cleanup_done = True
         _cleanup_lane_worktrees_for_round(
@@ -7280,8 +7560,15 @@ def _run_single_round(
     def _archive_single_round_state() -> None:
         _archive_state_for_round(task_id_from_card, round_num, paths=resolved_paths)
 
-    def _fail_single_round(outcome: str, message: str, exit_code: int = EXIT_VALIDATION_ERROR) -> None:
-        _cleanup_lane_worktrees()
+    def _fail_single_round(
+        outcome: str,
+        message: str,
+        exit_code: int = EXIT_VALIDATION_ERROR,
+        *,
+        cleanup_lane_worktrees: bool = True,
+    ) -> None:
+        if cleanup_lane_worktrees:
+            _cleanup_lane_worktrees()
         _archive_single_round_state()
         _fail_with_state(
             state,
@@ -7384,6 +7671,9 @@ def _run_single_round(
         },
         archive_before_save=_archive_single_round_state,
     )
+    lane_state = _initialize_lane_state(task_lanes, paths=resolved_paths)
+    if lane_state:
+        _save_lane_state_snapshot(state, lane_state, paths=resolved_paths)
     _feed_event(
         FEED_ROUND_START,
         data=_feed_data(
@@ -7407,48 +7697,223 @@ def _run_single_round(
     _print_round_header(round_num, "worker")
 
     work: WorkReport | None = None
-    try:
-        work = _auto_dispatch_role(
-            role="worker",
-            prompt=worker_prompt,
-            config=config,
+    lane_dispatch_enabled = bool(task_lanes) and config.auto_dispatch and config.max_parallel_workers > 1
+    if lane_dispatch_enabled:
+        lane_by_id = {str(lane["lane_id"]): lane for lane in task_lanes}
+        lane_handle_by_id = {handle.lane_id: handle for handle in lane_worktrees}
+        lane_reports: dict[str, WorkReport] = {}
+        lane_execution_order: list[str] = []
+        lane_failures: list[str] = []
+        lane_report_root = _lane_reports_dir(paths=resolved_paths)
+        lane_report_root.mkdir(parents=True, exist_ok=True)
+
+        def _dispatch_lane(lane: TaskLane, handle: LaneWorktreeHandle) -> WorkReport:
+            lane_id = str(lane["lane_id"])
+            _prepare_lane_loop_inputs(
+                handle=handle,
+                source_task_card=resolved_paths.task_card,
+                source_fix_list=resolved_paths.fix_list,
+                round_num=round_num,
+            )
+            lane_local_report = _lane_local_work_report_path(handle)
+            lane_prompt = _build_lane_worker_prompt(
+                base_prompt=worker_prompt,
+                lane=lane,
+                lane_report_path=lane_local_report,
+            )
+            lane_backend = _lane_backend_for_dispatch(lane, config)
+            dispatch_role = _lane_dispatch_role_name(lane_id)
+            dispatch_started_at = time.monotonic()
+            dispatch_metrics: dict[str, object] = {}
+
+            def _dispatch_call() -> None:
+                _run_auto_dispatch(
+                    role=dispatch_role,
+                    backend=lane_backend,
+                    prompt=lane_prompt,
+                    timeout_sec=config.dispatch_timeout,
+                    verbose=config.verbose,
+                    dispatch_retries=config.dispatch_retries,
+                    dispatch_retry_base_sec=config.dispatch_retry_base_sec,
+                    heartbeat_enabled=config.require_heartbeat,
+                    heartbeat_ttl_sec=config.heartbeat_ttl,
+                    task_id=task_id,
+                    round_num=round_num,
+                    dispatch_started_at=dispatch_started_at,
+                    telemetry=dispatch_metrics,
+                    cwd=handle.path,
+                )
+
+            artifact = _dispatch_with_artifact_fallback(
+                role=dispatch_role,
+                dispatch_call=_dispatch_call,
+                artifact_path=lane_local_report,
+                task_id=task_id,
+                round_num=round_num,
+                timeout_sec=config.artifact_timeout,
+            )
+            lane_work = cast(WorkReport, artifact)
+            lane_error = _validate_report(
+                lane_work,
+                expected_task_id=task_id,
+                expected_round=round_num,
+                schema="work_report",
+            )
+            if lane_error:
+                raise ValidationError(f"lane '{lane_id}' produced invalid work_report: {lane_error}")
+
+            lane_report_target = _lane_report_path(lane_id, paths=resolved_paths)
+            lane_report_target.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_write_json(lane_report_target, lane_work)
+            return lane_work
+
+        for stage_index, stage_lane_ids in enumerate(lane_stages):
+            ready_lanes: list[str] = []
+            for lane_id in stage_lane_ids:
+                lane = lane_by_id.get(lane_id)
+                lane_entry = lane_state.get(lane_id)
+                if lane is None or lane_entry is None:
+                    continue
+                blockers = _lane_dependency_blockers(lane_state, lane=lane)
+                if blockers:
+                    lane_entry["status"] = "blocked"
+                    lane_entry["blocked_by"] = blockers
+                    continue
+                lane_entry["status"] = "ready"
+                lane_entry["stage_index"] = stage_index
+                ready_lanes.append(lane_id)
+
+            if not ready_lanes:
+                _save_lane_state_snapshot(state, lane_state, paths=resolved_paths)
+                continue
+
+            max_workers = min(config.max_parallel_workers, len(ready_lanes))
+            _log(
+                f"Lane dispatch stage {stage_index}: ready={ready_lanes} max_workers={max_workers}",
+                paths=resolved_paths,
+            )
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_by_lane: dict[str, concurrent.futures.Future[WorkReport]] = {}
+                for lane_id in ready_lanes:
+                    lane = lane_by_id[lane_id]
+                    lane_handle = lane_handle_by_id.get(lane_id)
+                    lane_entry = lane_state[lane_id]
+                    if lane_handle is None:
+                        lane_entry["status"] = "failed"
+                        lane_entry["error"] = "lane worktree handle missing"
+                        lane_failures.append(f"{lane_id}: lane worktree handle missing")
+                        continue
+                    lane_entry["status"] = "running"
+                    lane_entry["worktree"] = _display_path(lane_handle.path)
+                    future_by_lane[lane_id] = executor.submit(_dispatch_lane, lane, lane_handle)
+
+                for lane_id in ready_lanes:
+                    future = future_by_lane.get(lane_id)
+                    if future is None:
+                        continue
+                    lane_entry = lane_state[lane_id]
+                    try:
+                        lane_work = future.result()
+                    except Exception as e:
+                        lane_entry["status"] = "failed"
+                        lane_entry["error"] = str(e)
+                        lane_failures.append(f"{lane_id}: {e}")
+                        continue
+                    lane_reports[lane_id] = lane_work
+                    lane_execution_order.append(lane_id)
+                    lane_entry["status"] = "completed"
+                    lane_entry["head_sha"] = str(lane_work["head_sha"])
+                    print(f"  Lane completed: {lane_id} -> {str(lane_work['head_sha'])[:8]}")
+
+            _save_lane_state_snapshot(state, lane_state, paths=resolved_paths)
+
+        if lane_failures:
+            preserve_lane_worktrees = True
+            _save_lane_state_snapshot(state, lane_state, paths=resolved_paths)
+            _fail_single_round(
+                outcome="lane_dispatch_failed",
+                message="Lane dispatch failed: " + "; ".join(lane_failures),
+                exit_code=EXIT_VALIDATION_ERROR,
+                cleanup_lane_worktrees=False,
+            )
+            return
+
+        try:
+            merged_head_sha = _cherry_pick_lane_reports(
+                base_sha=base_sha,
+                lane_execution_order=lane_execution_order,
+                lane_reports=lane_reports,
+            )
+        except (RuntimeError, ValidationError) as e:
+            preserve_lane_worktrees = True
+            _fail_single_round(
+                outcome="lane_merge_failed",
+                message=str(e),
+                exit_code=EXIT_VALIDATION_ERROR,
+                cleanup_lane_worktrees=False,
+            )
+            return
+
+        work = _merge_lane_work_reports(
             task_id=task_id,
             round_num=round_num,
-            artifact_path=resolved_paths.work_report,
-            state=state,
+            lane_execution_order=lane_execution_order,
+            lane_reports=lane_reports,
+            merged_head_sha=merged_head_sha,
         )
-    except RuntimeError as e:
-        _fail_single_round(
-            outcome="worker_dispatch_failed",
-            message=str(e),
-            exit_code=EXIT_VALIDATION_ERROR,
-        )
-        return
+        _atomic_write_json(resolved_paths.work_report, work)
+    else:
+        try:
+            work = _auto_dispatch_role(
+                role="worker",
+                prompt=worker_prompt,
+                config=config,
+                task_id=task_id,
+                round_num=round_num,
+                artifact_path=resolved_paths.work_report,
+                state=state,
+            )
+        except RuntimeError as e:
+            _fail_single_round(
+                outcome="worker_dispatch_failed",
+                message=str(e),
+                exit_code=EXIT_VALIDATION_ERROR,
+            )
+            return
+
+        if work is None:
+            work = _wait_for_role_result(
+                role="worker",
+                artifact_path=resolved_paths.work_report,
+                config=config,
+                task_id=task_id,
+                round_num=round_num,
+            )
+        if work is None:
+            if config.require_heartbeat:
+                _log("Worker unavailable or timed out. Aborting.")
+                print("\n  Worker unavailable or timed out. Check .loop/runtime and logs.")
+            else:
+                _log("Worker timed out. Aborting.")
+                print("\n  Worker did not respond in time. Check .loop/logs/ for details.")
+            _apply_state_transition(
+                state,
+                trigger=STATE_TRIGGER_WORKER_TIMEOUT,
+                paths=resolved_paths,
+                archive_before_save=_archive_single_round_state,
+            )
+            _write_task_card_status(config.task_path, TASK_STATUS_BLOCKED, paths=resolved_paths)
+            _cleanup_lane_worktrees()
+            raise DispatchError("Worker timed out")
 
     if work is None:
-        work = _wait_for_role_result(
-            role="worker",
-            artifact_path=resolved_paths.work_report,
-            config=config,
-            task_id=task_id,
-            round_num=round_num,
+        _fail_single_round(
+            outcome="worker_dispatch_failed",
+            message="Worker dispatch produced no work report.",
+            exit_code=EXIT_VALIDATION_ERROR,
+            cleanup_lane_worktrees=False if preserve_lane_worktrees else True,
         )
-    if work is None:
-        if config.require_heartbeat:
-            _log("Worker unavailable or timed out. Aborting.")
-            print("\n  Worker unavailable or timed out. Check .loop/runtime and logs.")
-        else:
-            _log("Worker timed out. Aborting.")
-            print("\n  Worker did not respond in time. Check .loop/logs/ for details.")
-        _apply_state_transition(
-            state,
-            trigger=STATE_TRIGGER_WORKER_TIMEOUT,
-            paths=resolved_paths,
-            archive_before_save=_archive_single_round_state,
-        )
-        _write_task_card_status(config.task_path, TASK_STATUS_BLOCKED, paths=resolved_paths)
-        _cleanup_lane_worktrees()
-        raise DispatchError("Worker timed out")
+        return
 
     report_error = _validate_report(
         work,
@@ -8316,6 +8781,21 @@ def main() -> None:
         help="Max rounds to reuse one backend session before rotating (0 disables rotation)",
     )
     run_p.add_argument(
+        "--max-parallel-workers",
+        type=int,
+        default=None,
+        help=(
+            "Maximum concurrent lane workers per ready stage "
+            f"(default: {DEFAULT_MAX_PARALLEL_WORKERS}, safe cap: {DEFAULT_MAX_PARALLEL_WORKERS_CAP})"
+        ),
+    )
+    run_p.add_argument(
+        "--aggressive-parallelism",
+        action="store_true",
+        default=None,
+        help=f"Allow --max-parallel-workers above safe cap ({DEFAULT_MAX_PARALLEL_WORKERS_CAP})",
+    )
+    run_p.add_argument(
         "--artifact-timeout",
         type=int,
         default=None,
@@ -8445,6 +8925,15 @@ def main() -> None:
                     _cfg_val(args.max_session_rounds, "max_session_rounds", DEFAULT_MAX_SESSION_ROUNDS),
                     field_name="max_session_rounds",
                     minimum=0,
+                ),
+                max_parallel_workers=_coerce_int_config(
+                    _cfg_val(args.max_parallel_workers, "max_parallel_workers", DEFAULT_MAX_PARALLEL_WORKERS),
+                    field_name="max_parallel_workers",
+                    minimum=1,
+                ),
+                aggressive_parallelism=_coerce_bool_config(
+                    _cfg_val(args.aggressive_parallelism, "aggressive_parallelism", False),
+                    field_name="aggressive_parallelism",
                 ),
                 artifact_timeout=_coerce_int_config(
                     _cfg_val(args.artifact_timeout, "artifact_timeout", DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC),
