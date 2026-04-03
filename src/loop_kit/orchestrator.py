@@ -158,30 +158,6 @@ class DirtyWorktreeError(ValidationError):
     pass
 
 
-class StateError(LoopKitError):
-    """Errors related to state management or state corruption."""
-
-    pass
-
-
-class DispatchError(LoopKitError):
-    """Errors related to subprocess dispatch, timeouts, or backend failures."""
-
-    pass
-
-
-class ValidationError(LoopKitError):
-    """Errors related to input validation, git state, or business rule violations."""
-
-    pass
-
-
-class ConfigError(LoopKitError):
-    """Errors related to configuration loading or invalid config values."""
-
-    pass
-
-
 ROOT = Path.cwd()
 LOOP_DIR = ROOT / ".loop"
 LOGS_DIR = LOOP_DIR / "logs"
@@ -1247,9 +1223,7 @@ def _command_looks_like_test(tokens: list[str]) -> bool:
         return True
     if tokens[0] in {"go", "cargo", "gradle", "gradlew", "mvn"} and "test" in token_set:
         return True
-    if tokens[0] in {"npm", "pnpm", "yarn", "bun"} and "test" in tokens[1:]:
-        return True
-    return False
+    return tokens[0] in {"npm", "pnpm", "yarn", "bun"} and "test" in tokens[1:]
 
 
 def _command_looks_like_search(tokens: list[str]) -> bool:
@@ -1258,9 +1232,7 @@ def _command_looks_like_search(tokens: list[str]) -> bool:
     first = tokens[0]
     if first in {"rg", "ripgrep", "grep", "ag", "ack", "findstr", "select-string", "fd"}:
         return True
-    if first == "git" and len(tokens) > 1 and tokens[1] == "grep":
-        return True
-    return False
+    return first == "git" and len(tokens) > 1 and tokens[1] == "grep"
 
 
 def _command_looks_like_read(tokens: list[str]) -> bool:
@@ -1292,9 +1264,7 @@ def _command_looks_like_edit(tokens: list[str]) -> bool:
         return True
     if first == "sed" and any(token in {"-i", "--in-place"} for token in tokens[1:]):
         return True
-    if any(token in {">", ">>", "1>", "1>>", "2>", "2>>"} for token in tokens):
-        return True
-    return False
+    return any(token in {">", ">>", "1>", "1>>", "2>", "2>>"} for token in tokens)
 
 
 def _classify_command_execution_category(command_text: str) -> DispatchActionCategory:
@@ -1635,11 +1605,9 @@ def _build_codex_command(
     if sid:
         cmd.extend(["resume", sid])
     cmd.append(
-        (
-            "Execute the context provided via stdin. Follow the instructions"
-            " embedded in it and only finish after the required output artifact"
-            " is written."
-        )
+        "Execute the context provided via stdin. Follow the instructions"
+        " embedded in it and only finish after the required output artifact"
+        " is written."
     )
     return (
         [
@@ -2225,6 +2193,8 @@ def _run_auto_dispatch(
     try:
         while attempt < max_attempts:
             attempt += 1
+            current_attempt = attempt
+            current_max_attempts = max_attempts
 
             def _elapsed_ms_now() -> int:
                 nonlocal dispatch_anchor_perf
@@ -2233,7 +2203,12 @@ def _run_auto_dispatch(
                     dispatch_anchor_perf = now
                 return max(0, int((now - dispatch_anchor_perf) * 1000))
 
-            def _on_summary(summary: str) -> None:
+            def _on_summary(
+                summary: str,
+                *,
+                _attempt: int = current_attempt,
+                _max_attempts: int = current_max_attempts,
+            ) -> None:
                 nonlocal first_meaningful_summary_ms
                 if first_meaningful_summary_ms is not None:
                     return
@@ -2247,15 +2222,20 @@ def _run_auto_dispatch(
                         round_num=round_num,
                         role=role,
                         backend=backend,
-                        attempt=attempt,
-                        max_attempts=max_attempts,
+                        attempt=_attempt,
+                        max_attempts=_max_attempts,
                         latency_ms=first_meaningful_summary_ms,
                         signal_type="summary_signal",
                         summary=summary,
                     ),
                 )
 
-            def _on_stdout_line(raw_line: str) -> None:
+            def _on_stdout_line(
+                raw_line: str,
+                *,
+                _attempt: int = current_attempt,
+                _max_attempts: int = current_max_attempts,
+            ) -> None:
                 nonlocal first_stdout_ms
                 nonlocal first_work_action_ms
                 nonlocal active_subphase
@@ -2270,8 +2250,8 @@ def _run_auto_dispatch(
                             round_num=round_num,
                             role=role,
                             backend=backend,
-                            attempt=attempt,
-                            max_attempts=max_attempts,
+                            attempt=_attempt,
+                            max_attempts=_max_attempts,
                             latency_ms=first_stdout_ms,
                         ),
                     )
@@ -2298,8 +2278,8 @@ def _run_auto_dispatch(
                     round_num=round_num,
                     role=role,
                     backend=backend,
-                    attempt=attempt,
-                    max_attempts=max_attempts,
+                    attempt=_attempt,
+                    max_attempts=_max_attempts,
                     latency_ms=first_work_action_ms,
                 )
                 payload.update(signal_data)
@@ -2810,7 +2790,7 @@ def _nearest_rank_percentile(values: list[float], percentile: float) -> float | 
     if not values:
         return None
     ordered = sorted(values)
-    rank = max(1, int(math.ceil(percentile * len(ordered))))
+    rank = max(1, math.ceil(percentile * len(ordered)))
     return ordered[min(len(ordered) - 1, rank - 1)]
 
 
@@ -3028,7 +3008,9 @@ def _prune_jsonl_by_source_version(path: Path, older_than_days: int) -> tuple[in
     return removed, len(kept)
 
 
-def _dedupe_text_knowledge_entries(entries: list[dict], *, text_field: str, default_category: str) -> tuple[list[dict], int]:
+def _dedupe_text_knowledge_entries(
+    entries: list[dict], *, text_field: str, default_category: str
+) -> tuple[list[dict], int]:
     deduped: dict[tuple[str, str], dict] = {}
     duplicates = 0
     for entry in entries:
@@ -3560,7 +3542,10 @@ def _persist_worker_handoff(
     if notes:
         done.append(f"Worker notes: {notes}")
     evidence = [
-        f"tests_total={tests_summary['total']} pass={tests_summary['pass']} fail={tests_summary['fail']} other={tests_summary['other']}",
+        (
+            f"tests_total={tests_summary['total']} pass={tests_summary['pass']} "
+            f"fail={tests_summary['fail']} other={tests_summary['other']}"
+        ),
         f"files_changed_count={len(files_changed)}",
     ]
     if files_changed:
@@ -4343,13 +4328,12 @@ def _validate_report(
         for list_field in ("files_changed", "tests"):
             if list_field in report and not isinstance(report[list_field], list):
                 return f"{prefix} field '{list_field}' must be a list, got {type(report[list_field]).__name__}"
-    elif schema == "review_report":
-        if report["decision"] not in {"approve", "changes_required"}:
-            return (
-                f"{prefix} field 'decision' must be one of "
-                "{{'approve', 'changes_required'}}, "
-                f"got {report['decision']!r}"
-            )
+    elif schema == "review_report" and report["decision"] not in {"approve", "changes_required"}:
+        return (
+            f"{prefix} field 'decision' must be one of "
+            "{{'approve', 'changes_required'}}, "
+            f"got {report['decision']!r}"
+        )
 
     if report["task_id"] != expected_task_id:
         return f"{prefix} field 'task_id' mismatch: expected {expected_task_id!r}, got {report['task_id']!r}"
@@ -4571,9 +4555,7 @@ def _can_reuse_module_entry(entry: object, rel_path: str, *, size_bytes: int, la
         return False
     if not isinstance(entry.get("docstring"), str):
         return False
-    if not isinstance(entry.get("loc"), int):
-        return False
-    return True
+    return isinstance(entry.get("loc"), int)
 
 
 def _build_module_entry(path: Path, existing_entries: dict[str, dict]) -> dict | None:

@@ -2143,7 +2143,9 @@ def test_persist_handoff_artifacts_are_structured(tmp_path: Path, monkeypatch) -
         },
     )
 
-    worker_handoff = json.loads((tmp_path / ".loop" / "handoff" / task_id / "worker_r1.json").read_text(encoding="utf-8"))
+    worker_handoff = json.loads(
+        (tmp_path / ".loop" / "handoff" / task_id / "worker_r1.json").read_text(encoding="utf-8")
+    )
     reviewer_handoff = json.loads(
         (tmp_path / ".loop" / "handoff" / task_id / "reviewer_r1.json").read_text(encoding="utf-8")
     )
@@ -2383,7 +2385,10 @@ def test_classify_dispatch_action_categorizes_codex_event_payloads() -> None:
     search_line = json.dumps(
         {
             "type": "item.started",
-            "item": {"type": "command_execution", "command": "rg --line-number dispatch_phase_metrics src/loop_kit/orchestrator.py"},
+            "item": {
+                "type": "command_execution",
+                "command": "rg --line-number dispatch_phase_metrics src/loop_kit/orchestrator.py",
+            },
         },
         ensure_ascii=False,
     )
@@ -2509,7 +2514,11 @@ def test_run_auto_dispatch_emits_resume_fallback_event(monkeypatch) -> None:
         _ = (cmd, kwargs)
         calls["count"] += 1
         if calls["count"] == 1:
-            return _FakeProc(stdout_lines=[], stderr_lines=["no rollout found for thread id stale-session\n"], returncode=1)
+            return _FakeProc(
+                stdout_lines=[],
+                stderr_lines=["no rollout found for thread id stale-session\n"],
+                returncode=1,
+            )
         return _FakeProc(
             stdout_lines=['{"type":"item.completed","item":{"type":"agent_message","text":"resumed"}}\n'],
             returncode=0,
@@ -2833,7 +2842,11 @@ def _configure_default_knowledge_paths(monkeypatch, tmp_path: Path) -> tuple[Pat
     monkeypatch.setattr(orchestrator, "_DEFAULT_FACTS_JSONL", facts_path)
     monkeypatch.setattr(orchestrator, "_DEFAULT_PITFALLS_JSONL", pitfalls_path)
     monkeypatch.setattr(orchestrator, "_DEFAULT_PATTERNS_JSONL", patterns_path)
-    monkeypatch.setattr(orchestrator, "_configure_loop_paths", lambda loop_dir=".loop": orchestrator._snapshot_global_paths())
+    monkeypatch.setattr(
+        orchestrator,
+        "_configure_loop_paths",
+        lambda loop_dir=".loop": orchestrator._snapshot_global_paths(),
+    )
     return facts_path, pitfalls_path, patterns_path
 
 
@@ -2960,7 +2973,9 @@ class TestKnowledgeCli:
         out = capsys.readouterr().out
         assert "removed_total=3" in out
 
-        facts_entries = [json.loads(line) for line in facts_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        facts_entries = [
+            json.loads(line) for line in facts_path.read_text(encoding="utf-8").splitlines() if line.strip()
+        ]
         pitfalls_entries = [
             json.loads(line) for line in pitfalls_path.read_text(encoding="utf-8").splitlines() if line.strip()
         ]
@@ -3010,7 +3025,9 @@ class TestKnowledgeCli:
         assert "pitfalls_removed=1" in out
         assert "patterns_removed=1" in out
 
-        facts_entries = [json.loads(line) for line in facts_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        facts_entries = [
+            json.loads(line) for line in facts_path.read_text(encoding="utf-8").splitlines() if line.strip()
+        ]
         pitfalls_entries = [
             json.loads(line) for line in pitfalls_path.read_text(encoding="utf-8").splitlines() if line.strip()
         ]
@@ -5817,9 +5834,9 @@ class TestConfigureLoopPathsGlobals:
 
         orchestrator._configure_loop_paths(".loop-test")
 
-        assert orchestrator._SUMMARY_FILE == tmp_path / ".loop-test" / "summary.json"
-        assert orchestrator._CONFIG_FILE == tmp_path / ".loop-test" / "config.json"
-        assert orchestrator._TASKS_DIR == tmp_path / ".loop-test" / "tasks"
+        assert tmp_path / ".loop-test" / "summary.json" == orchestrator._SUMMARY_FILE
+        assert tmp_path / ".loop-test" / "config.json" == orchestrator._CONFIG_FILE
+        assert tmp_path / ".loop-test" / "tasks" == orchestrator._TASKS_DIR
 
         monkeypatch.setattr(orchestrator, "ROOT", Path.cwd())
         orchestrator._configure_loop_paths(".loop")

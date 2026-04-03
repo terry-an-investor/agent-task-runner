@@ -102,7 +102,9 @@ def _write_fake_opencode_backend(bin_dir: Path) -> Path:
             "    reviewer_decision = os.environ.get(\"FAKE_OPENCODE_REVIEW_DECISION\", \"approve\").strip()\n"
             "    session_id = _arg_value(\"-s\", argv) or \"fake-session\"\n"
             "\n"
-            "    sys.stdout.write(json.dumps({\"type\": \"step_start\", \"part\": {\"sessionID\": session_id}}) + \"\\n\")\n"
+            "    sys.stdout.write(\n"
+            "        json.dumps({\"type\": \"step_start\", \"part\": {\"sessionID\": session_id}}) + \"\\n\"\n"
+            "    )\n"
             "    sys.stdout.flush()\n"
             "\n"
             "    if mode == \"fail\":\n"
@@ -151,7 +153,10 @@ def _write_fake_opencode_backend(bin_dir: Path) -> Path:
             "            \"head_sha\": head_sha,\n"
             "            \"files_changed\": [changed_file.name],\n"
             "            \"tests\": [{\"name\": \"fake-opencode\", \"result\": \"pass\", \"output\": \"ok\"}],\n"
-            "            \"notes\": f\"worker round {round_num} handoff_visible={handoff_visible} quickstart_visible={quickstart_visible}\",\n"
+            "            \"notes\": (\n"
+            "                f\"worker round {round_num} handoff_visible={handoff_visible} \"\n"
+            "                f\"quickstart_visible={quickstart_visible}\"\n"
+            "            ),\n"
             "            \"round\": round_num,\n"
             "        }\n"
             "        target = loop_dir / \"work_report.json\"\n"
@@ -165,7 +170,9 @@ def _write_fake_opencode_backend(bin_dir: Path) -> Path:
             "        }\n"
             "        target = loop_dir / \"review_report.json\"\n"
             "\n"
-            "    sys.stdout.write(json.dumps({\"type\": \"text\", \"part\": {\"text\": \"backend executing\"}}) + \"\\n\")\n"
+            "    sys.stdout.write(\n"
+            "        json.dumps({\"type\": \"text\", \"part\": {\"text\": \"backend executing\"}}) + \"\\n\"\n"
+            "    )\n"
             "    target.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + \"\\n\", encoding=\"utf-8\")\n"
             "    sys.stdout.write(json.dumps({\"type\": \"step_finish\", \"part\": {}}) + \"\\n\")\n"
             "    sys.stdout.flush()\n"
@@ -244,7 +251,13 @@ def _prepare_loop_contract(tmp_path: Path, *, task_id: str, base_sha: str, state
     return loop_dir
 
 
-def _run_loop(tmp_path: Path, args: list[str], *, mode: str = "ok", reviewer_decision: str = "approve") -> subprocess.CompletedProcess[str]:
+def _run_loop(
+    tmp_path: Path,
+    args: list[str],
+    *,
+    mode: str = "ok",
+    reviewer_decision: str = "approve",
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, "-m", "loop_kit", *args],
         cwd=tmp_path,
@@ -272,7 +285,10 @@ def _state_transition_pairs(feed_path: Path) -> list[tuple[str | None, str | Non
     return pairs
 
 
-def _contains_ordered_pairs(actual: list[tuple[str | None, str | None]], expected: list[tuple[str | None, str | None]]) -> bool:
+def _contains_ordered_pairs(
+    actual: list[tuple[str | None, str | None]],
+    expected: list[tuple[str | None, str | None]],
+) -> bool:
     idx = 0
     for pair in actual:
         if pair == expected[idx]:
