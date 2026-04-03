@@ -2555,33 +2555,138 @@ def test_run_auto_dispatch_emits_resume_fallback_event(monkeypatch) -> None:
     assert calls["count"] == 2
 
 
-def test_save_state_emits_state_transition_feed_event(tmp_path: Path, monkeypatch) -> None:
+def test_state_machine_successful_work_review_done_flow(tmp_path: Path, monkeypatch) -> None:
     _configure_loop_paths(monkeypatch, tmp_path)
     captured: list[tuple[str, dict[str, object]]] = []
 
-    def fake_feed_event(event: str, *, level: str = "info", data: dict | None = None) -> None:
-        _ = level
+    def fake_feed_event(
+        event: str,
+        *,
+        level: str = "info",
+        data: dict | None = None,
+        paths: orchestrator.LoopPaths | None = None,
+    ) -> None:
+        _ = (level, paths)
         captured.append((event, dict(data or {})))
 
     monkeypatch.setattr(orchestrator, "_feed_event", fake_feed_event)
 
-    orchestrator._save_state(
-        {
-            "state": orchestrator.STATE_AWAITING_WORK,
-            "round": 1,
-            "task_id": "T-800",
-            "base_sha": "base-sha",
-        }
+    state = {
+        "state": orchestrator.STATE_AWAITING_WORK,
+        "round": 1,
+        "task_id": "T-800",
+        "base_sha": "base-sha",
+    }
+
+    orchestrator._apply_state_transition(
+        state,
+        trigger=orchestrator.STATE_TRIGGER_WORKER_COMPLETED,
+        updates={"head_sha": "head-sha"},
+    )
+    orchestrator._apply_state_transition(
+        state,
+        trigger=orchestrator.STATE_TRIGGER_REVIEWER_APPROVED,
     )
 
-    assert captured
+    assert state["state"] == orchestrator.STATE_DONE
+    assert state["outcome"] == "approved"
+    assert state["round"] == 1
+    assert len(captured) >= 2
+
+    worker_event, worker_payload = captured[-2]
+    assert worker_event == orchestrator.FEED_STATE_TRANSITION
+    assert worker_payload["trigger"] == orchestrator.STATE_TRIGGER_WORKER_COMPLETED
+    assert worker_payload["from_state"] == orchestrator.STATE_AWAITING_WORK
+    assert worker_payload["to_state"] == orchestrator.STATE_AWAITING_REVIEW
+
+    review_event, review_payload = captured[-1]
+    assert review_event == orchestrator.FEED_STATE_TRANSITION
+    assert review_payload["trigger"] == orchestrator.STATE_TRIGGER_REVIEWER_APPROVED
+    assert review_payload["from_state"] == orchestrator.STATE_AWAITING_REVIEW
+    assert review_payload["to_state"] == orchestrator.STATE_DONE
+
+
+def test_state_machine_worker_timeout_transition_is_declarative(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+    captured: list[tuple[str, dict[str, object]]] = []
+
+    def fake_feed_event(
+        event: str,
+        *,
+        level: str = "info",
+        data: dict | None = None,
+        paths: orchestrator.LoopPaths | None = None,
+    ) -> None:
+        _ = (level, paths)
+        captured.append((event, dict(data or {})))
+
+    monkeypatch.setattr(orchestrator, "_feed_event", fake_feed_event)
+
+    state = {
+        "state": orchestrator.STATE_AWAITING_WORK,
+        "round": 2,
+        "task_id": "T-801",
+        "base_sha": "base-sha",
+    }
+    orchestrator._apply_state_transition(
+        state,
+        trigger=orchestrator.STATE_TRIGGER_WORKER_TIMEOUT,
+    )
+
+    assert state["state"] == orchestrator.STATE_DONE
+    assert state["outcome"] == "worker_timeout"
+    assert state["error"] == "Worker timed out"
     event, payload = captured[-1]
     assert event == orchestrator.FEED_STATE_TRANSITION
-    assert payload["task_id"] == "T-800"
-    assert payload["round"] == 1
-    assert payload["role"] == "orchestrator"
-    assert payload["from_state"] is None
-    assert payload["to_state"] == orchestrator.STATE_AWAITING_WORK
+    assert payload["trigger"] == orchestrator.STATE_TRIGGER_WORKER_TIMEOUT
+    assert payload["transition_kind"] == orchestrator.TRANSITION_KIND_TIMEOUT
+
+
+def test_fail_with_state_uses_terminal_error_transition(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+    orchestrator.TASK_CARD.write_text(
+        json.dumps({"task_id": "T-802", "status": "todo"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    captured: list[tuple[str, dict[str, object]]] = []
+
+    def fake_feed_event(
+        event: str,
+        *,
+        level: str = "info",
+        data: dict | None = None,
+        paths: orchestrator.LoopPaths | None = None,
+    ) -> None:
+        _ = (level, paths)
+        captured.append((event, dict(data or {})))
+
+    monkeypatch.setattr(orchestrator, "_feed_event", fake_feed_event)
+    state = {
+        "state": orchestrator.STATE_AWAITING_REVIEW,
+        "round": 4,
+        "task_id": "T-802",
+        "base_sha": "base-sha",
+    }
+
+    with pytest.raises(SystemExit) as exc:
+        orchestrator._fail_with_state(
+            state,
+            outcome="invalid_review_report",
+            message="review report schema mismatch",
+            exit_code=orchestrator.EXIT_VALIDATION_ERROR,
+            task_path=str(orchestrator.TASK_CARD),
+        )
+
+    assert exc.value.code == orchestrator.EXIT_VALIDATION_ERROR
+    persisted = json.loads(orchestrator.STATE_FILE.read_text(encoding="utf-8"))
+    assert persisted["state"] == orchestrator.STATE_DONE
+    assert persisted["outcome"] == "invalid_review_report"
+    assert "review report schema mismatch" in persisted["error"]
+    transition_payloads = [payload for event, payload in captured if event == orchestrator.FEED_STATE_TRANSITION]
+    assert transition_payloads
+    payload = transition_payloads[-1]
+    assert payload["trigger"] == orchestrator.STATE_TRIGGER_TERMINAL_ERROR
+    assert payload["transition_kind"] == orchestrator.TRANSITION_KIND_ERROR
 
 
 def test_configure_loop_paths_resets_log_dir_ensure_flag(tmp_path: Path, monkeypatch) -> None:

@@ -4008,6 +4008,151 @@ STATE_DONE = "done"
 TASK_STATUS_IN_PROGRESS = "in_progress"
 TASK_STATUS_DONE = "done"
 TASK_STATUS_BLOCKED = "blocked"
+TRANSITION_KIND_NORMAL = "normal"
+TRANSITION_KIND_RETRY = "retry"
+TRANSITION_KIND_TIMEOUT = "timeout"
+TRANSITION_KIND_ERROR = "error"
+STATE_TRIGGER_BOOTSTRAP = "bootstrap"
+STATE_TRIGGER_PREPARE_ROUND = "prepare_round"
+STATE_TRIGGER_WORKER_COMPLETED = "worker_completed"
+STATE_TRIGGER_WORKER_TIMEOUT = "worker_timeout"
+STATE_TRIGGER_REVIEWER_APPROVED = "reviewer_approved"
+STATE_TRIGGER_REVIEWER_CHANGES_REQUIRED = "reviewer_changes_required"
+STATE_TRIGGER_REVIEWER_TIMEOUT = "reviewer_timeout"
+STATE_TRIGGER_MAX_ROUNDS_EXHAUSTED = "max_rounds_exhausted"
+STATE_TRIGGER_TERMINAL_ERROR = "terminal_error"
+
+TransitionKind = Literal[
+    "normal",
+    "retry",
+    "timeout",
+    "error",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class _StateDescriptor:
+    name: str
+    handler: str
+    terminal: bool
+    description: str
+
+
+@dataclass(frozen=True, slots=True)
+class _StateTransitionRule:
+    trigger: str
+    source_states: tuple[str, ...]
+    target_state: str
+    transition_kind: TransitionKind = TRANSITION_KIND_NORMAL
+    round_delta: int = 0
+    default_updates: tuple[tuple[str, object], ...] = ()
+    clear_keys: tuple[str, ...] = ()
+
+
+STATE_DESCRIPTORS: dict[str, _StateDescriptor] = {
+    STATE_IDLE: _StateDescriptor(
+        name=STATE_IDLE,
+        handler="_run_multi_round_via_subprocess",
+        terminal=False,
+        description="Loop has no active task contract.",
+    ),
+    STATE_AWAITING_WORK: _StateDescriptor(
+        name=STATE_AWAITING_WORK,
+        handler="_run_single_round(worker)",
+        terminal=False,
+        description="Worker action required for the current round.",
+    ),
+    STATE_AWAITING_REVIEW: _StateDescriptor(
+        name=STATE_AWAITING_REVIEW,
+        handler="_run_single_round(reviewer)",
+        terminal=False,
+        description="Reviewer action required for the current round.",
+    ),
+    STATE_DONE: _StateDescriptor(
+        name=STATE_DONE,
+        handler="_run_multi_round_via_subprocess(exit)",
+        terminal=True,
+        description="Terminal state for approved/blocked/error outcomes.",
+    ),
+}
+
+STATE_ALIASES: dict[str, str] = {
+    "task_ready": STATE_AWAITING_WORK,
+    "work_done": STATE_AWAITING_REVIEW,
+    "review_done": STATE_DONE,
+}
+
+
+def _normalize_state_for_transition(value: object) -> str:
+    if isinstance(value, str):
+        if value in STATE_DESCRIPTORS:
+            return value
+        alias = STATE_ALIASES.get(value)
+        if alias is not None:
+            return alias
+    return STATE_IDLE
+
+
+STATE_TRANSITIONS: dict[str, _StateTransitionRule] = {
+    STATE_TRIGGER_BOOTSTRAP: _StateTransitionRule(
+        trigger=STATE_TRIGGER_BOOTSTRAP,
+        source_states=(STATE_IDLE, STATE_DONE, STATE_AWAITING_WORK, STATE_AWAITING_REVIEW),
+        target_state=STATE_AWAITING_WORK,
+        clear_keys=tuple(_STALE_STATE_KEYS),
+    ),
+    STATE_TRIGGER_PREPARE_ROUND: _StateTransitionRule(
+        trigger=STATE_TRIGGER_PREPARE_ROUND,
+        source_states=(STATE_AWAITING_WORK, STATE_AWAITING_REVIEW, STATE_DONE, STATE_IDLE),
+        target_state=STATE_AWAITING_WORK,
+        clear_keys=_STALE_STATE_KEYS[:3],
+    ),
+    STATE_TRIGGER_WORKER_COMPLETED: _StateTransitionRule(
+        trigger=STATE_TRIGGER_WORKER_COMPLETED,
+        source_states=(STATE_AWAITING_WORK,),
+        target_state=STATE_AWAITING_REVIEW,
+    ),
+    STATE_TRIGGER_WORKER_TIMEOUT: _StateTransitionRule(
+        trigger=STATE_TRIGGER_WORKER_TIMEOUT,
+        source_states=(STATE_AWAITING_WORK,),
+        target_state=STATE_DONE,
+        transition_kind=TRANSITION_KIND_TIMEOUT,
+        default_updates=(("outcome", "worker_timeout"), ("error", "Worker timed out")),
+    ),
+    STATE_TRIGGER_REVIEWER_APPROVED: _StateTransitionRule(
+        trigger=STATE_TRIGGER_REVIEWER_APPROVED,
+        source_states=(STATE_AWAITING_REVIEW,),
+        target_state=STATE_DONE,
+        default_updates=(("outcome", "approved"),),
+    ),
+    STATE_TRIGGER_REVIEWER_CHANGES_REQUIRED: _StateTransitionRule(
+        trigger=STATE_TRIGGER_REVIEWER_CHANGES_REQUIRED,
+        source_states=(STATE_AWAITING_REVIEW,),
+        target_state=STATE_AWAITING_WORK,
+        transition_kind=TRANSITION_KIND_RETRY,
+        round_delta=1,
+        clear_keys=_STALE_STATE_KEYS[:3],
+    ),
+    STATE_TRIGGER_REVIEWER_TIMEOUT: _StateTransitionRule(
+        trigger=STATE_TRIGGER_REVIEWER_TIMEOUT,
+        source_states=(STATE_AWAITING_REVIEW,),
+        target_state=STATE_DONE,
+        transition_kind=TRANSITION_KIND_TIMEOUT,
+        default_updates=(("outcome", "reviewer_timeout"), ("error", "Reviewer timed out")),
+    ),
+    STATE_TRIGGER_MAX_ROUNDS_EXHAUSTED: _StateTransitionRule(
+        trigger=STATE_TRIGGER_MAX_ROUNDS_EXHAUSTED,
+        source_states=(STATE_AWAITING_WORK, STATE_AWAITING_REVIEW),
+        target_state=STATE_DONE,
+        transition_kind=TRANSITION_KIND_RETRY,
+        default_updates=(("outcome", "max_rounds_exhausted"),),
+    ),
+    STATE_TRIGGER_TERMINAL_ERROR: _StateTransitionRule(
+        trigger=STATE_TRIGGER_TERMINAL_ERROR,
+        source_states=(STATE_IDLE, STATE_AWAITING_WORK, STATE_AWAITING_REVIEW, STATE_DONE),
+        target_state=STATE_DONE,
+        transition_kind=TRANSITION_KIND_ERROR,
+    ),
+}
 
 
 def _default_state(task_id: str | None = None, round_num: int = 0) -> dict:
@@ -4126,25 +4271,95 @@ def _save_state(state: dict, paths: LoopPaths | None = None) -> None:
         state_backup.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(state_file, state_backup)
     _atomic_write_json(state_file, state_to_save)
-    from_state = previous_state.get("state") if isinstance(previous_state, dict) else None
-    from_round = previous_state.get("round") if isinstance(previous_state, dict) else None
-    to_state = state_to_save.get("state")
-    to_round = state_to_save.get("round")
-    if from_state != to_state or from_round != to_round:
-        task_id_raw = state_to_save.get("task_id")
-        task_id = task_id_raw if isinstance(task_id_raw, str) and task_id_raw else None
-        round_num = to_round if isinstance(to_round, int) else None
-        _feed_event(
-            FEED_STATE_TRANSITION,
-            data=_feed_data(
-                task_id=task_id,
-                round_num=round_num,
-                role="orchestrator",
-                from_state=from_state,
-                to_state=to_state,
-                from_round=from_round,
-                to_round=to_round,
-            ),
+    _ = previous_state
+
+
+def _emit_state_transition_event(
+    *,
+    state: dict,
+    trigger: str,
+    transition_kind: TransitionKind,
+    from_state: str | None,
+    to_state: str,
+    from_round: int | None,
+    to_round: int | None,
+) -> None:
+    task_id_raw = state.get("task_id")
+    task_id = task_id_raw if isinstance(task_id_raw, str) and task_id_raw else None
+    round_num = to_round if isinstance(to_round, int) else None
+    _feed_event(
+        FEED_STATE_TRANSITION,
+        data=_feed_data(
+            task_id=task_id,
+            round_num=round_num,
+            role="orchestrator",
+            trigger=trigger,
+            transition_kind=transition_kind,
+            from_state=from_state,
+            to_state=to_state,
+            from_round=from_round,
+            to_round=to_round,
+        ),
+    )
+
+
+def _apply_state_transition(
+    state: dict,
+    *,
+    trigger: str,
+    paths: LoopPaths | None = None,
+    round_num: int | None = None,
+    updates: dict[str, object] | None = None,
+    archive_before_save: Callable[[], None] | None = None,
+) -> None:
+    rule = STATE_TRANSITIONS.get(trigger)
+    if rule is None:
+        raise StateError(f"Unknown state transition trigger: {trigger}")
+
+    from_state_raw = state.get("state")
+    from_state = from_state_raw if isinstance(from_state_raw, str) else None
+    normalized_from_state = _normalize_state_for_transition(from_state)
+    if normalized_from_state not in rule.source_states:
+        raise StateError(
+            "Invalid state transition: "
+            f"trigger={trigger!r} from_state={from_state!r} normalized={normalized_from_state!r} "
+            f"allowed={rule.source_states!r}"
+        )
+
+    from_round_raw = state.get("round")
+    from_round = from_round_raw if isinstance(from_round_raw, int) else None
+    to_round = from_round
+    if round_num is not None:
+        to_round = round_num
+    elif rule.round_delta:
+        base_round = from_round if isinstance(from_round, int) else 0
+        to_round = base_round + rule.round_delta
+
+    for key in rule.clear_keys:
+        state.pop(key, None)
+    if round_num is not None or rule.round_delta:
+        state["round"] = to_round
+
+    state["state"] = rule.target_state
+    for key, value in rule.default_updates:
+        state[key] = value
+    if updates:
+        for key, value in updates.items():
+            state[key] = value
+
+    if archive_before_save is not None:
+        archive_before_save()
+    _save_state(state, paths=paths)
+    event_from_state = from_state if isinstance(from_state, str) else normalized_from_state
+    if event_from_state != rule.target_state or from_round != to_round:
+        _emit_state_transition_event(
+            state=state,
+            trigger=trigger,
+            transition_kind=rule.transition_kind,
+            from_state=event_from_state,
+            to_state=rule.target_state,
+            from_round=from_round,
+            to_round=to_round,
         )
 
 
@@ -4623,11 +4838,16 @@ def _fail_with_state(
 ) -> None:
     _log(message)
     print(f"  Error: {message}", file=sys.stderr)
-    state["state"] = STATE_DONE
-    state["outcome"] = outcome
-    state["failed_at"] = _ts()
-    state["error"] = message
-    _save_state(state, paths=paths)
+    _apply_state_transition(
+        state,
+        trigger=STATE_TRIGGER_TERMINAL_ERROR,
+        paths=paths,
+        updates={
+            "outcome": outcome,
+            "failed_at": _ts(),
+            "error": message,
+        },
+    )
     _write_task_card_status(task_path or str(_resolve_paths(paths).task_card), TASK_STATUS_BLOCKED, paths=paths)
     try:
         # Map exit code to appropriate exception type
@@ -5989,12 +6209,11 @@ def _run_single_round(
     state_task_id = state.get("task_id")
     state_base_sha = state.get("base_sha")
 
-    def _save_single_round_state() -> None:
+    def _archive_single_round_state() -> None:
         _archive_state_for_round(task_id_from_card, round_num, paths=resolved_paths)
-        _save_state(state, paths=resolved_paths)
 
     def _fail_single_round(outcome: str, message: str, exit_code: int = EXIT_VALIDATION_ERROR) -> None:
-        _archive_state_for_round(task_id_from_card, round_num, paths=resolved_paths)
+        _archive_single_round_state()
         _fail_with_state(
             state,
             outcome=outcome,
@@ -6017,18 +6236,20 @@ def _run_single_round(
             return
         state_task_id = task_id_from_card
         state_base_sha = _current_sha()
-        state.update(
-            {
-                "state": STATE_AWAITING_WORK,
-                "round": 1,
+        _apply_state_transition(
+            state,
+            trigger=STATE_TRIGGER_BOOTSTRAP,
+            paths=resolved_paths,
+            round_num=1,
+            updates={
                 "task_id": state_task_id,
                 "base_sha": state_base_sha,
                 "started_at": _ts(),
                 "round_details": [],
                 "sessions": {},
-            }
+            },
+            archive_before_save=_archive_single_round_state,
         )
-        _save_single_round_state()
 
     if state_task_id != task_id_from_card:
         _fail_single_round(
@@ -6049,16 +6270,22 @@ def _run_single_round(
     _log(f"Goal: {task_card.get('goal', '<no goal>')}")
     _log(f"Single-round state contract: task_id={task_id} base_sha={base_sha}")
 
-    _clean_stale_state(state, *_STALE_STATE_KEYS[:3])
     if not isinstance(state.get("round_details"), list):
         state["round_details"] = []
-    state["sessions"] = _normalize_sessions_map(state.get("sessions"))
+    sessions = _normalize_sessions_map(state.get("sessions"))
     if round_num == 1:
-        state["sessions"] = {}
-    state["started_at"] = _ts()
-    state["round"] = round_num
-    state["state"] = STATE_AWAITING_WORK
-    _save_single_round_state()
+        sessions = {}
+    _apply_state_transition(
+        state,
+        trigger=STATE_TRIGGER_PREPARE_ROUND,
+        paths=resolved_paths,
+        round_num=round_num,
+        updates={
+            "started_at": _ts(),
+            "sessions": sessions,
+        },
+        archive_before_save=_archive_single_round_state,
+    )
     _feed_event(
         FEED_ROUND_START,
         data=_feed_data(
@@ -6115,10 +6342,12 @@ def _run_single_round(
         else:
             _log("Worker timed out. Aborting.")
             print("\n  Worker did not respond in time. Check .loop/logs/ for details.")
-        state["state"] = STATE_DONE
-        state["outcome"] = "worker_timeout"
-        state["error"] = "Worker timed out"
-        _save_single_round_state()
+        _apply_state_transition(
+            state,
+            trigger=STATE_TRIGGER_WORKER_TIMEOUT,
+            paths=resolved_paths,
+            archive_before_save=_archive_single_round_state,
+        )
         _write_task_card_status(config.task_path, TASK_STATUS_BLOCKED, paths=resolved_paths)
         raise DispatchError("Worker timed out")
 
@@ -6187,9 +6416,13 @@ def _run_single_round(
     )
     _prepare_bus_file(resolved_paths.review_report, task_id, round_num, "review_report")
 
-    state["state"] = STATE_AWAITING_REVIEW
-    state["head_sha"] = head_sha
-    _save_single_round_state()
+    _apply_state_transition(
+        state,
+        trigger=STATE_TRIGGER_WORKER_COMPLETED,
+        paths=resolved_paths,
+        updates={"head_sha": head_sha},
+        archive_before_save=_archive_single_round_state,
+    )
 
     _print_round_header(round_num, "reviewer")
 
@@ -6225,10 +6458,12 @@ def _run_single_round(
             _log("Reviewer unavailable or timed out. Aborting.")
         else:
             _log("Reviewer timed out. Aborting.")
-        state["state"] = STATE_DONE
-        state["outcome"] = "reviewer_timeout"
-        state["error"] = "Reviewer timed out"
-        _save_single_round_state()
+        _apply_state_transition(
+            state,
+            trigger=STATE_TRIGGER_REVIEWER_TIMEOUT,
+            paths=resolved_paths,
+            archive_before_save=_archive_single_round_state,
+        )
         _write_task_card_status(config.task_path, TASK_STATUS_BLOCKED, paths=resolved_paths)
         raise DispatchError("Reviewer timed out")
 
@@ -6285,9 +6520,12 @@ def _run_single_round(
             _update_knowledge_on_approval(task_id, round_num)
         except OSError as e:
             _log(f"Warning: failed to update knowledge context on approval: {e}")
-        state["state"] = STATE_DONE
-        state["outcome"] = "approved"
-        _save_single_round_state()
+        _apply_state_transition(
+            state,
+            trigger=STATE_TRIGGER_REVIEWER_APPROVED,
+            paths=resolved_paths,
+            archive_before_save=_archive_single_round_state,
+        )
         _write_task_card_status(config.task_path, TASK_STATUS_DONE, paths=resolved_paths)
         print(f"\n{'=' * 60}")
         print(f"  APPROVED at round {round_num}")
@@ -6359,9 +6597,12 @@ def _run_single_round(
         ),
     )
 
-    state["state"] = STATE_AWAITING_WORK
-    state["round"] = round_num + 1
-    _save_single_round_state()
+    _apply_state_transition(
+        state,
+        trigger=STATE_TRIGGER_REVIEWER_CHANGES_REQUIRED,
+        paths=resolved_paths,
+        archive_before_save=_archive_single_round_state,
+    )
 
 
 def _run_multi_round_via_subprocess(
@@ -6391,18 +6632,18 @@ def _run_multi_round_via_subprocess(
         _log(f"Base SHA: {base_sha}")
 
         state = _load_state(paths=resolved_paths)
-        _clean_stale_state(state, *_STALE_STATE_KEYS)
-        state.update(
-            {
-                "state": STATE_AWAITING_WORK,
-                "round": 1,
+        _apply_state_transition(
+            state,
+            trigger=STATE_TRIGGER_BOOTSTRAP,
+            paths=resolved_paths,
+            round_num=1,
+            updates={
                 "task_id": task_id,
                 "base_sha": base_sha,
                 "started_at": _ts(),
                 "sessions": {},
-            }
+            },
         )
-        _save_state(state, paths=resolved_paths)
     else:
         state = dict(resume_from_state)
         state_task_id = state.get("task_id")
@@ -6446,16 +6687,21 @@ def _run_multi_round_via_subprocess(
         _set_feed_round(start_round)
         _log(f"Resuming task: {task_id}")
         _log(f"Resume contract: base_sha={base_sha} round={start_round}")
-        _clean_stale_state(state, *_STALE_STATE_KEYS[:3])
         if not isinstance(state.get("round_details"), list):
             state["round_details"] = []
-        state["sessions"] = _normalize_sessions_map(state.get("sessions"))
+        sessions = _normalize_sessions_map(state.get("sessions"))
         if start_round == 1:
-            state["sessions"] = {}
-        state["state"] = STATE_AWAITING_WORK
-        state["round"] = start_round
-        state["started_at"] = _ts()
-        _save_state(state, paths=resolved_paths)
+            sessions = {}
+        _apply_state_transition(
+            state,
+            trigger=STATE_TRIGGER_PREPARE_ROUND,
+            paths=resolved_paths,
+            round_num=start_round,
+            updates={
+                "started_at": _ts(),
+                "sessions": sessions,
+            },
+        )
 
     _write_task_card_status(config.task_path, TASK_STATUS_IN_PROGRESS, paths=resolved_paths)
 
@@ -6642,9 +6888,11 @@ def _run_multi_round_via_subprocess(
         )
 
     state = _load_state(paths=resolved_paths)
-    state["state"] = STATE_DONE
-    state["outcome"] = "max_rounds_exhausted"
-    _save_state(state, paths=resolved_paths)
+    _apply_state_transition(
+        state,
+        trigger=STATE_TRIGGER_MAX_ROUNDS_EXHAUSTED,
+        paths=resolved_paths,
+    )
     _write_task_card_status(config.task_path, TASK_STATUS_BLOCKED, paths=resolved_paths)
     print(f"\n  MAX ROUNDS ({config.max_rounds}) reached without approval.")
     print(f"  Last review decision: {last_decision}")

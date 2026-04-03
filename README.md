@@ -304,6 +304,31 @@ Interpretation limits for the command output:
 
 **state.json** — Internal orchestrator state, the single source of truth between rounds.
 
+### Core run-loop state machine
+
+The orchestrator run loop uses explicit state metadata and trigger-driven transitions for the core states:
+
+- `idle` (no active contract)
+- `awaiting_work` (worker phase)
+- `awaiting_review` (reviewer phase)
+- `done` (terminal: approved, timeout, or blocked/error outcomes)
+
+State names in `state.json` are unchanged for backward compatibility.
+
+| Trigger | Transition | Kind | Notes |
+|---------|------------|------|-------|
+| `bootstrap` | `idle|done|awaiting_* -> awaiting_work` | normal | Initializes round contract for a task. |
+| `prepare_round` | `awaiting_*|idle|done -> awaiting_work` | normal | Normalizes resumed/single-round execution start. |
+| `worker_completed` | `awaiting_work -> awaiting_review` | normal | Worker artifact validated and review request prepared. |
+| `reviewer_approved` | `awaiting_review -> done` | normal | Approved terminal path (`outcome=approved`). |
+| `reviewer_changes_required` | `awaiting_review -> awaiting_work` | retry | Declarative retry transition (`round += 1`). |
+| `worker_timeout` | `awaiting_work -> done` | timeout | Declarative timeout terminal path. |
+| `reviewer_timeout` | `awaiting_review -> done` | timeout | Declarative timeout terminal path. |
+| `terminal_error` | `any core state -> done` | error | Centralized blocked/error terminal transition. |
+| `max_rounds_exhausted` | `awaiting_work|awaiting_review -> done` | retry | Terminal stop when max rounds reached. |
+
+`state_transition` feed events are emitted through one centralized transition path and include `trigger` plus `transition_kind`.
+
 Dispatch logs (`.loop/logs/*_dispatch.log`) redact common sensitive values before persistence (for example bearer tokens, API keys, and password-like fields).
 
 ### Archive
