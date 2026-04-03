@@ -9,5 +9,18 @@
     "<measurable criterion>"
   ],
   "depends_on": [],
+  "lanes": [
+    {
+      "lane_id": "lane_core",
+      "owner_paths": [
+        "src/loop_kit/orchestrator.py"
+      ],
+      "depends_on": [],
+      "backend_preference": "codex",
+      "acceptance_checks": [
+        "<lane-specific check>"
+      ]
+    }
+  ],
   "constraints": []
 }

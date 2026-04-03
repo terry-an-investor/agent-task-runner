@@ -116,6 +116,14 @@ class FixList(TypedDict, total=False):
     prior_review_non_blocking: NotRequired[list[str]]
 
 
+class TaskLane(TypedDict, total=False):
+    lane_id: Required[str]
+    owner_paths: Required[list[str]]
+    depends_on: NotRequired[list[str]]
+    backend_preference: NotRequired[str]
+    acceptance_checks: NotRequired[list[str]]
+
+
 class TaskCard(TypedDict, total=False):
     task_id: Required[str]
     goal: Required[str]
@@ -125,6 +133,7 @@ class TaskCard(TypedDict, total=False):
     constraints: Required[list[str]]
     depends_on: NotRequired[list[str]]
     dependencies: NotRequired[list[str]]
+    lanes: NotRequired[list[TaskLane]]
 
 
 # ── single-file architecture boundaries (T-722) ────────────────────────────
@@ -3685,6 +3694,12 @@ def _function_index(path: Path) -> str:
 
 
 def _render_task_card_section(task_card: TaskCard) -> str:
+    lanes_raw = task_card.get("lanes")
+    lanes_lines: list[str] = []
+    if isinstance(lanes_raw, list):
+        for lane in lanes_raw:
+            if isinstance(lane, dict):
+                lanes_lines.append(json.dumps(lane, ensure_ascii=False))
     return (
         "=== TASK CARD ===\n"
         f"goal: {task_card.get('goal', '<none>')}\n"
@@ -3696,6 +3711,8 @@ def _render_task_card_section(task_card: TaskCard) -> str:
         f"{_as_prompt_list(task_card.get('acceptance_criteria'))}\n"
         "depends_on:\n"
         f"{_as_prompt_list(task_card.get('depends_on'))}\n"
+        "lanes:\n"
+        f"{_as_prompt_list(lanes_lines)}\n"
         "constraints:\n"
         f"{_as_prompt_list(task_card.get('constraints'))}\n"
     )
@@ -4241,6 +4258,8 @@ TASK_STATUS_IN_PROGRESS = "in_progress"
 TASK_STATUS_DONE = "done"
 TASK_STATUS_BLOCKED = "blocked"
 _DEPENDENCY_FIELDS = ("depends_on", "dependencies")
+_LANE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+_OWNER_PATH_GLOB_CHARS = frozenset("*?[]")
 TRANSITION_KIND_NORMAL = "normal"
 TRANSITION_KIND_RETRY = "retry"
 TRANSITION_KIND_TIMEOUT = "timeout"
@@ -4787,6 +4806,182 @@ def _normalize_task_dependencies(task_card: dict, *, source: Path, task_id: str)
     return dependencies
 
 
+def _normalize_lane_owner_path(*, source: Path, lane_id: str, location: str, raw_value: object) -> str:
+    if not isinstance(raw_value, str) or not raw_value.strip():
+        raise ConfigError(
+            f"task card {source}: field '{location}' in lane '{lane_id}' must be a non-empty repo-relative path"
+        )
+    owner_path = raw_value.strip()
+    parsed = Path(owner_path)
+    if parsed.is_absolute() or parsed.drive:
+        raise ConfigError(f"task card {source}: field '{location}' in lane '{lane_id}' must not be absolute")
+    normalized_parts: list[str] = []
+    for part in parsed.parts:
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            raise ConfigError(
+                f"task card {source}: field '{location}' in lane '{lane_id}' must not contain traversal segments"
+            )
+        normalized_parts.append(part)
+    normalized = "/".join(normalized_parts)
+    if not normalized:
+        raise ConfigError(
+            f"task card {source}: field '{location}' in lane '{lane_id}' must be a non-empty repo-relative path"
+        )
+    if any(char in _OWNER_PATH_GLOB_CHARS for char in normalized):
+        raise ConfigError(
+            f"task card {source}: field '{location}' in lane '{lane_id}' must use literal paths without glob patterns"
+        )
+    return normalized
+
+
+def _owner_paths_overlap(path_a: str, path_b: str) -> bool:
+    a_parts = path_a.split("/")
+    b_parts = path_b.split("/")
+    if len(a_parts) <= len(b_parts):
+        return b_parts[: len(a_parts)] == a_parts
+    return a_parts[: len(b_parts)] == b_parts
+
+
+def _normalize_task_lanes(task_card: dict, *, source: Path) -> list[TaskLane]:
+    if "lanes" not in task_card:
+        return []
+    raw_lanes = task_card.get("lanes")
+    if raw_lanes is None:
+        return []
+    if not isinstance(raw_lanes, list):
+        raise ConfigError(f"task card {source}: field 'lanes' must be a list of lane definitions")
+
+    normalized_lanes: list[TaskLane] = []
+    lanes_by_id: dict[str, TaskLane] = {}
+    lane_ids_in_order: list[str] = []
+    owner_claims: list[tuple[str, str, str]] = []
+
+    for lane_index, lane_raw in enumerate(raw_lanes):
+        lane_location = f"lanes[{lane_index}]"
+        if not isinstance(lane_raw, dict):
+            raise ConfigError(f"task card {source}: field '{lane_location}' must be a JSON object")
+
+        lane_id_raw = lane_raw.get("lane_id")
+        if not isinstance(lane_id_raw, str) or not lane_id_raw.strip():
+            raise ConfigError(f"task card {source}: field '{lane_location}.lane_id' must be a non-empty string")
+        lane_id = lane_id_raw.strip()
+        if not _LANE_ID_PATTERN.fullmatch(lane_id):
+            raise ConfigError(
+                f"task card {source}: field '{lane_location}.lane_id' must match pattern "
+                r"'^[A-Za-z0-9][A-Za-z0-9_-]*$'"
+            )
+        if lane_id in lanes_by_id:
+            raise ConfigError(f"task card {source}: duplicate lane_id '{lane_id}'")
+
+        owner_paths_raw = lane_raw.get("owner_paths")
+        if not isinstance(owner_paths_raw, list) or not owner_paths_raw:
+            raise ConfigError(
+                f"task card {source}: field '{lane_location}.owner_paths' must be a non-empty list of paths"
+            )
+        owner_paths: list[str] = []
+        seen_owner_paths: set[str] = set()
+        for owner_index, raw_owner in enumerate(owner_paths_raw):
+            owner_location = f"{lane_location}.owner_paths[{owner_index}]"
+            owner_path = _normalize_lane_owner_path(
+                source=source,
+                lane_id=lane_id,
+                location=owner_location,
+                raw_value=raw_owner,
+            )
+            if owner_path in seen_owner_paths:
+                raise ConfigError(
+                    f"task card {source}: duplicate owner_paths entry '{owner_path}' in lane '{lane_id}'"
+                )
+            seen_owner_paths.add(owner_path)
+            owner_paths.append(owner_path)
+            owner_claims.append((owner_path, lane_id, owner_location))
+
+        depends_on: list[str] = []
+        depends_on_raw = lane_raw.get("depends_on")
+        if depends_on_raw is not None:
+            if not isinstance(depends_on_raw, list):
+                raise ConfigError(
+                    f"task card {source}: field '{lane_location}.depends_on' must be a list of lane IDs"
+                )
+            seen_depends_on: dict[str, str] = {}
+            for dep_index, dep_raw in enumerate(depends_on_raw):
+                dep_location = f"{lane_location}.depends_on[{dep_index}]"
+                if not isinstance(dep_raw, str) or not dep_raw.strip():
+                    raise ConfigError(
+                        f"task card {source}: field '{dep_location}' must be a non-empty lane ID string"
+                    )
+                dep_id = dep_raw.strip()
+                if dep_id == lane_id:
+                    raise ConfigError(f"task card {source}: lane '{lane_id}' must not depend on itself")
+                first_seen = seen_depends_on.get(dep_id)
+                if first_seen is not None:
+                    raise ConfigError(
+                        f"task card {source}: duplicate lane dependency '{dep_id}' at '{dep_location}' "
+                        f"(first seen at '{first_seen}')"
+                    )
+                seen_depends_on[dep_id] = dep_location
+                depends_on.append(dep_id)
+
+        lane: TaskLane = {
+            "lane_id": lane_id,
+            "owner_paths": owner_paths,
+        }
+        if "depends_on" in lane_raw:
+            lane["depends_on"] = depends_on
+
+        backend_preference_raw = lane_raw.get("backend_preference")
+        if backend_preference_raw is not None:
+            if not isinstance(backend_preference_raw, str) or not backend_preference_raw.strip():
+                raise ConfigError(
+                    f"task card {source}: field '{lane_location}.backend_preference' must be a non-empty string"
+                )
+            lane["backend_preference"] = backend_preference_raw.strip()
+
+        acceptance_checks_raw = lane_raw.get("acceptance_checks")
+        if acceptance_checks_raw is not None:
+            if not isinstance(acceptance_checks_raw, list):
+                raise ConfigError(
+                    f"task card {source}: field '{lane_location}.acceptance_checks' must be a list of strings"
+                )
+            acceptance_checks: list[str] = []
+            for check_index, check_raw in enumerate(acceptance_checks_raw):
+                check_location = f"{lane_location}.acceptance_checks[{check_index}]"
+                if not isinstance(check_raw, str) or not check_raw.strip():
+                    raise ConfigError(f"task card {source}: field '{check_location}' must be a non-empty string")
+                acceptance_checks.append(check_raw.strip())
+            lane["acceptance_checks"] = acceptance_checks
+
+        lanes_by_id[lane_id] = lane
+        lane_ids_in_order.append(lane_id)
+        normalized_lanes.append(lane)
+
+    for lane_id in lane_ids_in_order:
+        lane = lanes_by_id[lane_id]
+        for dep_id in lane.get("depends_on", []):
+            if dep_id not in lanes_by_id:
+                raise ConfigError(
+                    f"task card {source}: lane '{lane_id}' depends_on unknown lane_id '{dep_id}'"
+                )
+
+    claim_count = len(owner_claims)
+    for first_index in range(claim_count):
+        first_path, first_lane_id, first_location = owner_claims[first_index]
+        for second_index in range(first_index + 1, claim_count):
+            second_path, second_lane_id, second_location = owner_claims[second_index]
+            if first_lane_id == second_lane_id:
+                continue
+            if _owner_paths_overlap(first_path, second_path):
+                raise ConfigError(
+                    f"task card {source}: owner_paths overlap across lanes: "
+                    f"'{first_path}' ({first_location}, lane '{first_lane_id}') conflicts with "
+                    f"'{second_path}' ({second_location}, lane '{second_lane_id}')"
+                )
+
+    return normalized_lanes
+
+
 def _task_card_candidate_paths(task_id: str, *, paths: LoopPaths | None = None) -> list[Path]:
     resolved_paths = _resolve_paths(paths)
     tasks_dir = resolved_paths.dir / "tasks"
@@ -4846,10 +5041,15 @@ def _load_task_card_or_raise(task_path: str | Path) -> tuple[Path, TaskCard, str
     task_id_raw = task_card_typed.get("task_id", "UNKNOWN")
     task_id = str(task_id_raw).strip() if isinstance(task_id_raw, str) else str(task_id_raw)
     dependencies = _normalize_task_dependencies(task_card_typed, source=tp, task_id=task_id)
+    lanes = _normalize_task_lanes(task_card_typed, source=tp)
     if dependencies:
         task_card_typed["depends_on"] = dependencies
     elif "depends_on" in task_card_typed:
         task_card_typed["depends_on"] = []
+    if lanes:
+        task_card_typed["lanes"] = lanes
+    elif "lanes" in task_card_typed:
+        task_card_typed["lanes"] = []
     return tp, task_card_typed, task_id or "UNKNOWN"
 
 
@@ -5550,6 +5750,15 @@ def cmd_init(paths: LoopPaths | None = None) -> None:
                     "out_of_scope": [],
                     "acceptance_criteria": ["<measurable criterion>"],
                     "depends_on": [],
+                    "lanes": [
+                        {
+                            "lane_id": "lane_core",
+                            "owner_paths": ["src/loop_kit/orchestrator.py"],
+                            "depends_on": [],
+                            "backend_preference": "codex",
+                            "acceptance_checks": ["<lane-specific check>"],
+                        }
+                    ],
                     "constraints": [],
                 },
                 indent=2,

@@ -271,11 +271,27 @@ Interpretation limits for the command output:
   "out_of_scope": [],
   "acceptance_criteria": ["measurable criterion"],
   "depends_on": ["T-000"],
+  "lanes": [
+    {
+      "lane_id": "lane_core",
+      "owner_paths": ["src/loop_kit/orchestrator.py"],
+      "depends_on": [],
+      "backend_preference": "codex",
+      "acceptance_checks": ["unit tests pass for lane-owned files"]
+    }
+  ],
   "constraints": []
 }
 ```
 
 `depends_on` is optional. A legacy alias field `dependencies` is also accepted.
+`lanes` is optional. Each lane requires `lane_id` and non-empty `owner_paths` (literal repo-relative paths).
+When lanes are provided, the orchestrator validates:
+- `lane_id` values are unique
+- `depends_on` only references existing lane IDs
+- lanes do not depend on themselves
+- `owner_paths` rejects absolute paths and traversal segments
+- `owner_paths` has no overlap across lanes (same path or parent/child ownership)
 
 `status` is system-managed while the loop runs: it is written to `in_progress` at start, `done` on approved completion, and `blocked` on non-approved terminal failures, including unsatisfied task dependencies before dispatch.
 

@@ -3787,6 +3787,212 @@ def test_load_task_card_rejects_invalid_depends_on_shape(tmp_path: Path, capsys)
     assert "field 'depends_on' must be a list of task IDs" in capsys.readouterr().err
 
 
+def test_load_task_card_normalizes_valid_lanes(tmp_path: Path) -> None:
+    task_path = tmp_path / "task_input.json"
+    task_path.write_text(
+        json.dumps(
+            {
+                "task_id": "T-900",
+                "goal": "lane parse",
+                "lanes": [
+                    {
+                        "lane_id": "lane_core",
+                        "owner_paths": ["src/loop_kit/orchestrator.py"],
+                        "depends_on": [],
+                        "backend_preference": "codex",
+                        "acceptance_checks": ["lane unit tests pass"],
+                    },
+                    {
+                        "lane_id": "lane_tests",
+                        "owner_paths": ["tests/test_orchestrator.py"],
+                        "depends_on": ["lane_core"],
+                    },
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    _, task_card, task_id = orchestrator._load_task_card(str(task_path))
+
+    assert task_id == "T-900"
+    assert task_card["lanes"] == [
+        {
+            "lane_id": "lane_core",
+            "owner_paths": ["src/loop_kit/orchestrator.py"],
+            "depends_on": [],
+            "backend_preference": "codex",
+            "acceptance_checks": ["lane unit tests pass"],
+        },
+        {
+            "lane_id": "lane_tests",
+            "owner_paths": ["tests/test_orchestrator.py"],
+            "depends_on": ["lane_core"],
+        },
+    ]
+
+
+def test_load_task_card_rejects_lanes_with_duplicate_lane_id(tmp_path: Path, capsys) -> None:
+    task_path = tmp_path / "task_input.json"
+    task_path.write_text(
+        json.dumps(
+            {
+                "task_id": "T-900",
+                "goal": "bad lanes",
+                "lanes": [
+                    {"lane_id": "lane_core", "owner_paths": ["src/loop_kit/orchestrator.py"]},
+                    {"lane_id": "lane_core", "owner_paths": ["tests/test_orchestrator.py"]},
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        orchestrator._load_task_card(str(task_path))
+
+    assert exc.value.code == 1
+    assert "duplicate lane_id 'lane_core'" in capsys.readouterr().err
+
+
+def test_load_task_card_rejects_lane_depends_on_unknown_lane(tmp_path: Path, capsys) -> None:
+    task_path = tmp_path / "task_input.json"
+    task_path.write_text(
+        json.dumps(
+            {
+                "task_id": "T-900",
+                "goal": "bad lane deps",
+                "lanes": [
+                    {
+                        "lane_id": "lane_core",
+                        "owner_paths": ["src/loop_kit/orchestrator.py"],
+                        "depends_on": ["lane_missing"],
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        orchestrator._load_task_card(str(task_path))
+
+    assert exc.value.code == 1
+    assert "depends_on unknown lane_id 'lane_missing'" in capsys.readouterr().err
+
+
+def test_load_task_card_rejects_lane_self_dependency(tmp_path: Path, capsys) -> None:
+    task_path = tmp_path / "task_input.json"
+    task_path.write_text(
+        json.dumps(
+            {
+                "task_id": "T-900",
+                "goal": "bad lane deps",
+                "lanes": [
+                    {
+                        "lane_id": "lane_core",
+                        "owner_paths": ["src/loop_kit/orchestrator.py"],
+                        "depends_on": ["lane_core"],
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        orchestrator._load_task_card(str(task_path))
+
+    assert exc.value.code == 1
+    assert "lane 'lane_core' must not depend on itself" in capsys.readouterr().err
+
+
+def test_load_task_card_rejects_lane_owner_paths_with_traversal(tmp_path: Path, capsys) -> None:
+    task_path = tmp_path / "task_input.json"
+    task_path.write_text(
+        json.dumps(
+            {
+                "task_id": "T-900",
+                "goal": "bad owner path",
+                "lanes": [
+                    {
+                        "lane_id": "lane_core",
+                        "owner_paths": ["src/../secrets.py"],
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        orchestrator._load_task_card(str(task_path))
+
+    assert exc.value.code == 1
+    assert "must not contain traversal segments" in capsys.readouterr().err
+
+
+def test_load_task_card_rejects_lane_owner_paths_with_absolute_path(tmp_path: Path, capsys) -> None:
+    task_path = tmp_path / "task_input.json"
+    task_path.write_text(
+        json.dumps(
+            {
+                "task_id": "T-900",
+                "goal": "bad owner path",
+                "lanes": [
+                    {
+                        "lane_id": "lane_core",
+                        "owner_paths": [str((tmp_path / "outside.py").resolve())],
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        orchestrator._load_task_card(str(task_path))
+
+    assert exc.value.code == 1
+    assert "must not be absolute" in capsys.readouterr().err
+
+
+def test_load_task_card_rejects_lane_owner_paths_overlap(tmp_path: Path, capsys) -> None:
+    task_path = tmp_path / "task_input.json"
+    task_path.write_text(
+        json.dumps(
+            {
+                "task_id": "T-900",
+                "goal": "overlap",
+                "lanes": [
+                    {
+                        "lane_id": "lane_core",
+                        "owner_paths": ["src/loop_kit"],
+                    },
+                    {
+                        "lane_id": "lane_tests",
+                        "owner_paths": ["src/loop_kit/orchestrator.py"],
+                    },
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        orchestrator._load_task_card(str(task_path))
+
+    assert exc.value.code == 1
+    assert "owner_paths overlap across lanes" in capsys.readouterr().err
+
+
 def test_dependency_snapshot_ready_when_dependencies_done(tmp_path: Path, monkeypatch) -> None:
     _configure_loop_paths(monkeypatch, tmp_path)
     task_path = tmp_path / "task_input.json"
