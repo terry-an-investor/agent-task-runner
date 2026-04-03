@@ -326,6 +326,22 @@ class RunConfig:
     verbose: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class FeedEvent:
+    ts: str
+    level: str
+    event: str
+    data: dict[str, object]
+
+    def as_payload(self) -> dict[str, object]:
+        return {
+            "ts": self.ts,
+            "level": self.level,
+            "event": self.event,
+            "data": self.data,
+        }
+
+
 def _resolve_loop_dir(loop_dir: str | Path) -> Path:
     candidate = Path(loop_dir)
     if not candidate.is_absolute():
@@ -713,25 +729,20 @@ def _feed_event(
     event: str,
     *,
     level: str = "info",
-    data: dict | None = None,
+    data: dict[str, object] | None = None,
     paths: LoopPaths | None = None,
 ) -> None:
     if _FEED_TASK_ID and data and data.get("task_id") not in (None, _FEED_TASK_ID):
         return
-    payload_data = dict(data or {})
+    payload_data: dict[str, object] = dict(data or {})
     if _FEED_TASK_ID and "task_id" not in payload_data:
         payload_data["task_id"] = _FEED_TASK_ID
     _ensure_logs_dir(paths=paths)
     feed_path = _feed_log_path(paths=paths)
     _rotate_log_file(feed_path)
-    payload = {
-        "ts": _ts(),
-        "level": level,
-        "event": event,
-        "data": payload_data,
-    }
+    payload = FeedEvent(ts=_ts(), level=level, event=event, data=payload_data)
     with open(feed_path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        f.write(json.dumps(payload.as_payload(), ensure_ascii=False) + "\n")
 
 
 def _log(msg: str, paths: LoopPaths | None = None) -> None:
