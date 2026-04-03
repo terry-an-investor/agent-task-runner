@@ -24,10 +24,37 @@ loop init
 # (optional) Build offline module map for faster context
 loop index
 
-# Create task card (see .loop/examples/task_card.json)
+# Create task card (see example below)
 # Run with auto-dispatch
 loop run --task .loop/task_card.json --auto-dispatch --worker-backend codex --reviewer-backend codex
 ```
+
+**Example task card** (`.loop/task_card.json`):
+
+```json
+{
+  "task_id": "T-001",
+  "status": "todo",
+  "goal": "Add input validation to user registration endpoint",
+  "in_scope": ["src/api/auth.py", "tests/test_auth.py"],
+  "out_of_scope": ["UI changes"],
+  "acceptance_criteria": [
+    "Email format validated",
+    "Password strength enforced",
+    "Tests cover edge cases"
+  ],
+  "lanes": [
+    {
+      "lane_id": "lane_core",
+      "owner_paths": ["src/api/auth.py"],
+      "depends_on": [],
+      "backend_preference": "codex"
+    }
+  ]
+}
+```
+
+Run and watch rounds progress in `.loop/state.json`.
 
 ## Prerequisites
 
@@ -35,17 +62,35 @@ loop run --task .loop/task_card.json --auto-dispatch --worker-backend codex --re
 - Git repository (the orchestrator uses git commits as the source of truth)
 - At least one AI backend installed: [codex](https://github.com/openai/codex), [claude](https://docs.anthropic.com/en/docs/claude-code), or [opencode](https://opencode.ai)
 
-## 📋 Table of Contents
+## 📋 Contents
 
-GitHub Actions workflow [`loop-ci.yml`](.github/workflows/loop-ci.yml) runs on `push` to `main`/`master` and on `pull_request`.
+- [CLI Reference](#cli-reference)
+- [Core Concepts](#core-concepts)
+- [Architecture](#architecture)
+- [Typical Workflow](#typical-workflow)
+- [Performance](#performance)
+- [Troubleshooting](#troubleshooting)
+- [Development](#development)
 
-- `uv sync --frozen --group dev`
-- `uv run --group dev --with pytest-cov pytest --cov=src/loop_kit --cov-report=xml`
-- `uv run --group dev pytest -m integration` when integration-marked tests exist
-- `uv run --group dev ruff check src/loop_kit tests`
-- `uv run --group dev --with mypy mypy src/loop_kit` (optional, non-blocking)
+## Typical Workflow
 
-The workflow uploads `coverage.xml` to Codecov and stores JUnit XML test results as workflow artifacts.
+1. **Create task card** — Define goal, scope, acceptance criteria
+2. **Run loop** — System executes rounds automatically:
+   - Worker writes code based on task card
+   - Reviewer validates against criteria
+   - On `changes_required`, loop repeats (max rounds)
+3. **Monitor** — Check `.loop/state.json` and `.loop/logs/` for progress
+4. **Approve or fix** — Loop ends when reviewer approves or max rounds exhausted
+
+```
+Round 1: Worker → Reviewer → changes_required
+Round 2: Worker → Reviewer → approve ✅
+```
+
+Key files:
+- `.loop/state.json` — Current state and round number
+- `.loop/logs/feed.jsonl` — Event log for debugging
+- `.loop/archive/{task_id}/` — Historical artifacts per round
 
 ## CLI Reference
 
@@ -133,16 +178,14 @@ The command compares archived `state`, `work_report`, and/or `review_report` JSO
 
 `--format markdown` renders a deterministic task summary including goal, status, rounds, per-round decisions, and changed files when available. The report command only consumes artifacts whose payload identity matches the requested task and round; inconsistent archived artifacts fail with validation errors.
 
-### `loop knowledge` commands
+`loop knowledge` manages built-in defaults:
 
-| Command | Description |
-|---------|-------------|
-| `loop knowledge list [--category CAT]` | Print facts, pitfalls, and patterns from `src/loop_kit/defaults/*.jsonl` in a table |
-| `loop knowledge add --pattern TEXT --category CAT --confidence 0..1 --source ORIGIN` | Append a pattern entry to `src/loop_kit/defaults/patterns.jsonl` |
-| `loop knowledge prune --older-than DAYS` | Remove entries whose `source_version` timestamp is older than `DAYS` |
-| `loop knowledge dedupe` | Deduplicate defaults knowledge entries and report removals |
+- `list [--category CAT]` — Print facts, pitfalls, patterns
+- `add --pattern TEXT --category CAT --confidence 0..1 --source ORIGIN` — Append pattern
+- `prune --older-than DAYS` — Remove stale entries
+- `dedupe` — Remove duplicates
 
-All write operations are atomic (`temp file -> rename`) and modify `src/loop_kit/defaults/*.jsonl` in place.
+All writes are atomic and modify `src/loop_kit/defaults/*.jsonl`.
 
 ### Configuration files and env vars
 
@@ -161,18 +204,7 @@ Resolution order:
 
 `CLI args > environment variables > config file > built-in defaults`
 
-Validation rules:
-
-- `max_rounds` must be `>= 1`
-- `timeout`, `dispatch_timeout`, `dispatch_retries`, `dispatch_retry_base_sec`, `max_session_rounds`, `artifact_timeout`, and `heartbeat_ttl` must be `>= 0`
-- Invalid CLI/env/config values fail fast with a validation error (`exit code 3`)
-- JSON payloads loaded from bus/state/config/task files are capped at 5 MiB and rejected when oversized
-
-### Archive
-
-Round artifacts are archived to `.loop/archive/{task_id}/r{N}_{name}.json` using payload identity (`task_id`, `round`) before overwrite, preserving deterministic round history and rejecting cross-task writes.
-
-## Performance Metrics
+## Architecture
 
 **task_card.json**
 ```json
@@ -198,34 +230,8 @@ Round artifacts are archived to `.loop/archive/{task_id}/r{N}_{name}.json` using
 ```
 
 `depends_on` is optional. A legacy alias field `dependencies` is also accepted.
-`lanes` is optional. Each lane requires `lane_id` and non-empty `owner_paths` (literal repo-relative paths).
-`lane_id` must match `^[A-Za-z0-9][A-Za-z0-9_-]*$`.
-When lanes are provided, the orchestrator validates:
-- `lane_id` values are unique
-- `depends_on` only references existing lane IDs
-- lanes do not depend on themselves
-- lane dependencies are acyclic (`lanes.depends_on` must form a DAG)
-- `owner_paths` rejects absolute paths and traversal segments
-- `owner_paths` has no overlap across lanes (same path or parent/child ownership)
 
-When lanes are present and valid, the orchestrator computes deterministic execution stages for troubleshooting and future parallel scheduling:
-- each stage contains lanes whose dependencies are already satisfied
-- lane order is deterministic for equal-priority lanes (task-card declaration order)
-- round logs include `Lane stage <index>: <lane set>`
-- feed emits `lane_plan_stage` events with `stage_index`, `stage_count`, and `lanes`
-
-Lane worktree isolation lifecycle:
-- for lane-enabled rounds, the orchestrator creates per-lane git worktrees under `.loop/worktrees/<task_id>/<round>/<lane_id>`
-- each lane worktree checks out a deterministic branch name: `loop/<task_id>/r<round>/<lane_id>`
-- lane worktrees are cleaned up on normal completion, worker/reviewer timeout failures, and parent-loop interruption handling
-- cleanup is scoped to the current task/round lane paths only; unrelated git worktrees are not removed
-
-Recovery notes:
-- if a process is hard-killed before cleanup, inspect leftovers with `git worktree list`
-- remove stale lane worktrees with `git worktree remove --force <path>` and rerun `loop run`
-- lane worktree paths are disposable runtime artifacts under `.loop/worktrees/`; they should not be committed
-
-`status` is system-managed while the loop runs: it is written to `in_progress` at start, `done` on approved completion, and `blocked` on non-approved terminal failures, including unsatisfied task dependencies before dispatch.
+`status` is system-managed: `in_progress` at start, `done` on approval, `blocked` on failures.
 
 **work_report.json**
 ```json
@@ -280,6 +286,27 @@ Recovery notes:
 ```
 
 **state.json** — Internal orchestrator state, the single source of truth between rounds.
+
+### Architecture Overview
+
+```
+                   ┌──────────┐
+                   │   PM     │  orchestrator.py
+                   │(outer)   │
+                   └────┬─────┘
+             ┌──────────┼──────────┐
+             ▼          ▼          ▼
+      ┌──────────┐ ┌──────────┐
+      │  Worker  │ │ Reviewer │   (codex/claude/opencode subprocess)
+      │(codex/   │ │(codex/   │
+      │claude/   │ │claude/   │
+      │opencode) │ │opencode) │
+      └──────────┘ └──────────┘
+```
+
+Each round runs as a fresh subprocess (`python -m loop_kit run --single-round`), so code changes take effect immediately.
+
+Backend discovery uses `shutil.which()` plus known install paths. The backend registry (`register_backend()`) supports adding custom backends.
 
 ## Core Concepts
 
@@ -356,45 +383,71 @@ Interpretation:
 - `context_to_work_ms`: initial prompt processing before execution
 - `work_to_artifact_ms`: actual code work duration
 
-## Development
+### Optimization Tips
 
-```
-                   ┌──────────┐
-                   │   PM     │  orchestrator.py
-                   │(outer)   │
-                   └────┬─────┘
-             ┌──────────┼──────────┐
-             ▼          ▼          ▼
-      ┌──────────┐ ┌──────────┐
-      │  Worker  │ │ Reviewer │   (codex/claude/opencode subprocess)
-      │(codex/   │ │(codex/   │
-      │claude/   │ │claude/   │
-      │opencode) │ │opencode) │
-      └──────────┘ └──────────┘
-```
+**Slow startup** (`startup_ms` high):
+- Use `--max-session-rounds N` to reuse backend sessions
+- Pre-index with `loop index` for faster context
 
-Policy decision (T-722): `src/loop_kit/orchestrator.py` remains a single file. A physical module split is currently blocked because core runtime behavior still depends on shared module globals and targeted monkeypatch patterns in tests.
+**Slow work phase** (`work_to_artifact_ms` high):
+- Narrow `in_scope` files in task card
+- Add precise `acceptance_criteria` to reduce back-and-forth
+- Consider splitting into multiple lanes
 
-The single-file architecture is governed by explicit section boundaries in `_SECTION_OWNERSHIP_MAP`:
+**High retry count**:
+- Improve acceptance criteria clarity
+- Add more project facts via `loop knowledge add`
+- Tune prompt templates in `.loop/templates/`
 
-- `exceptions`
-- `paths`
-- `state`
-- `lock`
-- `dispatch`
-- `config`
-- `prompts`
+Monitor with: `loop dispatch-metrics --task-id <id> --role worker`
 
-Each round runs as a **fresh subprocess** (`python -m loop_kit run --single-round`), so code changes in the orchestrator itself take effect immediately — the orchestrator can improve itself.
+### Best Practices
 
-Backend discovery uses `shutil.which()` plus known install paths. The backend registry (`register_backend()`) supports adding custom backends.
+**Task cards**
+- One clear goal per task (avoid scope creep)
+- Specific, testable acceptance criteria
+- Use `lanes` for multi-module changes to isolate worktrees
 
-## Prompt Templates
+**Backend choice**
+- `codex`: Fast, good for boilerplate
+- `claude`: Strong reasoning, complex refactors
+- `opencode`: Local, no API costs
 
-`loop init` creates prompt templates in `.loop/templates/`:
+**Lanes**
+- Enable for changes spanning multiple subsystems
+- Each lane gets isolated git worktree
+- Define explicit dependencies between lanes
 
-- **worker_prompt.txt** — Worker prompt with `{task_id}`, `{round_num}`, `{agents_md}`, `{role_md}`, `{task_card_section}`, `{prior_context_section}`, `{work_report_path}` placeholders
-- **reviewer_prompt.txt** — Reviewer prompt with `{task_id}`, `{round_num}`, `{role_md}`, `{review_report_path}` placeholders
+**Reviewer tuning**
+- Make `acceptance_criteria` objective and verifiable
+- Provide examples of "done" in task description
+- Use `out_of_scope` to prevent creep
+
+**State management**
+- Use `--resume` to continue interrupted work
+- `loop status --tree` to visualize dependencies
+
+## Troubleshooting
+
+**Backend not found**
+- Ensure backend CLI is in PATH (`codex`, `claude`, or `opencode`)
+- Or set `--dispatch-backend native` for local module execution
+
+**Timeouts**
+- Increase `--dispatch-timeout` or `--artifact-timeout`
+- Check `.loop/logs/` for slow phases
+
+**Worker/reviewer not responding**
+- Use `loop health` to check heartbeats
+- Add `--require-heartbeat` to fail fast on stalls
+
+**State stuck**
+- Inspect `.loop/state.json`
+- Use `--reset` to clear stale bus files
+
+**Permission errors**
+- `.loop/` must be writable
+- Git worktree operations need repo write access
 
 ## Development
 
