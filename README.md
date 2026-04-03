@@ -352,6 +352,18 @@ All bus files are archived to `.loop/archive/{task_id}/r{N}_{name}.json` before 
       └──────────┘ └──────────┘
 ```
 
+Policy decision (T-722): `src/loop_kit/orchestrator.py` remains a single file. A physical module split is currently blocked because core runtime behavior still depends on shared module globals and targeted monkeypatch patterns in tests.
+
+The single-file architecture is governed by explicit section boundaries in `_SECTION_OWNERSHIP_MAP`:
+
+- `exceptions`
+- `paths`
+- `state`
+- `lock`
+- `dispatch`
+- `config`
+- `prompts`
+
 Each round runs as a **fresh subprocess** (`python -m loop_kit run --single-round`), so code changes in the orchestrator itself take effect immediately — the orchestrator can improve itself.
 
 Backend discovery uses `shutil.which()` plus known install paths. The backend registry (`register_backend()`) supports adding custom backends.

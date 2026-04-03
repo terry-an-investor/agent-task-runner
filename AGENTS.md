@@ -7,7 +7,8 @@
 
 ## Source Structure
 
-- All code in `src/loop_kit/orchestrator.py` — do not split into modules.
+- All code stays in `src/loop_kit/orchestrator.py` (policy decision T-722). Do not split into modules unless this file and README Architecture are updated in the same change.
+- Internal boundaries are documented by `_SECTION_OWNERSHIP_MAP` in `orchestrator.py` and are treated as module-equivalent ownership contracts.
 - Wrappers: `cli.py` (re-exports main), `__main__.py` (`python -m loop_kit`), `__init__.py` (version).
 - Tests in `tests/test_orchestrator.py`.
 

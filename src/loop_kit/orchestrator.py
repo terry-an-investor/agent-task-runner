@@ -125,6 +125,20 @@ class TaskCard(TypedDict, total=False):
     constraints: Required[list[str]]
 
 
+# ── single-file architecture boundaries (T-722) ────────────────────────────
+# The orchestrator intentionally remains single-file. Keep changes within these
+# section boundaries so ownership is explicit even without a physical split.
+_SECTION_OWNERSHIP_MAP: dict[str, tuple[str, ...]] = {
+    "exceptions": ("LoopKitError", "StateError", "DispatchError", "ValidationError", "ConfigError"),
+    "paths": ("LoopPaths", "_path", "_configure_loop_paths", "_resolve_paths"),
+    "state": ("_default_state", "_load_state", "_save_state", "_apply_state_transition"),
+    "lock": ("_lock_file", "_unlock_file", "_LoopLock", "_acquire_run_lock"),
+    "dispatch": ("register_backend", "_agent_command", "_run_auto_dispatch", "_dispatch_with_retry"),
+    "config": ("RunConfig", "_load_config", "_load_env_config", "_validate_run_config"),
+    "prompts": ("_render_task_packet_section", "_worker_prompt", "_reviewer_prompt"),
+}
+
+
 # ── exception hierarchy ─────────────────────────────────────────────────────
 class LoopKitError(Exception):
     """Base exception for all loop-kit errors."""

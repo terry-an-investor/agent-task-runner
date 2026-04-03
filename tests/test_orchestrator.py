@@ -7962,3 +7962,22 @@ def test_state_migration_is_idempotent(tmp_path: Path, monkeypatch) -> None:
 
     assert first == second
     assert second["version"] == orchestrator.STATE_SCHEMA_VERSION
+
+
+def test_single_file_section_ownership_map_covers_required_boundaries() -> None:
+    required = {"exceptions", "paths", "state", "lock", "dispatch", "config", "prompts"}
+    section_map = orchestrator._SECTION_OWNERSHIP_MAP
+
+    assert required.issubset(section_map)
+    for section in required:
+        assert section_map[section]
+
+
+def test_orchestrator_error_class_names_are_unique() -> None:
+    source = Path(orchestrator.__file__).read_text(encoding="utf-8")
+    module = ast.parse(source)
+    error_classes = [
+        node.name for node in module.body if isinstance(node, ast.ClassDef) and node.name.endswith("Error")
+    ]
+
+    assert len(error_classes) == len(set(error_classes))
