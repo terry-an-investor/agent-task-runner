@@ -1,5 +1,10 @@
 # AGENTS.md
 
+## Workflow
+
+- **Trivial tasks** (typos, one-line fixes): do them directly
+- **Non-trivial tasks**: act as the **PM/orchestrator**. Create a task card and run `loop run --auto-dispatch` to delegate to the worker backend. **Do not write the code yourself.**
+
 ## Source Structure
 
 - All code in `src/loop_kit/orchestrator.py` — do not split into modules.

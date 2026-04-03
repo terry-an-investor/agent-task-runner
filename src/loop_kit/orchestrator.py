@@ -119,6 +119,67 @@ class TaskCard(TypedDict, total=False):
     constraints: Required[list[str]]
 
 
+# ── exception hierarchy ─────────────────────────────────────────────────────
+class LoopKitError(Exception):
+    """Base exception for all loop-kit errors."""
+
+    pass
+
+
+class StateError(LoopKitError):
+    """Errors related to state management or state corruption."""
+
+    pass
+
+
+class DispatchError(LoopKitError):
+    """Errors related to subprocess dispatch, timeouts, or backend failures."""
+
+    pass
+
+
+class ValidationError(LoopKitError):
+    """Errors related to input validation, git state, or business rule violations."""
+
+    pass
+
+
+class ConfigError(LoopKitError):
+    """Errors related to configuration loading or invalid config values."""
+
+    pass
+
+
+class DirtyWorktreeError(ValidationError):
+    """Specific error for dirty git worktree."""
+
+    pass
+
+
+class StateError(LoopKitError):
+    """Errors related to state management or state corruption."""
+
+    pass
+
+
+class DispatchError(LoopKitError):
+    """Errors related to subprocess dispatch, timeouts, or backend failures."""
+
+    pass
+
+
+class ValidationError(LoopKitError):
+    """Errors related to input validation, git state, or business rule violations."""
+
+    pass
+
+
+class ConfigError(LoopKitError):
+    """Errors related to configuration loading or invalid config values."""
+
+    pass
+
+
 ROOT = Path.cwd()
 LOOP_DIR = ROOT / ".loop"
 LOGS_DIR = LOOP_DIR / "logs"
@@ -1013,7 +1074,6 @@ def _stream_dispatch_stdout_line(
     *,
     verbose: bool,
 ) -> None:
-
     read_state = getattr(_stream_local, "read_state", None)
     if read_state is None:
         read_state = {}
@@ -1476,7 +1536,11 @@ def _report_dispatch_result(
     round_num: int | None = None,
 ) -> None:
     _write_dispatch_log(role, cmd, result, session_id)
-    event_type = FEED_DISPATCH_COMPLETE if timeout_sec is None and result.returncode == 0 and not interrupted else FEED_DISPATCH_FAIL
+    event_type = (
+        FEED_DISPATCH_COMPLETE
+        if timeout_sec is None and result.returncode == 0 and not interrupted
+        else FEED_DISPATCH_FAIL
+    )
     data = _feed_data(
         task_id=task_id,
         round_num=round_num,
@@ -1838,10 +1902,7 @@ def _run_auto_dispatch(
             if active_resume_session_id and (
                 _is_invalid_resume_session_error(stderr_text) or _is_invalid_resume_session_error(stdout_text)
             ):
-                _log(
-                    f"{role} resume session is invalid for backend={backend}; "
-                    "falling back to a new session."
-                )
+                _log(f"{role} resume session is invalid for backend={backend}; falling back to a new session.")
                 active_resume_session_id = None
                 max_attempts += 1
                 continue
@@ -2510,14 +2571,25 @@ def _reviewer_prompt(task_id: str, round_num: int) -> str:
 
 
 # ── state ───────────────────────────────────────────────────────────
+STATE_SCHEMA_VERSION = 1
 STATE_IDLE = "idle"
 STATE_AWAITING_WORK = "awaiting_work"
 STATE_AWAITING_REVIEW = "awaiting_review"
 STATE_DONE = "done"
 
 
+def _default_state(task_id: str | None = None, round_num: int = 0) -> dict:
+    """Return a fresh state dict with current schema version."""
+    return {
+        "version": STATE_SCHEMA_VERSION,
+        "state": STATE_IDLE,
+        "round": round_num,
+        "task_id": task_id,
+    }
+
+
 def _load_state() -> dict:
-    default_state = {"state": STATE_IDLE, "round": 0, "task_id": None}
+    default_state = _default_state()
     if not STATE_FILE.exists():
         return default_state.copy()
 
@@ -2558,6 +2630,25 @@ def _load_state() -> dict:
     if not isinstance(data, dict):
         _log("Warning: state.json root must be a JSON object. Using fresh default state.")
         return default_state.copy()
+
+    # Migration: ensure version field exists and is current
+    version = data.get("version", 0)
+    if version != STATE_SCHEMA_VERSION:
+        # Migrate: add missing fields with defaults
+        migrated = dict(data)  # shallow copy
+        migrated["version"] = STATE_SCHEMA_VERSION
+
+        # Ensure core fields exist
+        if "state" not in migrated:
+            migrated["state"] = STATE_IDLE
+        if "round" not in migrated:
+            migrated["round"] = 0
+        if "task_id" not in migrated:
+            migrated["task_id"] = None
+
+        _log(f"State schema migrated from version {version} to {STATE_SCHEMA_VERSION}.")
+        return migrated
+
     return data
 
 
@@ -2742,18 +2833,23 @@ def _load_config() -> dict:
 
 
 def _enforce_clean_worktree_or_exit(*, allow_dirty: bool) -> None:
-    dirty = _dirty_tracked_paths()
-    if not dirty:
-        return
-    _log(f"Dirty working tree detected ({len(dirty)} tracked files)")
-    print("Warning: dirty git working tree detected:", file=sys.stderr)
-    for path in dirty:
-        print(f"  - {path}", file=sys.stderr)
-    if allow_dirty:
-        print("Proceeding because --allow-dirty is set.", file=sys.stderr)
-        return
-    print("Refusing to start. Re-run with --allow-dirty to bypass.", file=sys.stderr)
-    sys.exit(EXIT_DIRTY_WORKTREE)
+    try:
+        dirty = _dirty_tracked_paths()
+        if not dirty:
+            return
+        _log(f"Dirty working tree detected ({len(dirty)} tracked files)")
+        print("Warning: dirty git working tree detected:", file=sys.stderr)
+        for path in dirty:
+            print(f"  - {path}", file=sys.stderr)
+        if allow_dirty:
+            print("Proceeding because --allow-dirty is set.", file=sys.stderr)
+            return
+        print("Refusing to start. Re-run with --allow-dirty to bypass.", file=sys.stderr)
+        raise DirtyWorktreeError("Dirty worktree")
+    except DirtyWorktreeError:
+        sys.exit(EXIT_DIRTY_WORKTREE)
+    except LoopKitError:
+        sys.exit(EXIT_GENERAL_ERROR)
 
 
 def _validate_report(
@@ -2884,7 +2980,26 @@ def _fail_with_state(state: dict, outcome: str, message: str, exit_code: int = E
     state["failed_at"] = _ts()
     state["error"] = message
     _save_state(state)
-    sys.exit(exit_code)
+    try:
+        # Map exit code to appropriate exception type
+        if exit_code == EXIT_VALIDATION_ERROR:
+            raise ValidationError(message)
+        elif exit_code == EXIT_TIMEOUT:
+            raise DispatchError(message)
+        elif exit_code == EXIT_DIRTY_WORKTREE:
+            raise DirtyWorktreeError(message)
+        elif exit_code == EXIT_LOCK_FAILURE:
+            raise StateError(message)
+        elif exit_code == EXIT_INTERRUPTED:
+            # Should not happen in normal flow, but map to base
+            raise LoopKitError(message)
+        else:
+            # EXIT_GENERAL_ERROR or unknown -> ConfigError or LoopKitError?
+            # Use ConfigError for config-related failures, LoopKitError for others
+            raise ConfigError(message) if "config" in outcome.lower() else LoopKitError(message)
+    except LoopKitError:
+        # This function is an exit point; directly exit with the original exit_code
+        sys.exit(exit_code)
 
 
 def _write_template_if_missing(path: Path, content: str) -> bool:
@@ -3152,54 +3267,64 @@ def _restore_target_name_from_archive(stem: str) -> str:
 
 
 def cmd_archive(task_id: str, restore: str | None = None) -> None:
-    if ".." in task_id or "/" in task_id or "\\" in task_id:
-        print("Error: invalid task_id (path traversal not allowed)", file=sys.stderr)
-        sys.exit(EXIT_GENERAL_ERROR)
-    archive_dir = _task_archive_dir(task_id)
-    if restore is None:
-        if not archive_dir.exists():
-            print(f"No archive directory for task_id={task_id}: {archive_dir}")
+    try:
+        if ".." in task_id or "/" in task_id or "\\" in task_id:
+            print("Error: invalid task_id (path traversal not allowed)", file=sys.stderr)
+            raise LoopKitError("Invalid task_id")
+        archive_dir = _task_archive_dir(task_id)
+        if restore is None:
+            if not archive_dir.exists():
+                print(f"No archive directory for task_id={task_id}: {archive_dir}")
+                return
+            files = sorted(path.name for path in archive_dir.glob("*.json") if path.is_file())
+            if not files:
+                print(f"No archived files for task_id={task_id}: {archive_dir}")
+                return
+            print(f"Archive directory: {archive_dir}")
+            for name in files:
+                print(f"  {name}")
             return
-        files = sorted(path.name for path in archive_dir.glob("*.json") if path.is_file())
-        if not files:
-            print(f"No archived files for task_id={task_id}: {archive_dir}")
-            return
-        print(f"Archive directory: {archive_dir}")
-        for name in files:
-            print(f"  {name}")
-        return
 
-    restore_name = restore if restore.endswith(".json") else f"{restore}.json"
-    src = (archive_dir / restore_name).resolve()
-    if not src.is_relative_to(archive_dir.resolve()):
-        print("Error: restore path escapes archive directory", file=sys.stderr)
+        restore_name = restore if restore.endswith(".json") else f"{restore}.json"
+        src = (archive_dir / restore_name).resolve()
+        if not src.is_relative_to(archive_dir.resolve()):
+            print("Error: restore path escapes archive directory", file=sys.stderr)
+            raise LoopKitError("Restore path escapes archive")
+        if not src.exists():
+            print(
+                f"Error: archive file not found for task_id={task_id}: {src}",
+                file=sys.stderr,
+            )
+            raise LoopKitError("Archive file not found")
+        target_name = _restore_target_name_from_archive(src.stem)
+        dest = LOOP_DIR / target_name
+        shutil.copy2(src, dest)
+        print(f"Restored {src.name} -> {dest}")
+    except ValidationError:
+        sys.exit(EXIT_VALIDATION_ERROR)
+    except LoopKitError:
         sys.exit(EXIT_GENERAL_ERROR)
-    if not src.exists():
-        print(
-            f"Error: archive file not found for task_id={task_id}: {src}",
-            file=sys.stderr,
-        )
-        sys.exit(EXIT_GENERAL_ERROR)
-    target_name = _restore_target_name_from_archive(src.stem)
-    dest = LOOP_DIR / target_name
-    shutil.copy2(src, dest)
-    print(f"Restored {src.name} -> {dest}")
 
 
 # ── extract-diff ────────────────────────────────────────────────────
 def cmd_extract_diff(base: str, head: str) -> None:
-    for ref in (base, head):
-        if not _is_valid_ref(ref):
-            print(f"Error: invalid git ref: {ref!r}", file=sys.stderr)
-            sys.exit(EXIT_GENERAL_ERROR)
-    print(_diff(base, head))
+    try:
+        for ref in (base, head):
+            if not _is_valid_ref(ref):
+                print(f"Error: invalid git ref: {ref!r}", file=sys.stderr)
+                raise LoopKitError(f"Invalid git ref: {ref}")
+        print(_diff(base, head))
+    except ValidationError:
+        sys.exit(EXIT_VALIDATION_ERROR)
+    except LoopKitError:
+        sys.exit(EXIT_GENERAL_ERROR)
 
 
 def cmd_heartbeat(role: str, interval: int) -> None:
     role = role.lower().strip()
     if role not in {"worker", "reviewer"}:
         print(f"Error: invalid role: {role}", file=sys.stderr)
-        sys.exit(EXIT_GENERAL_ERROR)
+        raise ValidationError(f"Invalid role: {role}")
     LOOP_DIR.mkdir(exist_ok=True)
     RUNTIME_DIR.mkdir(exist_ok=True)
     hb = _heartbeat_path(role)
@@ -3240,24 +3365,29 @@ def cmd_health(ttl: int) -> None:
 
 # ── main run loop ───────────────────────────────────────────────────
 def _load_task_card(task_path: str) -> tuple[Path, TaskCard, str]:
-    tp = Path(task_path)
-    if not tp.exists():
-        print(f"Error: task card not found: {tp}", file=sys.stderr)
-        sys.exit(EXIT_GENERAL_ERROR)
     try:
-        task_card = json.loads(tp.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as e:
-        print(f"Error: task card at {tp} contains invalid JSON: {e}", file=sys.stderr)
+        tp = Path(task_path)
+        if not tp.exists():
+            print(f"Error: task card not found: {tp}", file=sys.stderr)
+            raise ConfigError(f"Task card not found: {tp}")
+        try:
+            task_card = json.loads(tp.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as e:
+            print(f"Error: task card at {tp} contains invalid JSON: {e}", file=sys.stderr)
+            raise ConfigError(f"Invalid JSON in task card: {e}") from e
+        except OSError as e:
+            print(f"Error: unable to read task card at {tp}: {e}", file=sys.stderr)
+            raise ConfigError(f"Cannot read task card: {e}") from e
+        if not isinstance(task_card, dict):
+            print(f"Error: task card must be a JSON object: {tp}", file=sys.stderr)
+            raise ConfigError("Task card must be a JSON object")
+        task_card_typed = cast(TaskCard, task_card)
+        task_id = cast(str, task_card_typed.get("task_id", "UNKNOWN"))
+        return tp, task_card_typed, task_id
+    except ConfigError:
         sys.exit(EXIT_GENERAL_ERROR)
-    except OSError as e:
-        print(f"Error: unable to read task card at {tp}: {e}", file=sys.stderr)
+    except LoopKitError:
         sys.exit(EXIT_GENERAL_ERROR)
-    if not isinstance(task_card, dict):
-        print(f"Error: task card must be a JSON object: {tp}", file=sys.stderr)
-        sys.exit(EXIT_GENERAL_ERROR)
-    task_card_typed = cast(TaskCard, task_card)
-    task_id = cast(str, task_card_typed.get("task_id", "UNKNOWN"))
-    return tp, task_card_typed, task_id
 
 
 def _sync_task_card_to_bus(task_path: str, round_num: int = 1) -> tuple[TaskCard, str]:
@@ -3353,9 +3483,7 @@ def _normalize_sessions_map(value: object) -> dict[str, dict[str, str]]:
 
 def _clear_sessions(state: dict) -> bool:
     normalized = _normalize_sessions_map(state.get("sessions"))
-    had_meaningful_data = bool(normalized) or (
-        state.get("sessions") is not None and state.get("sessions") != {}
-    )
+    had_meaningful_data = bool(normalized) or (state.get("sessions") is not None and state.get("sessions") != {})
     state["sessions"] = {}
     return had_meaningful_data
 
@@ -3404,9 +3532,7 @@ def _invalidate_sessions_for_dispatch(
 
     state_task_id = state.get("task_id")
     if isinstance(state_task_id, str) and state_task_id and state_task_id != task_id:
-        _log(
-            f"Clearing dispatch sessions: task_id changed (state={state_task_id!r}, current={task_id!r})"
-        )
+        _log(f"Clearing dispatch sessions: task_id changed (state={state_task_id!r}, current={task_id!r})")
         _clear_sessions(state)
         return True
 
@@ -3764,7 +3890,7 @@ def _run_single_round(
         state["outcome"] = "worker_timeout"
         state["error"] = "Worker timed out"
         _save_single_round_state()
-        sys.exit(EXIT_TIMEOUT)
+        raise DispatchError("Worker timed out")
 
     report_error = _validate_report(
         work,
@@ -3867,7 +3993,7 @@ def _run_single_round(
         state["outcome"] = "reviewer_timeout"
         state["error"] = "Reviewer timed out"
         _save_single_round_state()
-        sys.exit(EXIT_TIMEOUT)
+        raise DispatchError("Reviewer timed out")
 
     review_error = _validate_report(
         review,
@@ -4252,7 +4378,7 @@ def _run_multi_round_via_subprocess(
     print(f"\n  MAX ROUNDS ({config.max_rounds}) reached without approval.")
     print(f"  Last review decision: {last_decision}")
     print("  PM should re-evaluate task scope or split the task.")
-    sys.exit(EXIT_GENERAL_ERROR)
+    raise DispatchError("Max rounds exhausted")
 
 
 def cmd_run(
@@ -4262,76 +4388,90 @@ def cmd_run(
     resume: bool = False,
     reset: bool = False,
 ) -> None:
-    lock: _LoopLock | None = None
-    # Single-round subprocesses are spawned by the parent loop which already
-    # holds the lock — skip lock acquisition to avoid self-deadlock.
-    if not single_round:
-        try:
-            lock = _acquire_run_lock()
-        except RuntimeError as e:
-            print(f"Error: {e}", file=sys.stderr)
-            sys.exit(EXIT_LOCK_FAILURE)
     try:
-        if reset and not single_round:
-            _reset_bus()
-            _sync_task_card(config.task_path)
-        elif not single_round:
-            # Still sync task card even without full reset
-            _sync_task_card(config.task_path)
-
+        lock: _LoopLock | None = None
         # Single-round subprocesses are spawned by the parent loop which already
-        # validated the worktree — skip redundant check to avoid duplicate warnings.
+        # holds the lock — skip lock acquisition to avoid self-deadlock.
         if not single_round:
-            _enforce_clean_worktree_or_exit(allow_dirty=config.allow_dirty)
+            try:
+                lock = _acquire_run_lock()
+            except RuntimeError as e:
+                print(f"Error: {e}", file=sys.stderr)
+                raise StateError(str(e)) from e
+        try:
+            if reset and not single_round:
+                _reset_bus()
+                _sync_task_card(config.task_path)
+            elif not single_round:
+                # Still sync task card even without full reset
+                _sync_task_card(config.task_path)
 
-        if resume and single_round:
-            print("Error: --resume cannot be combined with --single-round", file=sys.stderr)
-            sys.exit(EXIT_GENERAL_ERROR)
+            # Single-round subprocesses are spawned by the parent loop which already
+            # validated the worktree — skip redundant check to avoid duplicate warnings.
+            if not single_round:
+                _enforce_clean_worktree_or_exit(allow_dirty=config.allow_dirty)
 
-        if single_round:
-            if round_num is None or round_num < 1:
-                print("Error: --single-round requires --round N (N >= 1)", file=sys.stderr)
-                sys.exit(EXIT_GENERAL_ERROR)
-            _run_single_round(
-                config=config,
-                round_num=round_num,
-                single_round=single_round,
-            )
-            return
+            if resume and single_round:
+                print("Error: --resume cannot be combined with --single-round", file=sys.stderr)
+                raise ValidationError("--resume cannot be combined with --single-round")
 
-        if round_num is not None:
-            print("Error: --round is only valid together with --single-round", file=sys.stderr)
-            sys.exit(EXIT_GENERAL_ERROR)
-
-        resume_state: dict | None = None
-        if resume:
-            resume_state = _load_state()
-            outcome = resume_state.get("outcome")
-            state_name = resume_state.get("state")
-            if state_name == STATE_DONE and outcome == "approved":
-                print(
-                    "Resume not needed: state.json already marked done/approved "
-                    f"for task_id={resume_state.get('task_id')!r}."
+            if single_round:
+                if round_num is None or round_num < 1:
+                    print("Error: --single-round requires --round N (N >= 1)", file=sys.stderr)
+                    raise ValidationError("--single-round requires --round N (N >= 1)")
+                _run_single_round(
+                    config=config,
+                    round_num=round_num,
+                    single_round=single_round,
                 )
                 return
-            if state_name == STATE_DONE and outcome != "approved":
-                error_text = resume_state.get("error") or "<no error details in state.json>"
-                print(
-                    "Error: cannot resume because state.json indicates a failed run: "
-                    f"outcome={outcome!r} error={error_text}",
-                    file=sys.stderr,
-                )
-                print("Re-run without --resume to start a fresh run.", file=sys.stderr)
-                sys.exit(EXIT_VALIDATION_ERROR)
 
-        _run_multi_round_via_subprocess(
-            config=config,
-            worktree_checked=True,
-            resume_from_state=resume_state,
-        )
-    finally:
-        if lock is not None:
-            lock.release()
+            if round_num is not None:
+                print("Error: --round is only valid together with --single-round", file=sys.stderr)
+                raise ValidationError("--round is only valid together with --single-round")
+
+            resume_state: dict | None = None
+            if resume:
+                resume_state = _load_state()
+                outcome = resume_state.get("outcome")
+                state_name = resume_state.get("state")
+                if state_name == STATE_DONE and outcome == "approved":
+                    print(
+                        "Resume not needed: state.json already marked done/approved "
+                        f"for task_id={resume_state.get('task_id')!r}."
+                    )
+                    return
+                if state_name == STATE_DONE and outcome != "approved":
+                    error_text = resume_state.get("error") or "<no error details in state.json>"
+                    print(
+                        "Error: cannot resume because state.json indicates a failed run: "
+                        f"outcome={outcome!r} error={error_text}",
+                        file=sys.stderr,
+                    )
+                    print("Re-run without --resume to start a fresh run.", file=sys.stderr)
+                    raise ValidationError(f"Cannot resume from failed state: {outcome}")
+
+            _run_multi_round_via_subprocess(
+                config=config,
+                worktree_checked=True,
+                resume_from_state=resume_state,
+            )
+        finally:
+            if lock is not None:
+                lock.release()
+    except DirtyWorktreeError:
+        sys.exit(EXIT_DIRTY_WORKTREE)
+    except StateError as e:
+        print(f"Error: state error: {e}", file=sys.stderr)
+        sys.exit(EXIT_LOCK_FAILURE)
+    except DispatchError:
+        sys.exit(EXIT_TIMEOUT)
+    except ValidationError:
+        sys.exit(EXIT_VALIDATION_ERROR)
+    except ConfigError:
+        sys.exit(EXIT_GENERAL_ERROR)
+    except LoopKitError:
+        sys.exit(EXIT_GENERAL_ERROR)
 
 
 # ── CLI ─────────────────────────────────────────────────────────────
@@ -4439,64 +4579,78 @@ def main() -> None:
     if args.cmd is None:
         parser.print_help()
         return
-    _configure_loop_paths(args.loop_dir)
-    if args.cmd == "init":
-        cmd_init()
-    elif args.cmd == "index":
-        cmd_index()
-    elif args.cmd == "status":
-        cmd_status()
-    elif args.cmd == "health":
-        cmd_health(args.ttl)
-    elif args.cmd == "heartbeat":
-        cmd_heartbeat(args.role, args.interval)
-    elif args.cmd == "extract-diff":
-        cmd_extract_diff(args.base, args.head)
-    elif args.cmd == "archive":
-        cmd_archive(args.task_id, args.restore)
-    elif args.cmd == "run":
-        cfg = _load_config()
-        # Resolve task path: --task > positional task_ref > config > default
-        raw_ref = args.task if args.task is not None else args.task_ref
-        task_path = _resolve_task_path(raw_ref) or str(TASK_CARD)
+    try:
+        _configure_loop_paths(args.loop_dir)
+        if args.cmd == "init":
+            cmd_init()
+        elif args.cmd == "index":
+            cmd_index()
+        elif args.cmd == "status":
+            cmd_status()
+        elif args.cmd == "health":
+            cmd_health(args.ttl)
+        elif args.cmd == "heartbeat":
+            cmd_heartbeat(args.role, args.interval)
+        elif args.cmd == "extract-diff":
+            cmd_extract_diff(args.base, args.head)
+        elif args.cmd == "archive":
+            cmd_archive(args.task_id, args.restore)
+        elif args.cmd == "run":
+            cfg = _load_config()
+            # Resolve task path: --task > positional task_ref > config > default
+            raw_ref = args.task if args.task is not None else args.task_ref
+            task_path = _resolve_task_path(raw_ref) or str(TASK_CARD)
 
-        def _cfg_val(cli_val, config_key, builtin_default):
-            """CLI arg > config.json > builtin default."""
-            if cli_val is not None:
-                return cli_val
-            v = cfg.get(config_key)
-            return v if v is not None else builtin_default
+            def _cfg_val(cli_val, config_key, builtin_default):
+                """CLI arg > config.json > builtin default."""
+                if cli_val is not None:
+                    return cli_val
+                v = cfg.get(config_key)
+                return v if v is not None else builtin_default
 
-        config = RunConfig(
-            task_path=task_path,
-            max_rounds=int(_cfg_val(args.max_rounds, "max_rounds", DEFAULT_MAX_ROUNDS)),
-            timeout=int(_cfg_val(args.timeout, "timeout", 0)),
-            require_heartbeat=args.require_heartbeat,
-            heartbeat_ttl=int(_cfg_val(args.heartbeat_ttl, "heartbeat_ttl", DEFAULT_HEARTBEAT_TTL_SEC)),
-            auto_dispatch=_cfg_val(args.auto_dispatch, "auto_dispatch", False),
-            dispatch_backend=str(_cfg_val(args.dispatch_backend, "dispatch_backend", DEFAULT_DISPATCH_BACKEND)),
-            worker_backend=str(_cfg_val(args.worker_backend, "worker_backend", DEFAULT_WORKER_BACKEND)),
-            reviewer_backend=str(_cfg_val(args.reviewer_backend, "reviewer_backend", DEFAULT_REVIEWER_BACKEND)),
-            dispatch_timeout=int(_cfg_val(args.dispatch_timeout, "dispatch_timeout", DEFAULT_DISPATCH_TIMEOUT_SEC)),
-            dispatch_retries=int(_cfg_val(args.dispatch_retries, "dispatch_retries", DEFAULT_DISPATCH_RETRIES)),
-            dispatch_retry_base_sec=int(
-                _cfg_val(args.dispatch_retry_base_sec, "dispatch_retry_base_sec", DEFAULT_DISPATCH_RETRY_BASE_SEC)
-            ),
-            artifact_timeout=int(
-                _cfg_val(args.artifact_timeout, "artifact_timeout", DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC)
-            ),
-            allow_dirty=args.allow_dirty,
-            verbose=args.verbose,
-        )
-        cmd_run(
-            config,
-            single_round=args.single_round,
-            round_num=args.round,
-            resume=args.resume,
-            reset=args.reset,
-        )
-    else:
-        parser.print_help()
+            config = RunConfig(
+                task_path=task_path,
+                max_rounds=int(_cfg_val(args.max_rounds, "max_rounds", DEFAULT_MAX_ROUNDS)),
+                timeout=int(_cfg_val(args.timeout, "timeout", 0)),
+                require_heartbeat=args.require_heartbeat,
+                heartbeat_ttl=int(_cfg_val(args.heartbeat_ttl, "heartbeat_ttl", DEFAULT_HEARTBEAT_TTL_SEC)),
+                auto_dispatch=_cfg_val(args.auto_dispatch, "auto_dispatch", False),
+                dispatch_backend=str(_cfg_val(args.dispatch_backend, "dispatch_backend", DEFAULT_DISPATCH_BACKEND)),
+                worker_backend=str(_cfg_val(args.worker_backend, "worker_backend", DEFAULT_WORKER_BACKEND)),
+                reviewer_backend=str(_cfg_val(args.reviewer_backend, "reviewer_backend", DEFAULT_REVIEWER_BACKEND)),
+                dispatch_timeout=int(_cfg_val(args.dispatch_timeout, "dispatch_timeout", DEFAULT_DISPATCH_TIMEOUT_SEC)),
+                dispatch_retries=int(_cfg_val(args.dispatch_retries, "dispatch_retries", DEFAULT_DISPATCH_RETRIES)),
+                dispatch_retry_base_sec=int(
+                    _cfg_val(args.dispatch_retry_base_sec, "dispatch_retry_base_sec", DEFAULT_DISPATCH_RETRY_BASE_SEC)
+                ),
+                artifact_timeout=int(
+                    _cfg_val(args.artifact_timeout, "artifact_timeout", DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC)
+                ),
+                allow_dirty=args.allow_dirty,
+                verbose=args.verbose,
+            )
+            cmd_run(
+                config,
+                single_round=args.single_round,
+                round_num=args.round,
+                resume=args.resume,
+                reset=args.reset,
+            )
+    except KeyboardInterrupt:
+        sys.exit(EXIT_INTERRUPTED)
+    except DirtyWorktreeError:
+        sys.exit(EXIT_DIRTY_WORKTREE)
+    except StateError as e:
+        print(f"Error: state error: {e}", file=sys.stderr)
+        sys.exit(EXIT_LOCK_FAILURE)
+    except DispatchError:
+        sys.exit(EXIT_TIMEOUT)
+    except ValidationError:
+        sys.exit(EXIT_VALIDATION_ERROR)
+    except ConfigError:
+        sys.exit(EXIT_GENERAL_ERROR)
+    except LoopKitError:
+        sys.exit(EXIT_GENERAL_ERROR)
 
 
 if __name__ == "__main__":

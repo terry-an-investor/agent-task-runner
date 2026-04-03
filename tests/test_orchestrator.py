@@ -1116,7 +1116,9 @@ def test_auto_dispatch_role_only_enables_heartbeat_when_required(monkeypatch) ->
 
     monkeypatch.setattr(orchestrator, "_run_auto_dispatch", fake_run_auto_dispatch)
     monkeypatch.setattr(orchestrator, "_dispatch_with_artifact_fallback", fake_dispatch_with_artifact_fallback)
-    monkeypatch.setattr(orchestrator, "_load_state", lambda: {"state": "idle", "round": 0, "task_id": None, "sessions": {}})
+    monkeypatch.setattr(
+        orchestrator, "_load_state", lambda: {"state": "idle", "round": 0, "task_id": None, "sessions": {}}
+    )
     monkeypatch.setattr(orchestrator, "_save_state", lambda state: None)
 
     config_with_hb = orchestrator.RunConfig(
@@ -3792,7 +3794,7 @@ class TestLoadState:
 
         state = orchestrator._load_state()
 
-        assert state == {"state": "idle", "round": 0, "task_id": None}
+        assert state == {"version": orchestrator.STATE_SCHEMA_VERSION, "state": "idle", "round": 0, "task_id": None}
 
     def test_returns_default_on_read_oserror(self, tmp_path: Path, monkeypatch) -> None:
         _configure_loop_paths(monkeypatch, tmp_path)
@@ -3808,7 +3810,7 @@ class TestLoadState:
 
         state = orchestrator._load_state()
 
-        assert state == {"state": "idle", "round": 0, "task_id": None}
+        assert state == {"version": orchestrator.STATE_SCHEMA_VERSION, "state": "idle", "round": 0, "task_id": None}
 
     def test_recovers_from_backup_when_state_is_corrupted(self, tmp_path: Path, monkeypatch, capsys) -> None:
         _configure_loop_paths(monkeypatch, tmp_path)
@@ -5441,3 +5443,45 @@ class TestKnowledgeLayer:
         )
 
         assert calls == []
+
+
+def test_state_migration_from_version_0_to_1(tmp_path: Path, monkeypatch) -> None:
+    """Test that old state.json without version field is migrated to version 1."""
+    _configure_loop_paths(monkeypatch, tmp_path)
+
+    # Create an old state file (version 0) with only basic fields
+    old_state = {
+        "state": orchestrator.STATE_AWAITING_WORK,
+        "round": 2,
+        "task_id": "T-123",
+        # No version field
+    }
+    orchestrator.STATE_FILE.write_text(json.dumps(old_state), encoding="utf-8")
+
+    # Load state should migrate it
+    loaded_state = orchestrator._load_state()
+
+    # Verify migration
+    assert loaded_state["version"] == orchestrator.STATE_SCHEMA_VERSION
+    assert loaded_state["state"] == old_state["state"]
+    assert loaded_state["round"] == old_state["round"]
+    assert loaded_state["task_id"] == old_state["task_id"]
+
+
+def test_state_migration_adds_missing_core_fields(tmp_path: Path, monkeypatch) -> None:
+    """Test migration adds missing core fields with defaults."""
+    _configure_loop_paths(monkeypatch, tmp_path)
+
+    # Old state with version 0 but missing some core fields
+    old_state = {
+        "state": orchestrator.STATE_DONE,
+        # missing round and task_id
+    }
+    orchestrator.STATE_FILE.write_text(json.dumps(old_state), encoding="utf-8")
+
+    loaded_state = orchestrator._load_state()
+
+    assert loaded_state["version"] == orchestrator.STATE_SCHEMA_VERSION
+    assert loaded_state["state"] == orchestrator.STATE_DONE
+    assert loaded_state["round"] == 0  # default
+    assert loaded_state["task_id"] is None  # default
