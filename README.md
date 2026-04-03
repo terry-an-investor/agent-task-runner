@@ -67,6 +67,23 @@ loop extract-diff BASE HEAD  Print git diff between two commits
 | `--verbose` | off | Stream full backend stdout |
 | `--loop-dir PATH` | .loop | Loop bus directory |
 
+### Configuration files and env vars
+
+`loop run` also reads defaults from `.loop/config.yaml` (preferred) or `.loop/config.json` (backward compatible).
+
+- YAML support is optional and uses `PyYAML` when installed. If `config.yaml` exists but `PyYAML` is unavailable, it is skipped with a warning.
+- Existing `.loop/config.json` files continue to work unchanged.
+
+Environment variable overrides:
+
+- `LOOP_MAX_ROUNDS` -> `RunConfig.max_rounds`
+- `LOOP_DISPATCH_TIMEOUT` -> `RunConfig.dispatch_timeout`
+- `LOOP_BACKEND_PREFERENCE` -> `RunConfig.backend_preference` (comma-separated, e.g. `codex,claude,opencode`)
+
+Resolution order:
+
+`CLI args > environment variables > config file > built-in defaults`
+
 ## File Bus Protocol
 
 All state passes through JSON files in `.loop/`:

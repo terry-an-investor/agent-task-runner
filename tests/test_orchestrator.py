@@ -2353,6 +2353,7 @@ def _configure_loop_paths(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(orchestrator, "REVIEW_REQ", loop_dir / "review_request.json")
     monkeypatch.setattr(orchestrator, "REVIEW_REPORT", loop_dir / "review_report.json")
     monkeypatch.setattr(orchestrator, "LOCK_FILE", loop_dir / "lock")
+    monkeypatch.setattr(orchestrator, "_CONFIG_FILE", loop_dir / "config.json")
     monkeypatch.setattr(orchestrator, "TASK_PACKET", loop_dir / "task_packet.json")
     monkeypatch.setattr(orchestrator, "_HANDOFF_DIR", loop_dir / "handoff")
     monkeypatch.setattr(orchestrator, "_CONTEXT_DIR", loop_dir / "context")
@@ -5032,6 +5033,122 @@ class TestAutoDispatchConfig:
         orchestrator.main()
 
         assert captured["auto_dispatch"] is False
+
+
+class TestConfigLoadingPrecedence:
+    def test_load_config_prefers_yaml_over_json(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        config_json = tmp_path / ".loop" / "config.json"
+        config_yaml = tmp_path / ".loop" / "config.yaml"
+        config_json.write_text('{"max_rounds": 2, "dispatch_timeout": 9}', encoding="utf-8")
+        config_yaml.write_text("max_rounds: 7", encoding="utf-8")
+        monkeypatch.setattr(
+            orchestrator,
+            "_load_config_from_yaml",
+            lambda path: {"max_rounds": 7, "dispatch_timeout": 19} if path == config_yaml else {},
+        )
+
+        loaded = orchestrator._load_config()
+
+        assert loaded["max_rounds"] == 7
+        assert loaded["dispatch_timeout"] == 19
+
+    def test_load_config_falls_back_to_json_when_yaml_returns_empty(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        config_json = tmp_path / ".loop" / "config.json"
+        config_yaml = tmp_path / ".loop" / "config.yaml"
+        config_json.write_text('{"max_rounds": 5, "dispatch_timeout": 21}', encoding="utf-8")
+        config_yaml.write_text("max_rounds:", encoding="utf-8")
+        monkeypatch.setattr(orchestrator, "_load_config_from_yaml", lambda path: {})
+
+        loaded = orchestrator._load_config()
+
+        assert loaded["max_rounds"] == 5
+        assert loaded["dispatch_timeout"] == 21
+
+    def test_main_run_env_overrides_file_values(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        config_path = tmp_path / ".loop" / "config.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "max_rounds": 2,
+                    "dispatch_timeout": 10,
+                    "backend_preference": ["codex"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("LOOP_MAX_ROUNDS", "8")
+        monkeypatch.setenv("LOOP_DISPATCH_TIMEOUT", "27")
+        monkeypatch.setenv("LOOP_BACKEND_PREFERENCE", "claude, opencode")
+
+        captured: dict[str, object] = {}
+
+        def fake_cmd_run(
+            config: orchestrator.RunConfig,
+            single_round: bool,
+            round_num: int | None,
+            resume: bool = False,
+            reset: bool = False,
+        ) -> None:
+            _ = (single_round, round_num, resume, reset)
+            captured["max_rounds"] = config.max_rounds
+            captured["dispatch_timeout"] = config.dispatch_timeout
+            captured["backend_preference"] = config.backend_preference
+
+        monkeypatch.setattr(orchestrator, "cmd_run", fake_cmd_run)
+        monkeypatch.setattr(sys, "argv", ["orchestrator.py", "run", "--loop-dir", ".loop"])
+
+        orchestrator.main()
+
+        assert captured["max_rounds"] == 8
+        assert captured["dispatch_timeout"] == 27
+        assert captured["backend_preference"] == ["claude", "opencode"]
+
+    def test_main_run_cli_overrides_env_values(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        config_path = tmp_path / ".loop" / "config.json"
+        config_path.write_text('{"max_rounds": 2, "dispatch_timeout": 10}', encoding="utf-8")
+        monkeypatch.setenv("LOOP_MAX_ROUNDS", "8")
+        monkeypatch.setenv("LOOP_DISPATCH_TIMEOUT", "27")
+        monkeypatch.setenv("LOOP_BACKEND_PREFERENCE", "claude, opencode")
+
+        captured: dict[str, object] = {}
+
+        def fake_cmd_run(
+            config: orchestrator.RunConfig,
+            single_round: bool,
+            round_num: int | None,
+            resume: bool = False,
+            reset: bool = False,
+        ) -> None:
+            _ = (single_round, round_num, resume, reset)
+            captured["max_rounds"] = config.max_rounds
+            captured["dispatch_timeout"] = config.dispatch_timeout
+            captured["backend_preference"] = config.backend_preference
+
+        monkeypatch.setattr(orchestrator, "cmd_run", fake_cmd_run)
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "orchestrator.py",
+                "run",
+                "--loop-dir",
+                ".loop",
+                "--max-rounds",
+                "11",
+                "--dispatch-timeout",
+                "31",
+            ],
+        )
+
+        orchestrator.main()
+
+        assert captured["max_rounds"] == 11
+        assert captured["dispatch_timeout"] == 31
+        assert captured["backend_preference"] == ["claude", "opencode"]
 
 
 class TestResetDefault:

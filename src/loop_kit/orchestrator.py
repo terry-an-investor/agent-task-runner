@@ -316,6 +316,7 @@ class RunConfig:
     dispatch_backend: str = DEFAULT_DISPATCH_BACKEND
     worker_backend: str = DEFAULT_WORKER_BACKEND
     reviewer_backend: str = DEFAULT_REVIEWER_BACKEND
+    backend_preference: list[str] = field(default_factory=list)
     dispatch_timeout: int = DEFAULT_DISPATCH_TIMEOUT_SEC
     dispatch_retries: int = DEFAULT_DISPATCH_RETRIES
     dispatch_retry_base_sec: int = DEFAULT_DISPATCH_RETRY_BASE_SEC
@@ -3364,7 +3365,12 @@ def _resolve_task_path(task_ref: str | None) -> str | None:
 
 
 def _load_config() -> dict:
-    """Load .loop/config.json defaults (worker_backend, reviewer_backend, etc.)."""
+    """Load .loop/config defaults (config.yaml first, then config.json)."""
+    config_yaml = _CONFIG_FILE.with_name("config.yaml")
+    if config_yaml.is_file():
+        yaml_data = _load_config_from_yaml(config_yaml)
+        if yaml_data:
+            return yaml_data
     if not _CONFIG_FILE.is_file():
         return {}
     try:
@@ -3372,6 +3378,59 @@ def _load_config() -> dict:
         return data if isinstance(data, dict) else {}
     except (json.JSONDecodeError, OSError):
         return {}
+
+
+def _load_config_from_yaml(path: Path) -> dict:
+    try:
+        import yaml
+    except ImportError:
+        _log(f"Warning: {path.name} found but PyYAML is not installed; skipping YAML config.")
+        return {}
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except OSError:
+        return {}
+    except yaml.YAMLError as e:
+        _log(f"Warning: {path.name} has invalid YAML: {e}")
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _normalize_backend_preference(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [part.strip() for part in value.split(",") if part.strip()]
+    if isinstance(value, list):
+        normalized: list[str] = []
+        for item in value:
+            text = str(item).strip()
+            if text:
+                normalized.append(text)
+        return normalized
+    return []
+
+
+def _load_env_config() -> dict:
+    env_cfg: dict[str, object] = {}
+
+    max_rounds_raw = os.getenv("LOOP_MAX_ROUNDS")
+    if max_rounds_raw is not None and max_rounds_raw.strip():
+        try:
+            env_cfg["max_rounds"] = int(max_rounds_raw)
+        except ValueError:
+            _log(f"Warning: ignoring invalid LOOP_MAX_ROUNDS={max_rounds_raw!r}")
+
+    dispatch_timeout_raw = os.getenv("LOOP_DISPATCH_TIMEOUT")
+    if dispatch_timeout_raw is not None and dispatch_timeout_raw.strip():
+        try:
+            env_cfg["dispatch_timeout"] = int(dispatch_timeout_raw)
+        except ValueError:
+            _log(f"Warning: ignoring invalid LOOP_DISPATCH_TIMEOUT={dispatch_timeout_raw!r}")
+
+    backend_pref_raw = os.getenv("LOOP_BACKEND_PREFERENCE")
+    if backend_pref_raw is not None:
+        env_cfg["backend_preference"] = _normalize_backend_preference(backend_pref_raw)
+
+    return env_cfg
 
 
 def _enforce_clean_worktree_or_exit(*, allow_dirty: bool) -> None:
@@ -5314,17 +5373,21 @@ def main() -> None:
         elif args.cmd == "archive":
             cmd_archive(args.task_id, args.restore)
         elif args.cmd == "run":
-            cfg = _load_config()
+            file_cfg = _load_config()
+            env_cfg = _load_env_config()
             # Resolve task path: --task > positional task_ref > config > default
             raw_ref = args.task if args.task is not None else args.task_ref
             task_path = _resolve_task_path(raw_ref) or str(TASK_CARD)
 
             def _cfg_val(cli_val, config_key, builtin_default):
-                """CLI arg > config.json > builtin default."""
+                """CLI arg > env var > config file > builtin default."""
                 if cli_val is not None:
                     return cli_val
-                v = cfg.get(config_key)
-                return v if v is not None else builtin_default
+                env_value = env_cfg.get(config_key)
+                if env_value is not None:
+                    return env_value
+                file_value = file_cfg.get(config_key)
+                return file_value if file_value is not None else builtin_default
 
             config = RunConfig(
                 task_path=task_path,
@@ -5336,6 +5399,7 @@ def main() -> None:
                 dispatch_backend=str(_cfg_val(args.dispatch_backend, "dispatch_backend", DEFAULT_DISPATCH_BACKEND)),
                 worker_backend=str(_cfg_val(args.worker_backend, "worker_backend", DEFAULT_WORKER_BACKEND)),
                 reviewer_backend=str(_cfg_val(args.reviewer_backend, "reviewer_backend", DEFAULT_REVIEWER_BACKEND)),
+                backend_preference=_normalize_backend_preference(_cfg_val(None, "backend_preference", [])),
                 dispatch_timeout=int(_cfg_val(args.dispatch_timeout, "dispatch_timeout", DEFAULT_DISPATCH_TIMEOUT_SEC)),
                 dispatch_retries=int(_cfg_val(args.dispatch_retries, "dispatch_retries", DEFAULT_DISPATCH_RETRIES)),
                 dispatch_retry_base_sec=int(
