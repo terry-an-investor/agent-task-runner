@@ -2135,35 +2135,53 @@ def _join_prompt_sections(sections: list[tuple[str, str]]) -> str:
 
 def _build_prompt_sections(task_id: str, round_num: int) -> list[tuple[str, str]]:
     knowledge_section = _render_knowledge_section()
-    agents_text = _read_text_with_default(
-        ROOT / "AGENTS.md",
-        "agents_md_default.txt",
-    )
     role_text = _read_text_with_default(
         ROOT / "docs" / "roles" / "code-writer.md",
         "code_writer_md_default.txt",
     )
-    orchestrator_path = ROOT / "src" / "loop_kit" / "orchestrator.py"
-    task_card = _read_json_if_exists(TASK_CARD)
-    task_card_section = _render_task_card_section(task_card if isinstance(task_card, dict) else {})
-    prior_context_section = _render_prior_round_context_section(round_num)
     task_packet_section = _render_task_packet_section()
 
-    sections: list[tuple[str, str]] = [
-        ("=== BEGIN AGENTS.md ===", f"{agents_text}\n=== END AGENTS.md ==="),
-        ("=== BEGIN docs/roles/code-writer.md ===", f"{role_text}\n=== END docs/roles/code-writer.md ==="),
-        (
-            "=== BEGIN FUNCTION INDEX: " + _display_path(orchestrator_path) + " ===",
-            f"{_function_index(orchestrator_path)}\n=== END FUNCTION INDEX ===",
-        ),
-        ("=== KNOWLEDGE ===", knowledge_section),
-        ("=== TASK PACKET ===", task_packet_section),
-    ]
-    if task_card_section and task_card_section != "- <none>":
-        sections.append(("=== TASK CARD ===", task_card_section))
-    if prior_context_section:
-        lines = prior_context_section.split("\n", 1)
-        sections.append((lines[0], lines[1] if len(lines) > 1 else ""))
+    sections: list[tuple[str, str]] = []
+
+    if round_num == 1:
+        agents_text = _read_text_with_default(
+            ROOT / "AGENTS.md",
+            "agents_md_default.txt",
+        )
+        orchestrator_path = ROOT / "src" / "loop_kit" / "orchestrator.py"
+        task_card = _read_json_if_exists(TASK_CARD)
+        task_card_section = _render_task_card_section(task_card if isinstance(task_card, dict) else {})
+        prior_context_section = _render_prior_round_context_section(round_num)
+
+        sections = [
+            ("=== BEGIN AGENTS.md ===", f"{agents_text}\n=== END AGENTS.md ==="),
+            ("=== BEGIN docs/roles/code-writer.md ===", f"{role_text}\n=== END docs/roles/code-writer.md ==="),
+            (
+                "=== BEGIN FUNCTION INDEX: " + _display_path(orchestrator_path) + " ===",
+                f"{_function_index(orchestrator_path)}\n=== END FUNCTION INDEX ===",
+            ),
+            ("=== KNOWLEDGE ===", knowledge_section),
+            ("=== TASK PACKET ===", task_packet_section),
+        ]
+        if task_card_section and task_card_section != "- <none>":
+            sections.append(("=== TASK CARD ===", task_card_section))
+        if prior_context_section:
+            lines = prior_context_section.split("\n", 1)
+            sections.append((lines[0], lines[1] if len(lines) > 1 else ""))
+    else:
+        fix_list_section = _render_fix_list_section(round_num)
+        prior_context_section = _render_prior_round_context_section(round_num)
+
+        sections = [
+            ("=== BEGIN docs/roles/code-writer.md ===", f"{role_text}\n=== END docs/roles/code-writer.md ==="),
+            ("=== KNOWLEDGE ===", knowledge_section),
+            ("=== TASK PACKET ===", task_packet_section),
+            (f"=== FIX LIST (round {round_num}) ===", f"fixes:\n{fix_list_section}"),
+        ]
+        if prior_context_section:
+            lines = prior_context_section.split("\n", 1)
+            sections.append((lines[0], lines[1] if len(lines) > 1 else ""))
+
     return sections
 
 
@@ -2205,31 +2223,11 @@ def _worker_prompt(task_id: str, round_num: int) -> str:
         f"Current task_id: {task_id}, round: {round_num}.\n"
         f"Execute the contract below and only finish after writing {_display_path(WORK_REPORT)}."
     )
-    if round_num > 1:
-        role_text = _read_text_with_default(
-            ROOT / "docs" / "roles" / "code-writer.md",
-            "code_writer_md_default.txt",
-        )
-        fix_list_section = _render_fix_list_section(round_num)
-        prior_context = _render_prior_round_context_section(round_num)
-        knowledge_section = _render_knowledge_section()
-        task_packet_section = _render_task_packet_section()
-        sections: list[tuple[str, str]] = [
-            ("=== BEGIN docs/roles/code-writer.md ===", f"{role_text}\n=== END docs/roles/code-writer.md ==="),
-            ("=== KNOWLEDGE ===", knowledge_section),
-            ("=== TASK PACKET ===", task_packet_section),
-            (f"=== FIX LIST (round {round_num}) ===", f"fixes:\n{fix_list_section}"),
-        ]
-        if prior_context:
-            lines = prior_context.split("\n", 1)
-            sections.append((lines[0], lines[1] if len(lines) > 1 else ""))
-        result = header + "\n\n" + _join_prompt_sections(sections)
-        if not prior_context:
-            result += "\n\n"
-        return result
-
     sections = _build_prompt_sections(task_id, round_num)
-    return header + "\n\n" + _join_prompt_sections(sections)
+    result = header + "\n\n" + _join_prompt_sections(sections)
+    if round_num > 1 and not _render_prior_round_context_section(round_num):
+        result += "\n\n"
+    return result
 
 
 def _reviewer_prompt(task_id: str, round_num: int) -> str:
