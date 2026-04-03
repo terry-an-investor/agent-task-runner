@@ -4,7 +4,7 @@
 
 **You describe the task. AI writes the code. AI reviews the code. Repeat until it's right.**
 
-Most AI coding tools stop after generating code. Loop Kit closes the loop — a Worker AI writes the implementation, a Reviewer AI checks it against your acceptance criteria, and the system iterates automatically until the code passes or you step in.
+Most AI coding tools stop after generating code. Loop Kit closes the loop — a PM agent coordinates a Worker AI that writes code and a Reviewer AI that validates it, iterating automatically until the code passes or you step in.
 
 ## The Problem
 
@@ -13,7 +13,7 @@ AI coding assistants are great at writing code, but someone still has to review 
 ## The Solution
 
 ```
-You write a task card → AI writes → AI reviews → AI fixes → ... → ✅ Approved
+You describe the goal → PM agent creates the task card → Worker writes → Reviewer validates → ... → ✅ Approved
 ```
 
 | What | Before | With Loop Kit |
@@ -47,7 +47,7 @@ loop run --task .loop/task_card.json --auto-dispatch --worker-backend codex --re
 
 **Prerequisites:** Python >= 3.11, Git repo, at least one AI backend ([codex](https://github.com/openai/codex), [claude](https://docs.anthropic.com/en/docs/claude-code), or [opencode](https://opencode.ai)).
 
-**The only thing you write is the task card:**
+**Your only job is to define the goal — the PM agent generates the task card for you:**
 
 ```json
 {
