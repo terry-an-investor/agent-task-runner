@@ -239,6 +239,33 @@ PATTERN_STALE_DAYS = 30
 PATTERN_HIGH_CONFIDENCE = 0.7
 _KNOWLEDGE_MAX_PATTERNS = 200
 _KNOWLEDGE_MAX_PITFALL_LINES = 50
+_KNOWLEDGE_RETRIEVAL_FACT_CAP = 4
+_KNOWLEDGE_RETRIEVAL_PITFALL_CAP = 4
+_KNOWLEDGE_RETRIEVAL_PATTERN_CAP = 4
+_KNOWLEDGE_RETRIEVAL_MIN_SCORE = 1
+_KNOWLEDGE_RETRIEVAL_FALLBACK_CAP = 1
+_KNOWLEDGE_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "for",
+    "from",
+    "in",
+    "is",
+    "it",
+    "of",
+    "on",
+    "or",
+    "that",
+    "the",
+    "to",
+    "with",
+}
 _FEED_TASK_ID: str | None = None
 _FEED_ROUND: int | None = None
 _LOGS_DIR_ENSURED = False
@@ -2714,6 +2741,127 @@ def _read_markdown_knowledge_lines(path: Path) -> list[str]:
     return [entry["text"] for entry in entries]
 
 
+def _knowledge_tokens(text: object) -> set[str]:
+    if not isinstance(text, str):
+        return set()
+    normalized = re.sub(r"[^a-z0-9]+", " ", text.lower())
+    return {
+        token
+        for token in normalized.split()
+        if len(token) > 1 and token not in _KNOWLEDGE_STOPWORDS
+    }
+
+
+def _knowledge_score(text: object, query_tokens: set[str]) -> int:
+    if not query_tokens:
+        return 0
+    return len(_knowledge_tokens(text) & query_tokens)
+
+
+def _iter_task_card_query_fragments(task_card: TaskCard | None) -> list[str]:
+    if not isinstance(task_card, dict):
+        return []
+    fragments: list[str] = []
+    for key in ("title", "goal", "in_scope", "out_of_scope", "acceptance_criteria", "constraints"):
+        value = task_card.get(key)
+        if isinstance(value, str) and value.strip():
+            fragments.append(value.strip())
+            continue
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, str) and item.strip():
+                    fragments.append(item.strip())
+    for dep_key in _DEPENDENCY_FIELDS:
+        deps = task_card.get(dep_key)
+        if not isinstance(deps, list):
+            continue
+        for item in deps:
+            if isinstance(item, str) and item.strip():
+                fragments.append(item.strip())
+    return fragments
+
+
+def _iter_fix_list_query_fragments(round_num: int) -> list[str]:
+    if round_num <= 1:
+        return []
+    fix_data = _read_json_if_exists(FIX_LIST)
+    if not isinstance(fix_data, dict):
+        return []
+    fixes = fix_data.get("fixes")
+    if not isinstance(fixes, list):
+        return []
+    fragments: list[str] = []
+    for issue in fixes:
+        if not isinstance(issue, dict):
+            continue
+        for key in ("severity", "file", "reason", "required_change", "category", "id"):
+            value = issue.get(key)
+            if isinstance(value, str) and value.strip():
+                fragments.append(value.strip())
+    return fragments
+
+
+def _knowledge_query_tokens(task_id: str, round_num: int, task_card: TaskCard | None) -> set[str]:
+    query_fragments = [task_id]
+    query_fragments.extend(_iter_task_card_query_fragments(task_card))
+    query_fragments.extend(_iter_fix_list_query_fragments(round_num))
+    query_tokens: set[str] = set()
+    for fragment in query_fragments:
+        query_tokens.update(_knowledge_tokens(fragment))
+    return query_tokens
+
+
+def _select_ranked_text_knowledge(
+    entries: list[str],
+    *,
+    query_tokens: set[str],
+    cap: int,
+) -> list[str]:
+    if cap < 1:
+        return []
+    ranked: list[tuple[int, int, str]] = []
+    for index, value in enumerate(entries):
+        line = value.strip()
+        if not line:
+            continue
+        ranked.append((_knowledge_score(line, query_tokens), index, line))
+    if not ranked:
+        return []
+    matches = [item for item in ranked if item[0] >= _KNOWLEDGE_RETRIEVAL_MIN_SCORE]
+    if matches:
+        matches.sort(key=lambda item: (-item[0], item[1], item[2]))
+        return [line for _, _, line in matches[:cap]]
+    fallback_cap = min(cap, max(1, _KNOWLEDGE_RETRIEVAL_FALLBACK_CAP))
+    return [line for _, _, line in ranked[:fallback_cap]]
+
+
+def _select_ranked_patterns(
+    entries: list[dict],
+    *,
+    query_tokens: set[str],
+    cap: int,
+) -> list[str]:
+    if cap < 1:
+        return []
+    ranked: list[tuple[int, float, int, str]] = []
+    for index, entry in enumerate(entries):
+        confidence = _coerce_confidence(entry.get("confidence"), default=0.0)
+        if confidence < PATTERN_HIGH_CONFIDENCE:
+            continue
+        line = _format_pattern_prompt_line(entry)
+        searchable_text = f"{entry.get('category', '')} {entry.get('pattern', '')}"
+        ranked.append((_knowledge_score(searchable_text, query_tokens), confidence, index, line))
+    if not ranked:
+        return []
+    matches = [item for item in ranked if item[0] >= _KNOWLEDGE_RETRIEVAL_MIN_SCORE]
+    if matches:
+        matches.sort(key=lambda item: (-item[0], -item[1], item[2], item[3]))
+        return [line for _, _, _, line in matches[:cap]]
+    fallback_cap = min(cap, max(1, _KNOWLEDGE_RETRIEVAL_FALLBACK_CAP))
+    ranked.sort(key=lambda item: (-item[1], item[2], item[3]))
+    return [line for _, _, _, line in ranked[:fallback_cap]]
+
+
 def _parse_utc_iso8601(value: object) -> datetime | None:
     if not isinstance(value, str):
         return None
@@ -3314,26 +3462,37 @@ def _format_pattern_prompt_line(entry: dict) -> str:
     return f"[{confidence:.2f}] ({category}) {pattern} (verified {last_verified})"
 
 
-def _render_knowledge_section() -> str:
+def _render_knowledge_section(task_id: str, round_num: int, task_card: TaskCard | None) -> str:
     project_fact_entries = _load_project_facts()
     pitfall_entries = _load_pitfalls()
     project_facts = [entry["fact"] for entry in project_fact_entries]
     active_pitfalls = [entry["pitfall"] for entry in pitfall_entries]
     patterns, _ = _load_patterns_with_governance(persist=False)
-    high_conf_patterns = [
-        _format_pattern_prompt_line(entry)
-        for entry in patterns
-        if _coerce_confidence(entry.get("confidence"), default=0.0) >= PATTERN_HIGH_CONFIDENCE
-    ]
-    if not project_facts and not active_pitfalls and not high_conf_patterns:
+    query_tokens = _knowledge_query_tokens(task_id, round_num, task_card)
+    selected_facts = _select_ranked_text_knowledge(
+        project_facts,
+        query_tokens=query_tokens,
+        cap=_KNOWLEDGE_RETRIEVAL_FACT_CAP,
+    )
+    selected_pitfalls = _select_ranked_text_knowledge(
+        active_pitfalls,
+        query_tokens=query_tokens,
+        cap=_KNOWLEDGE_RETRIEVAL_PITFALL_CAP,
+    )
+    selected_patterns = _select_ranked_patterns(
+        patterns,
+        query_tokens=query_tokens,
+        cap=_KNOWLEDGE_RETRIEVAL_PATTERN_CAP,
+    )
+    if not selected_facts and not selected_pitfalls and not selected_patterns:
         return "- <none>"
     return (
         "project_facts:\n"
-        f"{_as_prompt_list(project_facts)}\n\n"
+        f"{_as_prompt_list(selected_facts)}\n\n"
         "active_pitfalls:\n"
-        f"{_as_prompt_list(active_pitfalls)}\n\n"
+        f"{_as_prompt_list(selected_pitfalls)}\n\n"
         "high_confidence_patterns:\n"
-        f"{_as_prompt_list(high_conf_patterns)}"
+        f"{_as_prompt_list(selected_patterns)}"
     )
 
 
@@ -3874,7 +4033,6 @@ def _join_prompt_sections(sections: list[tuple[str, str]]) -> str:
 
 
 def _build_prompt_sections(task_id: str, round_num: int) -> list[tuple[str, str]]:
-    knowledge_section = _render_knowledge_section()
     role_text = _read_text_with_default(
         ROOT / "docs" / "roles" / "code-writer.md",
         "code_writer_md_default.txt",
@@ -3882,6 +4040,7 @@ def _build_prompt_sections(task_id: str, round_num: int) -> list[tuple[str, str]
     task_packet_section = _render_task_packet_section()
     task_card_data = _read_json_if_exists(TASK_CARD)
     task_card = cast(TaskCard, task_card_data) if isinstance(task_card_data, dict) else cast(TaskCard, {})
+    knowledge_section = _render_knowledge_section(task_id, round_num, task_card)
     handoff_section = _render_handoff_context_section(task_id, round_num)
 
     sections: list[tuple[str, str]] = []
@@ -3960,7 +4119,7 @@ def _worker_prompt(task_id: str, round_num: int, paths: LoopPaths | None = None)
             else "- warm session path; quickstart context is intentionally omitted"
         )
         handoff_section = _render_handoff_context_section(task_id, round_num, paths=resolved_paths)
-        knowledge_section = _render_knowledge_section()
+        knowledge_section = _render_knowledge_section(task_id, round_num, task_card)
         task_packet_section = _render_task_packet_section()
         context = {
             "task_id": task_id,

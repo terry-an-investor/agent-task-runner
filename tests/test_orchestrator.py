@@ -7623,6 +7623,214 @@ class TestKnowledgeLayer:
         assert "=== KNOWLEDGE ===" in prompt
         assert "=== KNOWLEDGE ===\n- <none>" in prompt
 
+    def test_render_knowledge_section_orders_keyword_matches_and_enforces_caps(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        monkeypatch.setattr(orchestrator, "_KNOWLEDGE_RETRIEVAL_FACT_CAP", 2)
+        monkeypatch.setattr(orchestrator, "_KNOWLEDGE_RETRIEVAL_PITFALL_CAP", 2)
+        monkeypatch.setattr(orchestrator, "_KNOWLEDGE_RETRIEVAL_PATTERN_CAP", 2)
+        monkeypatch.setattr(orchestrator, "_KNOWLEDGE_RETRIEVAL_MIN_SCORE", 1)
+        monkeypatch.setattr(orchestrator, "_KNOWLEDGE_RETRIEVAL_FALLBACK_CAP", 1)
+
+        context_dir = tmp_path / ".loop" / "context"
+        context_dir.mkdir(parents=True, exist_ok=True)
+        (context_dir / "project_facts.md").write_text(
+            "\n".join(
+                [
+                    "# facts",
+                    "- keyword retrieval for prompt rendering",
+                    "- keyword retrieval keeps prompts concise",
+                    "- unrelated filesystem lock tip",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        (context_dir / "pitfalls.md").write_text(
+            "\n".join(
+                [
+                    "# pitfalls",
+                    "- prompt rendering can bloat when all context is injected",
+                    "- stale lock files can break retries",
+                    "- unrelated pitfall entry",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        now_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        (context_dir / "patterns.jsonl").write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "pattern": "keyword retrieval before prompt rendering",
+                            "category": "prompt",
+                            "confidence": 0.95,
+                            "last_verified": now_iso,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    json.dumps(
+                        {
+                            "pattern": "keyword retrieval when scoring facts",
+                            "category": "prompt",
+                            "confidence": 0.8,
+                            "last_verified": now_iso,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    json.dumps(
+                        {
+                            "pattern": "run tests before commit",
+                            "category": "workflow",
+                            "confidence": 0.99,
+                            "last_verified": now_iso,
+                        },
+                        ensure_ascii=False,
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        section = orchestrator._render_knowledge_section(
+            "T-724",
+            1,
+            {
+                "goal": "Reduce prompt bloat with keyword retrieval for prompt rendering",
+                "acceptance_criteria": ["keyword-based scoring for facts and pitfalls"],
+            },
+        )
+
+        assert "keyword retrieval for prompt rendering" in section
+        assert "keyword retrieval keeps prompts concise" in section
+        assert section.find("keyword retrieval for prompt rendering") < section.find(
+            "keyword retrieval keeps prompts concise"
+        )
+        assert "unrelated filesystem lock tip" not in section
+        assert "unrelated pitfall entry" not in section
+        assert "keyword retrieval before prompt rendering" in section
+        assert "keyword retrieval when scoring facts" in section
+        assert "run tests before commit" not in section
+
+    def test_render_knowledge_section_no_match_falls_back_to_minimal_safe_context(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        monkeypatch.setattr(orchestrator, "_KNOWLEDGE_RETRIEVAL_FACT_CAP", 3)
+        monkeypatch.setattr(orchestrator, "_KNOWLEDGE_RETRIEVAL_PITFALL_CAP", 3)
+        monkeypatch.setattr(orchestrator, "_KNOWLEDGE_RETRIEVAL_PATTERN_CAP", 3)
+        monkeypatch.setattr(orchestrator, "_KNOWLEDGE_RETRIEVAL_MIN_SCORE", 1)
+        monkeypatch.setattr(orchestrator, "_KNOWLEDGE_RETRIEVAL_FALLBACK_CAP", 1)
+
+        context_dir = tmp_path / ".loop" / "context"
+        context_dir.mkdir(parents=True, exist_ok=True)
+        (context_dir / "project_facts.md").write_text(
+            "# facts\n- delta baseline fact\n- epsilon backup fact\n",
+            encoding="utf-8",
+        )
+        (context_dir / "pitfalls.md").write_text(
+            "# pitfalls\n- zeta fallback pitfall\n- eta backup pitfall\n",
+            encoding="utf-8",
+        )
+        now_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        (context_dir / "patterns.jsonl").write_text(
+            json.dumps(
+                {
+                    "pattern": "theta low pattern",
+                    "category": "fallback",
+                    "confidence": 0.8,
+                    "last_verified": now_iso,
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "pattern": "omicron high pattern",
+                    "category": "fallback",
+                    "confidence": 0.95,
+                    "last_verified": now_iso,
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        section = orchestrator._render_knowledge_section(
+            "T-999",
+            1,
+            {
+                "goal": "alpha beta gamma",
+                "acceptance_criteria": ["iota kappa lambda"],
+            },
+        )
+        facts_block = section.split("project_facts:\n", 1)[1].split("\n\nactive_pitfalls:\n", 1)[0]
+        pitfalls_block = section.split("active_pitfalls:\n", 1)[1].split("\n\nhigh_confidence_patterns:\n", 1)[0]
+        patterns_block = section.split("high_confidence_patterns:\n", 1)[1]
+
+        assert len([line for line in facts_block.splitlines() if line.startswith("- ")]) == 1
+        assert len([line for line in pitfalls_block.splitlines() if line.startswith("- ")]) == 1
+        assert len([line for line in patterns_block.splitlines() if line.startswith("- ")]) == 1
+        assert "delta baseline fact" in section
+        assert "zeta fallback pitfall" in section
+        assert "omicron high pattern" in section
+        assert "theta low pattern" not in section
+
+    def test_render_knowledge_section_caps_reduce_prompt_payload_when_matches_are_many(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        monkeypatch.setattr(orchestrator, "_KNOWLEDGE_RETRIEVAL_FACT_CAP", 2)
+        monkeypatch.setattr(orchestrator, "_KNOWLEDGE_RETRIEVAL_PITFALL_CAP", 2)
+        monkeypatch.setattr(orchestrator, "_KNOWLEDGE_RETRIEVAL_PATTERN_CAP", 2)
+        monkeypatch.setattr(orchestrator, "_KNOWLEDGE_RETRIEVAL_MIN_SCORE", 1)
+        monkeypatch.setattr(orchestrator, "_KNOWLEDGE_RETRIEVAL_FALLBACK_CAP", 1)
+
+        context_dir = tmp_path / ".loop" / "context"
+        context_dir.mkdir(parents=True, exist_ok=True)
+        facts = [f"- dispatch workflow fact {i}" for i in range(1, 6)]
+        pitfalls = [f"- dispatch workflow pitfall {i}" for i in range(1, 6)]
+        (context_dir / "project_facts.md").write_text("# facts\n" + "\n".join(facts) + "\n", encoding="utf-8")
+        (context_dir / "pitfalls.md").write_text("# pitfalls\n" + "\n".join(pitfalls) + "\n", encoding="utf-8")
+        now_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        pattern_lines = [
+            json.dumps(
+                {
+                    "pattern": f"dispatch workflow pattern {i}",
+                    "category": "workflow",
+                    "confidence": 0.9,
+                    "last_verified": now_iso,
+                },
+                ensure_ascii=False,
+            )
+            for i in range(1, 6)
+        ]
+        (context_dir / "patterns.jsonl").write_text("\n".join(pattern_lines) + "\n", encoding="utf-8")
+
+        section = orchestrator._render_knowledge_section(
+            "T-725",
+            1,
+            {
+                "goal": "optimize dispatch workflow prompts",
+                "acceptance_criteria": ["dispatch workflow knowledge retrieval"],
+            },
+        )
+        facts_block = section.split("project_facts:\n", 1)[1].split("\n\nactive_pitfalls:\n", 1)[0]
+        pitfalls_block = section.split("active_pitfalls:\n", 1)[1].split("\n\nhigh_confidence_patterns:\n", 1)[0]
+        patterns_block = section.split("high_confidence_patterns:\n", 1)[1]
+
+        assert len([line for line in facts_block.splitlines() if line.startswith("- ")]) == 2
+        assert len([line for line in pitfalls_block.splitlines() if line.startswith("- ")]) == 2
+        assert len([line for line in patterns_block.splitlines() if line.startswith("- ")]) == 2
+        assert "dispatch workflow fact 5" not in section
+        assert "dispatch workflow pitfall 5" not in section
+        assert "dispatch workflow pattern 5" not in section
+
     def test_patterns_staleness_governance_sets_confidence_zero(self, tmp_path: Path, monkeypatch) -> None:
         _configure_loop_paths(monkeypatch, tmp_path)
         context_dir = tmp_path / ".loop" / "context"

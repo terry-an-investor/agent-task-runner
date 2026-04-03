@@ -188,6 +188,25 @@ The worker first reads project `AGENTS.md` and `docs/roles/code-writer.md`, and 
 If any of those files are missing, agent-task-runner falls back to built-in defaults in `src/loop_kit/defaults/`.
 Project files always override built-in defaults when present.
 
+### Knowledge retrieval in prompts
+
+Worker prompt rendering does deterministic retrieval instead of injecting all context lines:
+
+- Query terms are built from `task_id`, task card fields (`goal`, `in_scope`, `out_of_scope`, `acceptance_criteria`, `constraints`, dependencies), and fix-list issue fields on rounds `> 1`.
+- Facts/pitfalls/patterns are keyword-scored by token overlap and sorted deterministically.
+- Patterns keep the existing confidence gate (`confidence >= PATTERN_HIGH_CONFIDENCE`) before retrieval ranking.
+- Each section is capped to top-k entries, which reduces prompt bloat on large knowledge files.
+- If no entry matches, rendering falls back to a minimal safe subset (single fallback entry per non-empty section) instead of injecting the full context.
+- If context files are missing or empty, the knowledge block remains `- <none>`.
+
+Current tuning knobs in `src/loop_kit/orchestrator.py`:
+
+- `_KNOWLEDGE_RETRIEVAL_FACT_CAP` (default `4`)
+- `_KNOWLEDGE_RETRIEVAL_PITFALL_CAP` (default `4`)
+- `_KNOWLEDGE_RETRIEVAL_PATTERN_CAP` (default `4`)
+- `_KNOWLEDGE_RETRIEVAL_MIN_SCORE` (default `1`)
+- `_KNOWLEDGE_RETRIEVAL_FALLBACK_CAP` (default `1`)
+
 ### Quickstart vs Handoff vs Warm Resume
 
 - **Quickstart context**: injected for cold task starts (round 1) with stable project constraints and execution contract.
