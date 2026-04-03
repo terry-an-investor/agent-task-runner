@@ -1,19 +1,44 @@
-# AI Code Review Orchestrator | agent-task-runner
+# Loop Kit — Let AI Write Code, Then Review Itself
 
 [![ci](../../actions/workflows/loop-ci.yml/badge.svg)](../../actions/workflows/loop-ci.yml)
 
-**AI-driven automated code review and development workflow orchestration**
+**You describe the task. AI writes the code. AI reviews the code. Repeat until it's right.**
 
-agent-task-runner automates the complete development loop: a **Worker AI writes code**, a **Reviewer AI validates it**, and the system iterates automatically until approval or max rounds reached. Built for teams using AI coding assistants (OpenAI Codex, Anthropic Claude, OpenCode) who want structured, auditable, and efficient code review processes.
+Most AI coding tools stop after generating code. Loop Kit closes the loop — a **Worker AI** writes the implementation, a **Reviewer AI** checks it against your acceptance criteria, and the system iterates automatically until the code passes or you step in. No more copy-pasting AI output and reviewing it yourself.
 
-## ✨ Why Use This?
+## The Problem
 
-- **Automated code review cycles** - No manual back-and-forth between writing and reviewing
-- **Multi-round iteration** - Systematically handles "changes required" feedback
-- **Smart context management** - Retrieves relevant project facts, patterns, and pitfalls per task
-- **Full observability** - Track latency metrics, round history, and decision trails
-- **Extensible by design** - Plug in any AI backend via `register_backend()` without core changes
-- **Git-integrated** - Uses commits as source of truth, works with existing workflows
+AI coding assistants are great at writing code, but someone still has to:
+
+- Review the output for correctness and quality
+- Catch missed edge cases and style violations
+- Iterate on feedback until it's actually done
+
+That "someone" is usually **you** — which defeats the point of using AI in the first place.
+
+## The Solution
+
+```
+You write a task card → AI writes → AI reviews → AI fixes → ... → ✅ Approved
+```
+
+Loop Kit orchestrates the entire cycle:
+
+| What | Before | With Loop Kit |
+|------|--------|---------------|
+| Writing code | Manual or AI-assisted | Worker AI, scoped to your task |
+| Reviewing | You, or a teammate | Reviewer AI, against your criteria |
+| Iterating | Back-and-forth PR comments | Automatic, until approved or max rounds |
+| Tracking | Scattered across PRs & chats | Structured state, full audit trail |
+
+## ✨ Why Teams Use Loop Kit
+
+- **Ship faster** — Eliminate the manual review bottleneck between AI-generated code and your codebase
+- **Consistent quality** — Reviewer AI enforces your standards every time, no fatigue, no shortcuts
+- **Full audit trail** — Every round, every decision, every diff is logged. Know exactly what changed and why
+- **Works with your tools** — Plug in Codex, Claude, or OpenCode. Git-native, no new workflows to learn
+- **Scales with complexity** — Multi-lane execution for large changes, dependency-aware task graphs
+- **Zero lock-in** — Open source, extensible backend registry, your data stays in your repo
 
 ## Quick Start
 
