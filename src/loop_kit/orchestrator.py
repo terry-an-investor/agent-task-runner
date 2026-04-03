@@ -207,6 +207,8 @@ MAX_DISPATCH_RETRY_DELAY_SEC = 60
 DEFAULT_GIT_TIMEOUT_SEC = 30
 MAX_JSON_PAYLOAD_BYTES = 5 * 1024 * 1024
 _STALE_STATE_KEYS = ("outcome", "failed_at", "error", "head_sha", "round_details")
+_LANE_WORKTREES_DIRNAME = "worktrees"
+_LANE_WORKTREE_BRANCH_PREFIX = "loop"
 FEED_DISPATCH_START = "dispatch_start"
 FEED_DISPATCH_COMPLETE = "dispatch_complete"
 FEED_DISPATCH_FAIL = "dispatch_fail"
@@ -315,6 +317,15 @@ class LoopPaths:
     summary: Path
     logs: Path
     archive: Path
+
+
+@dataclass(frozen=True, slots=True)
+class LaneWorktreeHandle:
+    task_id: str
+    round_num: int
+    lane_id: str
+    path: Path
+    branch: str
 
 
 # Backward compatibility bridge while path globals are migrated function-by-function.
@@ -4639,10 +4650,63 @@ def _apply_state_transition(
 
 
 # ── git helpers ─────────────────────────────────────────────────────
-def _git(*args: str, timeout: float | None = DEFAULT_GIT_TIMEOUT_SEC) -> str:
+def _safe_git_component(value: str, *, fallback_prefix: str) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip())
+    normalized = normalized.strip("./-_")
+    if normalized:
+        return normalized
+    digest = hashlib.sha1(value.encode("utf-8")).hexdigest()[:8]
+    return f"{fallback_prefix}-{digest}"
+
+
+def _lane_task_component(task_id: str) -> str:
+    try:
+        return _validate_task_id_arg(task_id)
+    except ValidationError:
+        normalized = _safe_git_component(task_id, fallback_prefix="task")
+        _log(f"Lane worktree task path normalized for invalid task_id {task_id!r}: {normalized!r}")
+        return normalized
+
+
+def _lane_worktrees_task_dir(task_id: str, *, paths: LoopPaths | None = None) -> Path:
+    resolved_paths = _resolve_paths(paths)
+    return resolved_paths.dir / _LANE_WORKTREES_DIRNAME / _lane_task_component(task_id)
+
+
+def _lane_worktrees_round_dir(task_id: str, round_num: int, *, paths: LoopPaths | None = None) -> Path:
+    if not isinstance(round_num, int) or round_num < 1:
+        raise ValidationError(f"round_num must be int >= 1, got {round_num!r}")
+    return _lane_worktrees_task_dir(task_id, paths=paths) / str(round_num)
+
+
+def _lane_worktree_branch_name(task_id: str, round_num: int, lane_id: str) -> str:
+    if not isinstance(round_num, int) or round_num < 1:
+        raise ValidationError(f"round_num must be int >= 1, got {round_num!r}")
+    task_component = _safe_git_component(task_id, fallback_prefix="task")
+    lane_component = _safe_git_component(lane_id, fallback_prefix="lane")
+    return f"{_LANE_WORKTREE_BRANCH_PREFIX}/{task_component}/r{round_num}/{lane_component}"
+
+
+def _task_lane_ids(task_card: TaskCard) -> list[str]:
+    lanes_raw = task_card.get("lanes")
+    if not isinstance(lanes_raw, list):
+        return []
+    lane_ids: list[str] = []
+    for lane in lanes_raw:
+        if not isinstance(lane, dict):
+            continue
+        lane_id_raw = lane.get("lane_id")
+        if isinstance(lane_id_raw, str):
+            lane_id = lane_id_raw.strip()
+            if lane_id:
+                lane_ids.append(lane_id)
+    return lane_ids
+
+
+def _git_at(cwd: Path, *args: str, timeout: float | None = DEFAULT_GIT_TIMEOUT_SEC) -> str:
     try:
         result = subprocess.run(
-            ["git", "-C", str(ROOT), *args],
+            ["git", "-C", str(cwd), *args],
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -4654,6 +4718,149 @@ def _git(*args: str, timeout: float | None = DEFAULT_GIT_TIMEOUT_SEC) -> str:
     if result.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} failed: {result.stderr.strip()}")
     return result.stdout.strip()
+
+
+def _git(*args: str, timeout: float | None = DEFAULT_GIT_TIMEOUT_SEC) -> str:
+    return _git_at(ROOT, *args, timeout=timeout)
+
+
+def _git_worktree_paths() -> set[Path]:
+    output = _git("worktree", "list", "--porcelain")
+    paths: set[Path] = set()
+    for raw_line in output.splitlines():
+        if not raw_line.startswith("worktree "):
+            continue
+        path_text = raw_line[len("worktree ") :].strip()
+        if not path_text:
+            continue
+        path_obj = Path(path_text)
+        try:
+            paths.add(path_obj.resolve(strict=False))
+        except OSError:
+            continue
+    return paths
+
+
+def _cleanup_lane_worktrees_for_round(
+    *,
+    task_id: str,
+    round_num: int,
+    lane_ids: list[str] | None = None,
+    paths: LoopPaths | None = None,
+) -> None:
+    round_dir = _lane_worktrees_round_dir(task_id, round_num, paths=paths)
+    if not round_dir.exists() and not lane_ids:
+        return
+
+    if lane_ids is None:
+        candidate_paths = sorted(path for path in round_dir.iterdir() if path.is_dir()) if round_dir.is_dir() else []
+    else:
+        candidate_paths = [round_dir / lane_id for lane_id in lane_ids if lane_id]
+    if not candidate_paths:
+        return
+
+    registered_worktrees: set[Path] = set()
+    try:
+        registered_worktrees = _git_worktree_paths()
+    except RuntimeError as e:
+        _log(f"Warning: unable to list git worktrees before lane cleanup: {e}")
+
+    for candidate in candidate_paths:
+        if not _is_path_under_root(candidate, round_dir):
+            _log(f"Skipping lane cleanup outside expected round root: {candidate}")
+            continue
+        try:
+            resolved_candidate = candidate.resolve(strict=False)
+        except OSError:
+            resolved_candidate = candidate
+        if resolved_candidate in registered_worktrees:
+            try:
+                _git("worktree", "remove", "--force", str(candidate))
+                _log(f"Lane worktree removed: {candidate}")
+            except RuntimeError as e:
+                _log(f"Warning: failed to remove lane worktree {candidate}: {e}")
+        if candidate.is_file():
+            with contextlib.suppress(OSError):
+                candidate.unlink()
+        elif candidate.exists():
+            with contextlib.suppress(OSError):
+                shutil.rmtree(candidate)
+
+    for parent in (round_dir, round_dir.parent):
+        with contextlib.suppress(OSError):
+            if parent.exists() and not any(parent.iterdir()):
+                parent.rmdir()
+
+
+def _create_lane_worktree(
+    *,
+    task_id: str,
+    round_num: int,
+    lane_id: str,
+    base_sha: str,
+    paths: LoopPaths | None = None,
+) -> LaneWorktreeHandle:
+    round_dir = _lane_worktrees_round_dir(task_id, round_num, paths=paths)
+    lane_path = round_dir / lane_id
+    branch_name = _lane_worktree_branch_name(task_id, round_num, lane_id)
+    _cleanup_lane_worktrees_for_round(task_id=task_id, round_num=round_num, lane_ids=[lane_id], paths=paths)
+    round_dir.mkdir(parents=True, exist_ok=True)
+    _log(
+        "Lane worktree create: "
+        f"task_id={task_id} round={round_num} lane={lane_id} "
+        f"path={_display_path(lane_path)} branch={branch_name}"
+    )
+    _git("worktree", "add", "--detach", str(lane_path), base_sha)
+    _git_at(lane_path, "checkout", "-B", branch_name, base_sha)
+    return LaneWorktreeHandle(
+        task_id=task_id,
+        round_num=round_num,
+        lane_id=lane_id,
+        path=lane_path,
+        branch=branch_name,
+    )
+
+
+def _prepare_lane_worktrees(
+    *,
+    task_id: str,
+    round_num: int,
+    base_sha: str,
+    lanes: list[TaskLane],
+    paths: LoopPaths | None = None,
+) -> list[LaneWorktreeHandle]:
+    if not lanes:
+        return []
+    prepared: list[LaneWorktreeHandle] = []
+    prepared_lane_ids: list[str] = []
+    current_lane_id: str | None = None
+    try:
+        for lane in lanes:
+            lane_id = str(lane["lane_id"]).strip()
+            if not lane_id:
+                raise ValidationError(f"Lane worktree setup failed: lane_id is empty for task_id={task_id}")
+            current_lane_id = lane_id
+            handle = _create_lane_worktree(
+                task_id=task_id,
+                round_num=round_num,
+                lane_id=lane_id,
+                base_sha=base_sha,
+                paths=paths,
+            )
+            prepared.append(handle)
+            prepared_lane_ids.append(lane_id)
+    except (RuntimeError, ValidationError):
+        cleanup_lane_ids = list(prepared_lane_ids)
+        if current_lane_id and current_lane_id not in cleanup_lane_ids:
+            cleanup_lane_ids.append(current_lane_id)
+        _cleanup_lane_worktrees_for_round(
+            task_id=task_id,
+            round_num=round_num,
+            lane_ids=cleanup_lane_ids,
+            paths=paths,
+        )
+        raise
+    return prepared
 
 
 def _is_valid_ref(ref: str) -> bool:
@@ -7052,11 +7259,27 @@ def _run_single_round(
     _write_task_card_status(config.task_path, TASK_STATUS_IN_PROGRESS, paths=resolved_paths)
     state_task_id = state.get("task_id")
     state_base_sha = state.get("base_sha")
+    lane_cleanup_task_id: str | None = None
+    lane_cleanup_ids: list[str] = []
+    lane_cleanup_done = False
+
+    def _cleanup_lane_worktrees() -> None:
+        nonlocal lane_cleanup_done
+        if lane_cleanup_done or lane_cleanup_task_id is None or not lane_cleanup_ids:
+            return
+        lane_cleanup_done = True
+        _cleanup_lane_worktrees_for_round(
+            task_id=lane_cleanup_task_id,
+            round_num=round_num,
+            lane_ids=lane_cleanup_ids,
+            paths=resolved_paths,
+        )
 
     def _archive_single_round_state() -> None:
         _archive_state_for_round(task_id_from_card, round_num, paths=resolved_paths)
 
     def _fail_single_round(outcome: str, message: str, exit_code: int = EXIT_VALIDATION_ERROR) -> None:
+        _cleanup_lane_worktrees()
         _archive_single_round_state()
         _fail_with_state(
             state,
@@ -7120,6 +7343,28 @@ def _run_single_round(
         lane_stages=lane_stages,
         paths=resolved_paths,
     )
+    task_lanes_raw = task_card.get("lanes")
+    task_lanes = cast(list[TaskLane], task_lanes_raw) if isinstance(task_lanes_raw, list) else []
+    lane_worktrees: list[LaneWorktreeHandle] = []
+    if task_lanes:
+        try:
+            lane_worktrees = _prepare_lane_worktrees(
+                task_id=task_id,
+                round_num=round_num,
+                base_sha=base_sha,
+                lanes=task_lanes,
+                paths=resolved_paths,
+            )
+        except (RuntimeError, ValidationError) as e:
+            _fail_single_round(
+                outcome="lane_worktree_setup_failed",
+                message=f"Failed to prepare lane worktrees: {e}",
+                exit_code=EXIT_VALIDATION_ERROR,
+            )
+            return
+    lane_cleanup_task_id = task_id
+    lane_cleanup_ids = [handle.lane_id for handle in lane_worktrees]
+    lane_cleanup_done = False
 
     if not isinstance(state.get("round_details"), list):
         state["round_details"] = []
@@ -7200,6 +7445,7 @@ def _run_single_round(
             archive_before_save=_archive_single_round_state,
         )
         _write_task_card_status(config.task_path, TASK_STATUS_BLOCKED, paths=resolved_paths)
+        _cleanup_lane_worktrees()
         raise DispatchError("Worker timed out")
 
     report_error = _validate_report(
@@ -7316,6 +7562,7 @@ def _run_single_round(
             archive_before_save=_archive_single_round_state,
         )
         _write_task_card_status(config.task_path, TASK_STATUS_BLOCKED, paths=resolved_paths)
+        _cleanup_lane_worktrees()
         raise DispatchError("Reviewer timed out")
 
     review_error = _validate_report(
@@ -7413,6 +7660,7 @@ def _run_single_round(
                 outcome="approved",
             ),
         )
+        _cleanup_lane_worktrees()
         return
 
     raw_blocking = review.get("blocking_issues", [])
@@ -7454,6 +7702,7 @@ def _run_single_round(
         paths=resolved_paths,
         archive_before_save=_archive_single_round_state,
     )
+    _cleanup_lane_worktrees()
 
 
 def _run_multi_round_via_subprocess(
@@ -7739,6 +7988,20 @@ def _run_multi_round_via_subprocess(
             signal.signal(signal.SIGTERM, old_sigterm)
 
     if interrupted:
+        if current_round is not None and task_id:
+            task_card_data = _read_json_if_exists(resolved_paths.task_card)
+            if isinstance(task_card_data, dict):
+                lane_ids = _task_lane_ids(cast(TaskCard, task_card_data))
+                if lane_ids:
+                    try:
+                        _cleanup_lane_worktrees_for_round(
+                            task_id=task_id,
+                            round_num=current_round,
+                            lane_ids=lane_ids,
+                            paths=resolved_paths,
+                        )
+                    except (RuntimeError, ValidationError) as e:
+                        _log(f"Warning: failed to cleanup lane worktrees after interruption: {e}")
         _fail_with_state(
             _load_state(paths=resolved_paths),
             outcome="interrupted",

@@ -6596,6 +6596,122 @@ class TestGitHelper:
             orchestrator._git("status", timeout=12)
 
 
+class TestLaneWorktreeLifecycle:
+    def test_prepare_lane_worktrees_creates_expected_paths_and_branches(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        git_calls: list[tuple[str, ...]] = []
+        checkout_calls: list[tuple[Path, tuple[str, ...]]] = []
+
+        def fake_git(*args: str, timeout: float | None = orchestrator.DEFAULT_GIT_TIMEOUT_SEC) -> str:
+            _ = timeout
+            git_calls.append(args)
+            if args == ("worktree", "list", "--porcelain"):
+                return ""
+            if len(args) >= 4 and args[0:3] == ("worktree", "add", "--detach"):
+                return ""
+            if len(args) >= 4 and args[0:3] == ("worktree", "remove", "--force"):
+                return ""
+            raise AssertionError(f"unexpected git call: {args!r}")
+
+        def fake_git_at(
+            cwd: Path,
+            *args: str,
+            timeout: float | None = orchestrator.DEFAULT_GIT_TIMEOUT_SEC,
+        ) -> str:
+            _ = timeout
+            checkout_calls.append((cwd, args))
+            return ""
+
+        monkeypatch.setattr(orchestrator, "_git", fake_git)
+        monkeypatch.setattr(orchestrator, "_git_at", fake_git_at)
+
+        lanes: list[orchestrator.TaskLane] = [
+            {"lane_id": "lane_core", "owner_paths": ["src/loop_kit/orchestrator.py"]},
+            {"lane_id": "lane_tests", "owner_paths": ["tests/test_orchestrator.py"]},
+        ]
+        handles = orchestrator._prepare_lane_worktrees(
+            task_id="T-728",
+            round_num=1,
+            base_sha="abc123",
+            lanes=lanes,
+        )
+
+        expected_root = tmp_path / ".loop" / "worktrees" / "T-728" / "1"
+        assert [handle.path for handle in handles] == [
+            expected_root / "lane_core",
+            expected_root / "lane_tests",
+        ]
+        assert [handle.branch for handle in handles] == [
+            "loop/T-728/r1/lane_core",
+            "loop/T-728/r1/lane_tests",
+        ]
+        add_calls = [call for call in git_calls if len(call) >= 4 and call[0:3] == ("worktree", "add", "--detach")]
+        assert add_calls == [
+            ("worktree", "add", "--detach", str(expected_root / "lane_core"), "abc123"),
+            ("worktree", "add", "--detach", str(expected_root / "lane_tests"), "abc123"),
+        ]
+        assert checkout_calls == [
+            (
+                expected_root / "lane_core",
+                ("checkout", "-B", "loop/T-728/r1/lane_core", "abc123"),
+            ),
+            (
+                expected_root / "lane_tests",
+                ("checkout", "-B", "loop/T-728/r1/lane_tests", "abc123"),
+            ),
+        ]
+
+    def test_prepare_lane_worktrees_failure_cleans_round_lanes_only(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        removed_paths: list[str] = []
+        worktree_registry: set[str] = {
+            str((tmp_path / ".loop" / "worktrees" / "T-999" / "1" / "lane_other").resolve(strict=False))
+        }
+
+        def _list_output() -> str:
+            lines = [f"worktree {path}" for path in sorted(worktree_registry)]
+            return "\n".join(lines)
+
+        def fake_git(*args: str, timeout: float | None = orchestrator.DEFAULT_GIT_TIMEOUT_SEC) -> str:
+            _ = timeout
+            if args == ("worktree", "list", "--porcelain"):
+                return _list_output()
+            if len(args) >= 4 and args[0:3] == ("worktree", "add", "--detach"):
+                worktree_path = str(Path(args[3]).resolve(strict=False))
+                if worktree_path.endswith("lane_tests"):
+                    raise RuntimeError("lane add failed")
+                worktree_registry.add(worktree_path)
+                return ""
+            if len(args) >= 4 and args[0:3] == ("worktree", "remove", "--force"):
+                worktree_path = str(Path(args[3]).resolve(strict=False))
+                removed_paths.append(worktree_path)
+                worktree_registry.discard(worktree_path)
+                return ""
+            raise AssertionError(f"unexpected git call: {args!r}")
+
+        monkeypatch.setattr(orchestrator, "_git", fake_git)
+        monkeypatch.setattr(orchestrator, "_git_at", lambda cwd, *args, timeout=None: "")
+
+        lanes: list[orchestrator.TaskLane] = [
+            {"lane_id": "lane_core", "owner_paths": ["src/loop_kit/orchestrator.py"]},
+            {"lane_id": "lane_tests", "owner_paths": ["tests/test_orchestrator.py"]},
+        ]
+
+        with pytest.raises(RuntimeError, match="lane add failed"):
+            orchestrator._prepare_lane_worktrees(
+                task_id="T-728",
+                round_num=1,
+                base_sha="abc123",
+                lanes=lanes,
+            )
+
+        core_path = str((tmp_path / ".loop" / "worktrees" / "T-728" / "1" / "lane_core").resolve(strict=False))
+        unrelated_path = str((tmp_path / ".loop" / "worktrees" / "T-999" / "1" / "lane_other").resolve(strict=False))
+        assert core_path in removed_paths
+        assert unrelated_path not in removed_paths
+        assert unrelated_path in worktree_registry
+
+
 class TestFailWithState:
     def test_exits_with_given_code(self, monkeypatch, tmp_path) -> None:
         monkeypatch.setattr(orchestrator, "STATE_FILE", tmp_path / "state.json")

@@ -222,6 +222,17 @@ When lanes are present and valid, the orchestrator computes deterministic execut
 - round logs include `Lane stage <index>: <lane set>`
 - feed emits `lane_plan_stage` events with `stage_index`, `stage_count`, and `lanes`
 
+Lane worktree isolation lifecycle:
+- for lane-enabled rounds, the orchestrator creates per-lane git worktrees under `.loop/worktrees/<task_id>/<round>/<lane_id>`
+- each lane worktree checks out a deterministic branch name: `loop/<task_id>/r<round>/<lane_id>`
+- lane worktrees are cleaned up on normal completion, worker/reviewer timeout failures, and parent-loop interruption handling
+- cleanup is scoped to the current task/round lane paths only; unrelated git worktrees are not removed
+
+Recovery notes:
+- if a process is hard-killed before cleanup, inspect leftovers with `git worktree list`
+- remove stale lane worktrees with `git worktree remove --force <path>` and rerun `loop run`
+- lane worktree paths are disposable runtime artifacts under `.loop/worktrees/`; they should not be committed
+
 `status` is system-managed while the loop runs: it is written to `in_progress` at start, `done` on approved completion, and `blocked` on non-approved terminal failures, including unsatisfied task dependencies before dispatch.
 
 **work_report.json**
