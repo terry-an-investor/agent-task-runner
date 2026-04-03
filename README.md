@@ -125,6 +125,13 @@ Resolution order:
 
 `CLI args > environment variables > config file > built-in defaults`
 
+Validation rules:
+
+- `max_rounds` must be `>= 1`
+- `timeout`, `dispatch_timeout`, `dispatch_retries`, `dispatch_retry_base_sec`, `max_session_rounds`, `artifact_timeout`, and `heartbeat_ttl` must be `>= 0`
+- Invalid CLI/env/config values fail fast with a validation error (`exit code 3`)
+- JSON payloads loaded from bus/state/config/task files are capped at 5 MiB and rejected when oversized
+
 ## File Bus Protocol
 
 All state passes through JSON files in `.loop/`:
@@ -272,6 +279,8 @@ Interpretation limits for the command output:
 ```
 
 **state.json** — Internal orchestrator state, the single source of truth between rounds.
+
+Dispatch logs (`.loop/logs/*_dispatch.log`) redact common sensitive values before persistence (for example bearer tokens, API keys, and password-like fields).
 
 ### Archive
 

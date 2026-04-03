@@ -4,6 +4,7 @@ import builtins
 import hashlib
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -3608,6 +3609,18 @@ def test_load_task_card_rejects_invalid_json(tmp_path: Path, capsys) -> None:
     assert "contains invalid JSON" in capsys.readouterr().err
 
 
+def test_load_task_card_rejects_oversized_payload(tmp_path: Path, monkeypatch, capsys) -> None:
+    task_path = tmp_path / "task_input.json"
+    task_path.write_text('{"task_id":"T-1","goal":"' + ("x" * 128) + '"}', encoding="utf-8")
+    monkeypatch.setattr(orchestrator, "MAX_JSON_PAYLOAD_BYTES", 64)
+
+    with pytest.raises(SystemExit) as exc:
+        orchestrator._load_task_card(str(task_path))
+
+    assert exc.value.code == 1
+    assert "exceeds maximum size" in capsys.readouterr().err
+
+
 def test_load_task_card_rejects_unreadable_file(tmp_path: Path, monkeypatch, capsys) -> None:
     task_path = tmp_path / "task_input.json"
     task_path.write_text("{}", encoding="utf-8")
@@ -4387,6 +4400,15 @@ class TestReadJsonIfExists:
         p.write_text("not json", encoding="utf-8")
         assert orchestrator._read_json_if_exists(p) is None
 
+    def test_raises_on_oversized_json(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        p = tmp_path / "large.json"
+        p.write_text('{"data":"' + ("x" * 50) + '"}', encoding="utf-8")
+        monkeypatch.setattr(orchestrator, "MAX_JSON_PAYLOAD_BYTES", 20)
+
+        with pytest.raises(orchestrator.ConfigError, match="exceeds maximum size"):
+            orchestrator._read_json_if_exists(p)
+
 
 class TestReadTextOptional:
     def test_returns_content(self, tmp_path: Path) -> None:
@@ -4723,6 +4745,35 @@ class TestWriteDispatchLog:
         orchestrator._write_dispatch_log("worker", ["codex"], result, None)
         log = (tmp_path / "worker_dispatch.log").read_text(encoding="utf-8")
         assert "session_id=" not in log
+
+    def test_redacts_sensitive_values_in_stdout_and_stderr(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setattr(orchestrator, "LOGS_DIR", tmp_path)
+        result = subprocess.CompletedProcess(
+            args=["codex"],
+            returncode=1,
+            stdout=(
+                "Authorization: Bearer abcdef123456\n"
+                "api_key=secret-value\n"
+                "password=hunter2\n"
+                "sk-abcdefghijklmnopqrstuvwxyz1234\n"
+            ),
+            stderr='{"token":"my-token","message":"failed"}\n',
+        )
+        result.stdout = result.stdout
+        result.stderr = result.stderr
+
+        orchestrator._write_dispatch_log("worker", ["codex"], result, None)
+        log = (tmp_path / "worker_dispatch.log").read_text(encoding="utf-8")
+
+        assert "Bearer [REDACTED]" in log
+        assert "api_key=[REDACTED]" in log
+        assert "password=[REDACTED]" in log
+        assert "sk-[REDACTED]" in log
+        assert '"token":"[REDACTED]"' in log
+        assert "abcdef123456" not in log
+        assert "secret-value" not in log
+        assert "hunter2" not in log
+        assert "my-token" not in log
 
 
 class TestResolveExeFromCandidates:
@@ -5068,6 +5119,14 @@ class TestLoadState:
             **backup_state,
         }
         assert "state.json corrupted, recovered from backup" in capsys.readouterr().err
+
+    def test_rejects_oversized_state_json(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        orchestrator.STATE_FILE.write_text('{"state":"idle","round":0,"padding":"' + ("x" * 128) + '"}', encoding="utf-8")
+        monkeypatch.setattr(orchestrator, "MAX_JSON_PAYLOAD_BYTES", 64)
+
+        with pytest.raises(orchestrator.ConfigError, match="state.json rejected"):
+            orchestrator._load_state()
 
 
 class TestSaveState:
@@ -5648,6 +5707,77 @@ class TestCmdArchiveRestoreTraversal:
         assert state_file.exists()
         assert json.loads(state_file.read_text(encoding="utf-8"))["round"] == 1
 
+    def test_rejects_restore_symlink_escaping_archive(self, monkeypatch, capsys, tmp_path) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        archive_dir = tmp_path / ".loop" / "archive" / "T-001"
+        archive_dir.mkdir(parents=True)
+        outside = tmp_path / "outside_state.json"
+        outside.write_text('{"round": 999}', encoding="utf-8")
+        link = archive_dir / "r1_state.json"
+        try:
+            link.symlink_to(outside)
+        except (OSError, NotImplementedError):
+            pytest.skip("Symlink creation not supported in this environment")
+
+        with pytest.raises(SystemExit) as exc:
+            orchestrator.cmd_archive("T-001", restore="r1_state")
+
+        assert exc.value.code == 1
+        assert "escapes archive directory" in capsys.readouterr().err
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGTERM"), reason="SIGTERM not available on this platform")
+def test_run_multi_round_handles_sigterm_as_interrupted(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+    task_path = tmp_path / "task.json"
+    task_path.write_text(json.dumps({"task_id": "T-919", "goal": "signal test"}, ensure_ascii=False), encoding="utf-8")
+
+    monkeypatch.setattr(orchestrator, "_enforce_clean_worktree_or_exit", lambda allow_dirty: None)
+    monkeypatch.setattr(
+        orchestrator,
+        "_sync_task_card_to_bus",
+        lambda task_path, round_num=1, paths=None: ({"task_id": "T-919", "goal": "signal test"}, "T-919"),
+    )
+    monkeypatch.setattr(orchestrator, "_current_sha", lambda: "base-sha")
+    monkeypatch.setattr(orchestrator, "_write_task_card_status", lambda *args, **kwargs: None)
+    monkeypatch.setattr(orchestrator, "_prepare_bus_file", lambda *args, **kwargs: None)
+    monkeypatch.setattr(orchestrator, "_archive_bus_file", lambda *args, **kwargs: None)
+
+    captured: dict[str, object] = {}
+
+    def fake_fail_with_state(state, outcome, message, exit_code=1, task_path=None, paths=None):
+        _ = (state, task_path, paths)
+        captured["outcome"] = outcome
+        captured["message"] = message
+        raise SystemExit(exit_code)
+
+    monkeypatch.setattr(orchestrator, "_fail_with_state", fake_fail_with_state)
+
+    signal_handlers: dict[int, object] = {}
+    sigterm_triggered = False
+
+    def fake_signal(sig, handler):
+        nonlocal sigterm_triggered
+        previous = signal_handlers.get(sig, signal.SIG_DFL)
+        signal_handlers[sig] = handler
+        if sig == signal.SIGTERM and callable(handler) and not sigterm_triggered:
+            sigterm_triggered = True
+            handler(signal.SIGTERM, None)
+        return previous
+
+    monkeypatch.setattr(orchestrator.signal, "signal", fake_signal)
+
+    with pytest.raises(SystemExit) as exc:
+        orchestrator._run_multi_round_via_subprocess(
+            config=orchestrator.RunConfig(task_path=str(task_path), max_rounds=1, allow_dirty=True),
+        )
+
+    assert exc.value.code == orchestrator.EXIT_INTERRUPTED
+    assert captured["outcome"] == "interrupted"
+    assert captured["message"] == "User interrupted (SIGTERM)"
+    assert signal.SIGINT in signal_handlers
+    assert signal.SIGTERM in signal_handlers
+
 
 class TestStreamDispatchSuppression:
     def test_step_turn_completed_suppressed_by_exact_match(self, monkeypatch, capsys) -> None:
@@ -5962,6 +6092,15 @@ class TestConfigLoadingPrecedence:
         assert loaded["max_rounds"] == 5
         assert loaded["dispatch_timeout"] == 21
 
+    def test_load_config_rejects_oversized_json(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        config_json = tmp_path / ".loop" / "config.json"
+        config_json.write_text('{"max_rounds":3,"padding":"' + ("x" * 128) + '"}', encoding="utf-8")
+        monkeypatch.setattr(orchestrator, "MAX_JSON_PAYLOAD_BYTES", 64)
+
+        with pytest.raises(orchestrator.ConfigError, match="exceeds maximum size"):
+            orchestrator._load_config()
+
     def test_main_run_env_overrides_file_values(self, tmp_path: Path, monkeypatch) -> None:
         _configure_loop_paths(monkeypatch, tmp_path)
         config_path = tmp_path / ".loop" / "config.json"
@@ -6045,6 +6184,29 @@ class TestConfigLoadingPrecedence:
         assert captured["max_rounds"] == 11
         assert captured["dispatch_timeout"] == 31
         assert captured["backend_preference"] == ["claude", "opencode"]
+
+    def test_main_run_rejects_invalid_max_rounds_from_config(self, tmp_path: Path, monkeypatch, capsys) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        config_path = tmp_path / ".loop" / "config.json"
+        config_path.write_text('{"max_rounds": 0}', encoding="utf-8")
+        monkeypatch.setattr(sys, "argv", ["orchestrator.py", "run", "--loop-dir", ".loop"])
+
+        with pytest.raises(SystemExit) as exc:
+            orchestrator.main()
+
+        assert exc.value.code == orchestrator.EXIT_VALIDATION_ERROR
+        assert "max_rounds must be >= 1" in capsys.readouterr().err
+
+    def test_main_run_rejects_invalid_dispatch_timeout_from_env(self, tmp_path: Path, monkeypatch, capsys) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        monkeypatch.setenv("LOOP_DISPATCH_TIMEOUT", "-5")
+        monkeypatch.setattr(sys, "argv", ["orchestrator.py", "run", "--loop-dir", ".loop"])
+
+        with pytest.raises(SystemExit) as exc:
+            orchestrator.main()
+
+        assert exc.value.code == orchestrator.EXIT_VALIDATION_ERROR
+        assert "dispatch_timeout must be >= 0" in capsys.readouterr().err
 
 
 class TestResetDefault:
@@ -6259,6 +6421,46 @@ class TestBuildTaskPacket:
         packet = orchestrator._build_task_packet(task_card, 1)
 
         assert "src/main.py" in packet["target_files"]
+
+    def test_ignores_unsafe_in_scope_patterns(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        src = tmp_path / "src"
+        src.mkdir(parents=True)
+        (src / "main.py").write_text("def main(): pass\n", encoding="utf-8")
+
+        task_card = {
+            "goal": "test",
+            "in_scope": ["/etc/passwd", "../secret.txt", "src/main.py"],
+            "acceptance_criteria": [],
+            "constraints": [],
+        }
+
+        packet = orchestrator._build_task_packet(task_card, 1)
+
+        assert packet["target_files"] == ["src/main.py"]
+
+    def test_ignores_symlinked_match_outside_repo_root(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        src = tmp_path / "src"
+        src.mkdir(parents=True)
+        outside = tmp_path / "outside.py"
+        outside.write_text("print('outside')\n", encoding="utf-8")
+        link = src / "linked.py"
+        try:
+            link.symlink_to(outside)
+        except (OSError, NotImplementedError):
+            pytest.skip("Symlink creation not supported in this environment")
+
+        task_card = {
+            "goal": "test",
+            "in_scope": ["src/*.py"],
+            "acceptance_criteria": [],
+            "constraints": [],
+        }
+
+        packet = orchestrator._build_task_packet(task_card, 1)
+
+        assert packet["target_files"] == []
 
     def test_target_symbols_from_function_index(self, tmp_path: Path, monkeypatch) -> None:
         _configure_loop_paths(monkeypatch, tmp_path)

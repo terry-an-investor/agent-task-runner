@@ -27,6 +27,7 @@ import importlib.resources
 import json
 import math
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -176,6 +177,7 @@ DEFAULT_DISPATCH_RETRY_BASE_SEC = 5
 DEFAULT_MAX_SESSION_ROUNDS = 0
 MAX_DISPATCH_RETRY_DELAY_SEC = 60
 DEFAULT_GIT_TIMEOUT_SEC = 30
+MAX_JSON_PAYLOAD_BYTES = 5 * 1024 * 1024
 _STALE_STATE_KEYS = ("outcome", "failed_at", "error", "head_sha", "round_details")
 FEED_DISPATCH_START = "dispatch_start"
 FEED_DISPATCH_COMPLETE = "dispatch_complete"
@@ -225,6 +227,14 @@ _stream_local = threading.local()
 _AUTO_DISPATCH_HEARTBEATS: dict[str, tuple[threading.Event, threading.Thread]] = {}
 _AUTO_DISPATCH_HEARTBEAT_LOCK = threading.Lock()
 _AUTO_DISPATCH_HEARTBEAT_JOIN_TIMEOUT_SEC = 2.0
+_BEARER_TOKEN_RE = re.compile(r"(?i)\b(Bearer)\s+[A-Za-z0-9._~+/=-]{6,}")
+_KEY_VALUE_SECRET_RE = re.compile(
+    r"(?i)\b(api[_-]?key|access[_-]?token|refresh[_-]?token|token|password|passwd|pwd|secret)\b(\s*[:=]\s*)([^\s\"']+)"
+)
+_JSON_SECRET_RE = re.compile(
+    r"(?i)(\"(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|password|passwd|pwd|secret)\"\s*:\s*\")([^\"]+)(\")"
+)
+_OPENAI_KEY_RE = re.compile(r"\bsk-[A-Za-z0-9]{10,}\b")
 
 
 class DispatchTimeoutError(RuntimeError):
@@ -753,11 +763,37 @@ def _normalized_abs(path: Path) -> str:
     return os.path.normcase(str(path.resolve()))
 
 
+def _enforce_payload_size(path: Path, *, label: str, max_bytes: int | None = None) -> None:
+    effective_max_bytes = MAX_JSON_PAYLOAD_BYTES if max_bytes is None else max_bytes
+    try:
+        size = path.stat().st_size
+    except OSError:
+        raise
+    if size > effective_max_bytes:
+        raise ConfigError(f"{label} exceeds maximum size ({size} bytes > {effective_max_bytes} bytes)")
+
+
+def _load_json_with_limit(path: Path, *, label: str) -> object:
+    _enforce_payload_size(path, label=label)
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _redact_sensitive_log_text(text: str) -> str:
+    redacted = _BEARER_TOKEN_RE.sub(r"\1 [REDACTED]", text)
+    redacted = _KEY_VALUE_SECRET_RE.sub(r"\1\2[REDACTED]", redacted)
+    redacted = _JSON_SECRET_RE.sub(r"\1[REDACTED]\3", redacted)
+    redacted = _OPENAI_KEY_RE.sub("sk-[REDACTED]", redacted)
+    return redacted
+
+
 def _read_json_if_exists(path: Path) -> dict | None:
     if not path.exists():
         return None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return cast(dict, _load_json_with_limit(path, label=path.name))
+    except ConfigError as e:
+        _log(f"Error: {e}")
+        raise
     except json.JSONDecodeError as e:
         _log(f"Warning: {path.name} has invalid JSON: {e}")
         return None
@@ -1777,13 +1813,15 @@ def _write_dispatch_log(
         f.write(f"cmd={' '.join(cmd)}\n")
         if result.stdout:
             f.write("stdout:\n")
-            f.write(result.stdout)
-            if not result.stdout.endswith("\n"):
+            redacted_stdout = _redact_sensitive_log_text(result.stdout)
+            f.write(redacted_stdout)
+            if not redacted_stdout.endswith("\n"):
                 f.write("\n")
         if result.stderr:
             f.write("stderr:\n")
-            f.write(result.stderr)
-            if not result.stderr.endswith("\n"):
+            redacted_stderr = _redact_sensitive_log_text(result.stderr)
+            f.write(redacted_stderr)
+            if not redacted_stderr.endswith("\n"):
                 f.write("\n")
         f.write("-" * 60 + "\n")
 
@@ -3276,19 +3314,63 @@ def _render_knowledge_section() -> str:
 _function_index_cache: tuple[tuple[int, float], str] | None = None
 
 
+def _is_safe_scope_pattern(pattern: str) -> bool:
+    candidate = Path(pattern)
+    if candidate.is_absolute():
+        return False
+    return all(part != ".." for part in candidate.parts)
+
+
+def _is_path_under_root(path: Path, root: Path) -> bool:
+    try:
+        return path.resolve().is_relative_to(root)
+    except (OSError, RuntimeError):
+        return False
+
+
 def _build_task_packet(task_card: TaskCard, round_num: int) -> TaskPacket:
     in_scope = task_card.get("in_scope", [])
     target_files: list[str] = []
+    seen_target_files: set[str] = set()
+    root_resolved = ROOT.resolve()
     for item in in_scope:
         if not isinstance(item, str):
             continue
-        matched = sorted(p.relative_to(ROOT).as_posix() for p in ROOT.glob(item) if p.is_file())
+        pattern = item.strip()
+        if not pattern:
+            continue
+        if not _is_safe_scope_pattern(pattern):
+            _log(f"Ignoring unsafe in_scope pattern: {item!r}")
+            continue
+        try:
+            matched = sorted(
+                p.relative_to(ROOT).as_posix()
+                for p in ROOT.glob(pattern)
+                if p.is_file() and _is_path_under_root(p, root_resolved)
+            )
+        except (RuntimeError, OSError, ValueError):
+            _log(f"Ignoring invalid in_scope pattern: {item!r}")
+            continue
         if matched:
-            target_files.extend(matched)
+            for matched_path in matched:
+                if matched_path not in seen_target_files:
+                    target_files.append(matched_path)
+                    seen_target_files.add(matched_path)
         else:
-            resolved = (ROOT / item).resolve()
-            if resolved.is_file():
-                target_files.append(resolved.relative_to(ROOT).as_posix())
+            try:
+                resolved = (ROOT / pattern).resolve()
+            except OSError:
+                _log(f"Ignoring unreadable in_scope path: {item!r}")
+                continue
+            if not resolved.is_file():
+                continue
+            if not resolved.is_relative_to(root_resolved):
+                _log(f"Ignoring in_scope path outside repo root: {item!r}")
+                continue
+            rel_path = resolved.relative_to(ROOT).as_posix()
+            if rel_path not in seen_target_files:
+                target_files.append(rel_path)
+                seen_target_files.add(rel_path)
 
     target_symbols: list[str] = []
     for filepath in target_files:
@@ -3954,7 +4036,10 @@ def _load_state(paths: LoopPaths | None = None) -> dict:
         if not state_backup.exists():
             return None
         try:
-            backup_data = json.loads(state_backup.read_text(encoding="utf-8"))
+            backup_data = _load_json_with_limit(state_backup, label=state_backup.name)
+        except ConfigError as backup_err:
+            _log(f"Warning: backup state file rejected: {backup_err}.")
+            return None
         except json.JSONDecodeError as backup_err:
             _log(f"Warning: backup state file is corrupted: {backup_err}.")
             return None
@@ -3967,7 +4052,9 @@ def _load_state(paths: LoopPaths | None = None) -> dict:
         return _migrate_state_schema(backup_data)
 
     try:
-        data = json.loads(state_file.read_text(encoding="utf-8"))
+        data = _load_json_with_limit(state_file, label=state_file.name)
+    except ConfigError as e:
+        raise ConfigError(f"state.json rejected: {e}") from e
     except json.JSONDecodeError as e:
         backup_state = _load_backup_state()
         if backup_state is not None:
@@ -4209,8 +4296,10 @@ def _load_config() -> dict:
     if not _CONFIG_FILE.is_file():
         return {}
     try:
-        data = json.loads(_CONFIG_FILE.read_text(encoding="utf-8"))
+        data = _load_json_with_limit(_CONFIG_FILE, label=_CONFIG_FILE.name)
         return data if isinstance(data, dict) else {}
+    except ConfigError:
+        raise
     except (json.JSONDecodeError, OSError):
         return {}
 
@@ -4222,7 +4311,10 @@ def _load_config_from_yaml(path: Path) -> dict:
         _log(f"Warning: {path.name} found but PyYAML is not installed; skipping YAML config.")
         return {}
     try:
+        _enforce_payload_size(path, label=path.name)
         data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except ConfigError:
+        raise
     except OSError:
         return {}
     except yaml.YAMLError as e:
@@ -4244,22 +4336,88 @@ def _normalize_backend_preference(value: object) -> list[str]:
     return []
 
 
+def _coerce_bool_config(value: object, *, field_name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    raise ValidationError(f"{field_name} must be a boolean, got {value!r}")
+
+
+def _coerce_int_config(value: object, *, field_name: str, minimum: int) -> int:
+    parsed: int
+    if isinstance(value, bool):
+        raise ValidationError(f"{field_name} must be an integer >= {minimum}, got {value!r}")
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            raise ValidationError(f"{field_name} must be an integer >= {minimum}, got empty string")
+        try:
+            parsed = int(text)
+        except ValueError as e:
+            raise ValidationError(f"{field_name} must be an integer >= {minimum}, got {value!r}") from e
+    else:
+        raise ValidationError(f"{field_name} must be an integer >= {minimum}, got {value!r}")
+    if parsed < minimum:
+        raise ValidationError(f"{field_name} must be >= {minimum}, got {parsed}")
+    return parsed
+
+
+def _coerce_str_config(value: object, *, field_name: str) -> str:
+    if not isinstance(value, str):
+        raise ValidationError(f"{field_name} must be a non-empty string, got {value!r}")
+    normalized = value.strip()
+    if not normalized:
+        raise ValidationError(f"{field_name} must be a non-empty string, got {value!r}")
+    return normalized
+
+
+def _validate_run_config(config: RunConfig) -> None:
+    int_rules = (
+        ("max_rounds", config.max_rounds, 1),
+        ("timeout", config.timeout, 0),
+        ("heartbeat_ttl", config.heartbeat_ttl, 0),
+        ("dispatch_timeout", config.dispatch_timeout, 0),
+        ("dispatch_retries", config.dispatch_retries, 0),
+        ("dispatch_retry_base_sec", config.dispatch_retry_base_sec, 0),
+        ("max_session_rounds", config.max_session_rounds, 0),
+        ("artifact_timeout", config.artifact_timeout, 0),
+    )
+    for field_name, value, minimum in int_rules:
+        _coerce_int_config(value, field_name=field_name, minimum=minimum)
+    for bool_name, value in (
+        ("require_heartbeat", config.require_heartbeat),
+        ("auto_dispatch", config.auto_dispatch),
+        ("allow_dirty", config.allow_dirty),
+        ("verbose", config.verbose),
+    ):
+        _coerce_bool_config(value, field_name=bool_name)
+    _coerce_str_config(config.task_path, field_name="task_path")
+    _coerce_str_config(config.dispatch_backend, field_name="dispatch_backend")
+    _coerce_str_config(config.worker_backend, field_name="worker_backend")
+    _coerce_str_config(config.reviewer_backend, field_name="reviewer_backend")
+    if not isinstance(config.backend_preference, list):
+        raise ValidationError("backend_preference must be a list of backend names")
+    for item in config.backend_preference:
+        _coerce_str_config(item, field_name="backend_preference item")
+
+
 def _load_env_config() -> dict:
     env_cfg: dict[str, object] = {}
 
     max_rounds_raw = os.getenv("LOOP_MAX_ROUNDS")
     if max_rounds_raw is not None and max_rounds_raw.strip():
-        try:
-            env_cfg["max_rounds"] = int(max_rounds_raw)
-        except ValueError:
-            _log(f"Warning: ignoring invalid LOOP_MAX_ROUNDS={max_rounds_raw!r}")
+        env_cfg["max_rounds"] = max_rounds_raw
 
     dispatch_timeout_raw = os.getenv("LOOP_DISPATCH_TIMEOUT")
     if dispatch_timeout_raw is not None and dispatch_timeout_raw.strip():
-        try:
-            env_cfg["dispatch_timeout"] = int(dispatch_timeout_raw)
-        except ValueError:
-            _log(f"Warning: ignoring invalid LOOP_DISPATCH_TIMEOUT={dispatch_timeout_raw!r}")
+        env_cfg["dispatch_timeout"] = dispatch_timeout_raw
 
     backend_pref_raw = os.getenv("LOOP_BACKEND_PREFERENCE")
     if backend_pref_raw is not None:
@@ -4723,6 +4881,25 @@ def _restore_target_name_from_archive(stem: str) -> str:
     return f"{stem}.json"
 
 
+def _resolve_archive_restore_source(archive_dir: Path, restore_name: str) -> Path:
+    archive_root = archive_dir.resolve()
+    try:
+        source = (archive_dir / restore_name).resolve(strict=False)
+    except OSError as e:
+        raise LoopKitError(f"Cannot resolve restore path: {e}") from e
+    if not source.is_relative_to(archive_root):
+        raise LoopKitError("Restore path escapes archive")
+    if not source.exists():
+        raise LoopKitError("Archive file not found")
+    try:
+        resolved_source = source.resolve(strict=True)
+    except OSError as e:
+        raise LoopKitError(f"Cannot resolve restore path: {e}") from e
+    if not resolved_source.is_relative_to(archive_root):
+        raise LoopKitError("Restore path escapes archive (symlink)")
+    return source
+
+
 def cmd_archive(task_id: str, restore: str | None = None, paths: LoopPaths | None = None) -> None:
     resolved_paths = _resolve_paths(paths)
     try:
@@ -4744,16 +4921,17 @@ def cmd_archive(task_id: str, restore: str | None = None, paths: LoopPaths | Non
             return
 
         restore_name = restore if restore.endswith(".json") else f"{restore}.json"
-        src = (archive_dir / restore_name).resolve()
-        if not src.is_relative_to(archive_dir.resolve()):
-            print("Error: restore path escapes archive directory", file=sys.stderr)
-            raise LoopKitError("Restore path escapes archive")
-        if not src.exists():
-            print(
-                f"Error: archive file not found for task_id={task_id}: {src}",
-                file=sys.stderr,
-            )
-            raise LoopKitError("Archive file not found")
+        try:
+            src = _resolve_archive_restore_source(archive_dir, restore_name)
+        except LoopKitError as e:
+            if "not found" in str(e).lower():
+                print(
+                    f"Error: archive file not found for task_id={task_id}: {archive_dir / restore_name}",
+                    file=sys.stderr,
+                )
+            else:
+                print("Error: restore path escapes archive directory", file=sys.stderr)
+            raise
         target_name = _restore_target_name_from_archive(src.stem)
         dest = resolved_paths.dir / target_name
         shutil.copy2(src, dest)
@@ -4882,7 +5060,10 @@ def _load_task_card(task_path: str) -> tuple[Path, TaskCard, str]:
             print(f"Error: task card not found: {tp}", file=sys.stderr)
             raise ConfigError(f"Task card not found: {tp}")
         try:
-            task_card = json.loads(tp.read_text(encoding="utf-8"))
+            task_card = _load_json_with_limit(tp, label=f"task card {tp}")
+        except ConfigError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            raise
         except json.JSONDecodeError as e:
             print(f"Error: task card at {tp} contains invalid JSON: {e}", file=sys.stderr)
             raise ConfigError(f"Invalid JSON in task card: {e}") from e
@@ -5938,18 +6119,29 @@ def _run_multi_round_via_subprocess(
     interrupted = False
     _interrupted_event = threading.Event()
     current_proc: subprocess.Popen[str] | None = None
+    current_round: int | None = None
+    interrupt_signal = "SIGINT"
 
-    def _outer_sigint_handler(signum: int, frame: object) -> None:
+    def _outer_interrupt_handler(signum: int, frame: object) -> None:
+        nonlocal interrupt_signal
+        _ = frame
+        with contextlib.suppress(ValueError):
+            interrupt_signal = signal.Signals(signum).name
         _interrupted_event.set()
         if current_proc is not None and current_proc.poll() is None:
-            _log(f"SIGINT received during round {round_num}; terminating subprocess")
+            round_text = "unknown" if current_round is None else str(current_round)
+            _log(f"{interrupt_signal} received during round {round_text}; terminating subprocess")
             with contextlib.suppress(OSError):
                 current_proc.terminate()
 
-    old_sigint = signal.signal(signal.SIGINT, _outer_sigint_handler)
+    old_sigint = signal.signal(signal.SIGINT, _outer_interrupt_handler)
+    old_sigterm = None
+    if hasattr(signal, "SIGTERM"):
+        old_sigterm = signal.signal(signal.SIGTERM, _outer_interrupt_handler)
 
     try:
         for round_num in range(start_round, config.max_rounds + 1):
+            current_round = round_num
             _set_feed_round(round_num)
             if _interrupted_event.is_set():
                 interrupted = True
@@ -5999,7 +6191,7 @@ def _run_multi_round_via_subprocess(
 
             if _interrupted_event.is_set():
                 interrupted = True
-                _log(f"Round {round_num} subprocess terminated by SIGINT")
+                _log(f"Round {round_num} subprocess terminated by {interrupt_signal}")
                 break
 
             result = _completed_proc(
@@ -6087,12 +6279,14 @@ def _run_multi_round_via_subprocess(
             with contextlib.suppress(subprocess.TimeoutExpired, OSError):
                 current_proc.wait(timeout=2)
         signal.signal(signal.SIGINT, old_sigint)
+        if hasattr(signal, "SIGTERM") and old_sigterm is not None:
+            signal.signal(signal.SIGTERM, old_sigterm)
 
     if interrupted:
         _fail_with_state(
             _load_state(paths=resolved_paths),
             outcome="interrupted",
-            message="User interrupted (SIGINT)",
+            message=f"User interrupted ({interrupt_signal})",
             exit_code=EXIT_INTERRUPTED,
             task_path=config.task_path,
             paths=resolved_paths,
@@ -6143,6 +6337,7 @@ def cmd_run(
     if not _paths_match_globals(resolved_paths):
         _apply_loop_paths(resolved_paths)
     try:
+        _validate_run_config(config)
         lock: _LoopLock | None = None
         # Single-round subprocesses are spawned by the parent loop which already
         # holds the lock — skip lock acquisition to avoid self-deadlock.
@@ -6224,7 +6419,8 @@ def cmd_run(
         sys.exit(EXIT_LOCK_FAILURE)
     except DispatchError:
         sys.exit(EXIT_TIMEOUT)
-    except ValidationError:
+    except ValidationError as e:
+        print(f"Error: validation error: {e}", file=sys.stderr)
         sys.exit(EXIT_VALIDATION_ERROR)
     except ConfigError:
         sys.exit(EXIT_GENERAL_ERROR)
@@ -6423,31 +6619,67 @@ def main() -> None:
                 file_value = file_cfg.get(config_key)
                 return file_value if file_value is not None else builtin_default
 
+            auto_dispatch_cli = True if args.auto_dispatch else None
             config = RunConfig(
-                task_path=task_path,
-                max_rounds=int(_cfg_val(args.max_rounds, "max_rounds", DEFAULT_MAX_ROUNDS)),
-                timeout=int(_cfg_val(args.timeout, "timeout", 0)),
+                task_path=_coerce_str_config(task_path, field_name="task_path"),
+                max_rounds=_coerce_int_config(
+                    _cfg_val(args.max_rounds, "max_rounds", DEFAULT_MAX_ROUNDS),
+                    field_name="max_rounds",
+                    minimum=1,
+                ),
+                timeout=_coerce_int_config(_cfg_val(args.timeout, "timeout", 0), field_name="timeout", minimum=0),
                 require_heartbeat=args.require_heartbeat,
-                heartbeat_ttl=int(_cfg_val(args.heartbeat_ttl, "heartbeat_ttl", DEFAULT_HEARTBEAT_TTL_SEC)),
-                auto_dispatch=_cfg_val(args.auto_dispatch, "auto_dispatch", False),
-                dispatch_backend=str(_cfg_val(args.dispatch_backend, "dispatch_backend", DEFAULT_DISPATCH_BACKEND)),
-                worker_backend=str(_cfg_val(args.worker_backend, "worker_backend", DEFAULT_WORKER_BACKEND)),
-                reviewer_backend=str(_cfg_val(args.reviewer_backend, "reviewer_backend", DEFAULT_REVIEWER_BACKEND)),
+                heartbeat_ttl=_coerce_int_config(
+                    _cfg_val(args.heartbeat_ttl, "heartbeat_ttl", DEFAULT_HEARTBEAT_TTL_SEC),
+                    field_name="heartbeat_ttl",
+                    minimum=0,
+                ),
+                auto_dispatch=_coerce_bool_config(
+                    _cfg_val(auto_dispatch_cli, "auto_dispatch", False),
+                    field_name="auto_dispatch",
+                ),
+                dispatch_backend=_coerce_str_config(
+                    _cfg_val(args.dispatch_backend, "dispatch_backend", DEFAULT_DISPATCH_BACKEND),
+                    field_name="dispatch_backend",
+                ),
+                worker_backend=_coerce_str_config(
+                    _cfg_val(args.worker_backend, "worker_backend", DEFAULT_WORKER_BACKEND),
+                    field_name="worker_backend",
+                ),
+                reviewer_backend=_coerce_str_config(
+                    _cfg_val(args.reviewer_backend, "reviewer_backend", DEFAULT_REVIEWER_BACKEND),
+                    field_name="reviewer_backend",
+                ),
                 backend_preference=_normalize_backend_preference(_cfg_val(None, "backend_preference", [])),
-                dispatch_timeout=int(_cfg_val(args.dispatch_timeout, "dispatch_timeout", DEFAULT_DISPATCH_TIMEOUT_SEC)),
-                dispatch_retries=int(_cfg_val(args.dispatch_retries, "dispatch_retries", DEFAULT_DISPATCH_RETRIES)),
-                dispatch_retry_base_sec=int(
-                    _cfg_val(args.dispatch_retry_base_sec, "dispatch_retry_base_sec", DEFAULT_DISPATCH_RETRY_BASE_SEC)
+                dispatch_timeout=_coerce_int_config(
+                    _cfg_val(args.dispatch_timeout, "dispatch_timeout", DEFAULT_DISPATCH_TIMEOUT_SEC),
+                    field_name="dispatch_timeout",
+                    minimum=0,
                 ),
-                max_session_rounds=int(
-                    _cfg_val(args.max_session_rounds, "max_session_rounds", DEFAULT_MAX_SESSION_ROUNDS)
+                dispatch_retries=_coerce_int_config(
+                    _cfg_val(args.dispatch_retries, "dispatch_retries", DEFAULT_DISPATCH_RETRIES),
+                    field_name="dispatch_retries",
+                    minimum=0,
                 ),
-                artifact_timeout=int(
-                    _cfg_val(args.artifact_timeout, "artifact_timeout", DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC)
+                dispatch_retry_base_sec=_coerce_int_config(
+                    _cfg_val(args.dispatch_retry_base_sec, "dispatch_retry_base_sec", DEFAULT_DISPATCH_RETRY_BASE_SEC),
+                    field_name="dispatch_retry_base_sec",
+                    minimum=0,
+                ),
+                max_session_rounds=_coerce_int_config(
+                    _cfg_val(args.max_session_rounds, "max_session_rounds", DEFAULT_MAX_SESSION_ROUNDS),
+                    field_name="max_session_rounds",
+                    minimum=0,
+                ),
+                artifact_timeout=_coerce_int_config(
+                    _cfg_val(args.artifact_timeout, "artifact_timeout", DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC),
+                    field_name="artifact_timeout",
+                    minimum=0,
                 ),
                 allow_dirty=args.allow_dirty,
                 verbose=args.verbose,
             )
+            _validate_run_config(config)
             cmd_run(
                 config,
                 single_round=args.single_round,
@@ -6464,7 +6696,8 @@ def main() -> None:
         sys.exit(EXIT_LOCK_FAILURE)
     except DispatchError:
         sys.exit(EXIT_TIMEOUT)
-    except ValidationError:
+    except ValidationError as e:
+        print(f"Error: validation error: {e}", file=sys.stderr)
         sys.exit(EXIT_VALIDATION_ERROR)
     except ConfigError:
         sys.exit(EXIT_GENERAL_ERROR)
