@@ -2245,6 +2245,7 @@ def test_feed_event_constants_defined() -> None:
     assert orchestrator.FEED_REVIEW_VERDICT == "review_verdict"
     assert orchestrator.FEED_HEARTBEAT == "heartbeat"
     assert orchestrator.FEED_STATE_TRANSITION == "state_transition"
+    assert orchestrator.FEED_LANE_PLAN_STAGE == "lane_plan_stage"
 
 
 def test_run_auto_dispatch_emits_standardized_feed_events(monkeypatch) -> None:
@@ -3911,6 +3912,90 @@ def test_load_task_card_rejects_lane_self_dependency(tmp_path: Path, capsys) -> 
     assert "lane 'lane_core' must not depend on itself" in capsys.readouterr().err
 
 
+def test_plan_lane_execution_stages_independent_lanes_share_stage(tmp_path: Path) -> None:
+    source = tmp_path / "task_input.json"
+    stages = orchestrator._plan_lane_execution_stages(
+        [
+            {"lane_id": "lane_api", "owner_paths": ["src/api.py"]},
+            {"lane_id": "lane_ui", "owner_paths": ["src/ui.py"]},
+        ],
+        source=source,
+    )
+
+    assert stages == [["lane_api", "lane_ui"]]
+
+
+def test_plan_lane_execution_stages_chained_dependencies(tmp_path: Path) -> None:
+    source = tmp_path / "task_input.json"
+    stages = orchestrator._plan_lane_execution_stages(
+        [
+            {"lane_id": "lane_a", "owner_paths": ["a.py"]},
+            {"lane_id": "lane_b", "owner_paths": ["b.py"], "depends_on": ["lane_a"]},
+            {"lane_id": "lane_c", "owner_paths": ["c.py"], "depends_on": ["lane_b"]},
+        ],
+        source=source,
+    )
+
+    assert stages == [["lane_a"], ["lane_b"], ["lane_c"]]
+
+
+def test_plan_lane_execution_stages_fanout_and_fanin(tmp_path: Path) -> None:
+    source = tmp_path / "task_input.json"
+    stages = orchestrator._plan_lane_execution_stages(
+        [
+            {"lane_id": "lane_root", "owner_paths": ["root.py"]},
+            {"lane_id": "lane_left", "owner_paths": ["left.py"], "depends_on": ["lane_root"]},
+            {"lane_id": "lane_right", "owner_paths": ["right.py"], "depends_on": ["lane_root"]},
+            {
+                "lane_id": "lane_merge",
+                "owner_paths": ["merge.py"],
+                "depends_on": ["lane_left", "lane_right"],
+            },
+        ],
+        source=source,
+    )
+
+    assert stages == [["lane_root"], ["lane_left", "lane_right"], ["lane_merge"]]
+
+
+def test_plan_lane_execution_stages_rejects_missing_lane_dependency(tmp_path: Path) -> None:
+    source = tmp_path / "task_input.json"
+    with pytest.raises(orchestrator.ConfigError) as exc:
+        orchestrator._plan_lane_execution_stages(
+            [
+                {"lane_id": "lane_core", "owner_paths": ["src/core.py"], "depends_on": ["lane_missing"]},
+            ],
+            source=source,
+        )
+
+    assert "depends_on missing lane 'lane_missing'" in str(exc.value)
+    assert "Add the missing lane definition or remove the dependency." in str(exc.value)
+
+
+def test_load_task_card_rejects_lane_dependency_cycle(tmp_path: Path, capsys) -> None:
+    task_path = tmp_path / "task_input.json"
+    task_path.write_text(
+        json.dumps(
+            {
+                "task_id": "T-900",
+                "goal": "bad lane cycle",
+                "lanes": [
+                    {"lane_id": "lane_a", "owner_paths": ["src/a.py"], "depends_on": ["lane_b"]},
+                    {"lane_id": "lane_b", "owner_paths": ["src/b.py"], "depends_on": ["lane_a"]},
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        orchestrator._load_task_card(str(task_path))
+
+    assert exc.value.code == 1
+    assert "lane dependency cycle detected" in capsys.readouterr().err
+
+
 def test_load_task_card_rejects_lane_owner_paths_with_traversal(tmp_path: Path, capsys) -> None:
     task_path = tmp_path / "task_input.json"
     task_path.write_text(
@@ -4110,6 +4195,49 @@ def test_single_round_blocks_when_dependency_not_done(tmp_path: Path, monkeypatc
     src_task_card = json.loads(task_path.read_text(encoding="utf-8"))
     assert bus_task_card["status"] == "blocked"
     assert src_task_card["status"] == "blocked"
+
+
+def test_emit_lane_execution_plan_emits_stage_feed_events(monkeypatch) -> None:
+    feed_events: list[tuple[str, dict[str, object]]] = []
+    log_messages: list[str] = []
+
+    def fake_feed_event(event: str, *, level: str = "info", data: dict | None = None, paths=None) -> None:
+        _ = (level, paths)
+        feed_events.append((event, dict(data or {})))
+
+    def fake_log(message: str, paths=None) -> None:
+        _ = paths
+        log_messages.append(message)
+
+    monkeypatch.setattr(orchestrator, "_feed_event", fake_feed_event)
+    monkeypatch.setattr(orchestrator, "_log", fake_log)
+
+    orchestrator._emit_lane_execution_plan(
+        task_id="T-727",
+        round_num=1,
+        lane_stages=[["lane_core", "lane_tests"], ["lane_docs"]],
+    )
+
+    assert "Lane execution plan computed: 2 stage(s)" in log_messages
+    stage_events = [payload for event, payload in feed_events if event == orchestrator.FEED_LANE_PLAN_STAGE]
+    assert stage_events == [
+        {
+            "task_id": "T-727",
+            "round": 1,
+            "role": "orchestrator",
+            "stage_index": 0,
+            "stage_count": 2,
+            "lanes": ["lane_core", "lane_tests"],
+        },
+        {
+            "task_id": "T-727",
+            "round": 1,
+            "role": "orchestrator",
+            "stage_index": 1,
+            "stage_count": 2,
+            "lanes": ["lane_docs"],
+        },
+    ]
 
 
 def test_single_round_fails_on_dependency_cycle(tmp_path: Path, monkeypatch) -> None:

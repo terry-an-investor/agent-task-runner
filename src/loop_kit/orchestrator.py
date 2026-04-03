@@ -221,6 +221,7 @@ FEED_ROUND_COMPLETE = "round_complete"
 FEED_REVIEW_VERDICT = "review_verdict"
 FEED_HEARTBEAT = "heartbeat"
 FEED_STATE_TRANSITION = "state_transition"
+FEED_LANE_PLAN_STAGE = "lane_plan_stage"
 FEED_LOG = "log"
 BACKEND_CODEX = "codex"
 BACKEND_CLAUDE = "claude"
@@ -4983,6 +4984,107 @@ def _normalize_task_lanes(task_card: dict, *, source: Path) -> list[TaskLane]:
     return normalized_lanes
 
 
+def _detect_graph_cycle(graph: dict[str, list[str]], *, first_node: str | None = None) -> list[str] | None:
+    visited: set[str] = set()
+    in_stack: set[str] = set()
+    stack: list[str] = []
+
+    def visit(node: str) -> list[str] | None:
+        visited.add(node)
+        in_stack.add(node)
+        stack.append(node)
+        for dep in graph.get(node, []):
+            if dep not in graph:
+                continue
+            if dep in in_stack:
+                start_index = stack.index(dep)
+                return stack[start_index:] + [dep]
+            if dep not in visited:
+                cycle = visit(dep)
+                if cycle is not None:
+                    return cycle
+        stack.pop()
+        in_stack.remove(node)
+        return None
+
+    ordered_nodes: list[str] = []
+    if first_node and first_node in graph:
+        ordered_nodes.append(first_node)
+    for node in sorted(graph):
+        if not ordered_nodes or node != ordered_nodes[0]:
+            ordered_nodes.append(node)
+
+    for node in ordered_nodes:
+        if node in visited:
+            continue
+        cycle = visit(node)
+        if cycle is not None:
+            return cycle
+    return None
+
+
+def _plan_lane_execution_stages(lanes: list[TaskLane], *, source: Path) -> list[list[str]]:
+    if not lanes:
+        return []
+
+    lane_order: list[str] = []
+    dependencies_by_lane: dict[str, list[str]] = {}
+    dependents_by_lane: dict[str, list[str]] = {}
+
+    for lane in lanes:
+        lane_id = str(lane["lane_id"])
+        lane_order.append(lane_id)
+        dependencies = [str(dep).strip() for dep in cast(list[str], lane.get("depends_on", [])) if str(dep).strip()]
+        dependencies_by_lane[lane_id] = dependencies
+        dependents_by_lane[lane_id] = []
+
+    lane_order_index = {lane_id: idx for idx, lane_id in enumerate(lane_order)}
+    for lane_id in lane_order:
+        for dep_id in dependencies_by_lane[lane_id]:
+            if dep_id not in dependencies_by_lane:
+                raise ConfigError(
+                    f"task card {source}: lane '{lane_id}' depends_on missing lane '{dep_id}'. "
+                    "Add the missing lane definition or remove the dependency."
+                )
+            dependents_by_lane[dep_id].append(lane_id)
+
+    indegree_by_lane = {lane_id: len(dependencies_by_lane[lane_id]) for lane_id in lane_order}
+    current_stage = [lane_id for lane_id in lane_order if indegree_by_lane[lane_id] == 0]
+    stages: list[list[str]] = []
+    visited_count = 0
+    while current_stage:
+        stages.append(list(current_stage))
+        next_stage: list[str] = []
+        for lane_id in current_stage:
+            visited_count += 1
+            for dependent_id in dependents_by_lane[lane_id]:
+                indegree_by_lane[dependent_id] -= 1
+                if indegree_by_lane[dependent_id] == 0:
+                    next_stage.append(dependent_id)
+        next_stage.sort(key=lambda lane_id: lane_order_index[lane_id])
+        current_stage = next_stage
+
+    if visited_count != len(lane_order):
+        cycle = _detect_graph_cycle(
+            dependencies_by_lane,
+            first_node=(lane_order[0] if lane_order else None),
+        )
+        cycle_text = " -> ".join(cycle) if cycle else "<unresolved cycle>"
+        raise ConfigError(
+            f"task card {source}: lane dependency cycle detected: {cycle_text}. "
+            "Update lanes.depends_on so lane dependencies form a DAG."
+        )
+
+    return stages
+
+
+def _task_lane_execution_stages(task_card: TaskCard, *, source: Path) -> list[list[str]]:
+    lanes_raw = task_card.get("lanes")
+    if not isinstance(lanes_raw, list) or not lanes_raw:
+        return []
+    return _plan_lane_execution_stages(cast(list[TaskLane], lanes_raw), source=source)
+
+
 def _task_card_candidate_paths(task_id: str, *, paths: LoopPaths | None = None) -> list[Path]:
     resolved_paths = _resolve_paths(paths)
     tasks_dir = resolved_paths.dir / "tasks"
@@ -5051,6 +5153,7 @@ def _load_task_card_or_raise(task_path: str | Path) -> tuple[Path, TaskCard, str
         task_card_typed["lanes"] = lanes
     elif "lanes" in task_card_typed:
         task_card_typed["lanes"] = []
+    _task_lane_execution_stages(task_card_typed, source=tp)
     return tp, task_card_typed, task_id or "UNKNOWN"
 
 
@@ -5071,38 +5174,7 @@ def _task_card_status(task_card: TaskCard) -> str:
 
 
 def _detect_dependency_cycle(graph: dict[str, list[str]], root_task_id: str) -> list[str] | None:
-    visited: set[str] = set()
-    in_stack: set[str] = set()
-    stack: list[str] = []
-
-    def visit(node: str) -> list[str] | None:
-        visited.add(node)
-        in_stack.add(node)
-        stack.append(node)
-        for dep in graph.get(node, []):
-            if dep not in graph:
-                continue
-            if dep in in_stack:
-                start_index = stack.index(dep)
-                return stack[start_index:] + [dep]
-            if dep not in visited:
-                cycle = visit(dep)
-                if cycle is not None:
-                    return cycle
-        stack.pop()
-        in_stack.remove(node)
-        return None
-
-    cycle = visit(root_task_id)
-    if cycle is not None:
-        return cycle
-    for node in sorted(graph):
-        if node in visited:
-            continue
-        cycle = visit(node)
-        if cycle is not None:
-            return cycle
-    return None
+    return _detect_graph_cycle(graph, first_node=root_task_id)
 
 
 def _build_task_dependency_snapshot(task_path: str, *, paths: LoopPaths | None = None) -> _TaskDependencySnapshot:
@@ -5158,6 +5230,34 @@ def _dependency_blocked_reasons(snapshot: _TaskDependencySnapshot, *, task_id: s
         if dep_status != TASK_STATUS_DONE:
             reasons.append(f"{dep_task_id}: status={dep_status!r} (expected {TASK_STATUS_DONE!r})")
     return reasons
+
+
+def _emit_lane_execution_plan(
+    *,
+    task_id: str,
+    round_num: int,
+    lane_stages: list[list[str]],
+    paths: LoopPaths | None = None,
+) -> None:
+    if not lane_stages:
+        return
+    _log(f"Lane execution plan computed: {len(lane_stages)} stage(s)", paths=paths)
+    stage_count = len(lane_stages)
+    for stage_index, lane_ids in enumerate(lane_stages):
+        lane_set_text = ", ".join(lane_ids)
+        _log(f"Lane stage {stage_index}: {lane_set_text}", paths=paths)
+        _feed_event(
+            FEED_LANE_PLAN_STAGE,
+            data=_feed_data(
+                task_id=task_id,
+                round_num=round_num,
+                role="orchestrator",
+                stage_index=stage_index,
+                stage_count=stage_count,
+                lanes=list(lane_ids),
+            ),
+            paths=paths,
+        )
 
 
 def _render_dependency_tree(snapshot: _TaskDependencySnapshot) -> list[str]:
@@ -7008,12 +7108,19 @@ def _run_single_round(
 
     task_id = str(state_task_id)
     base_sha = str(state_base_sha)
+    lane_stages = _task_lane_execution_stages(task_card, source=resolved_paths.task_card)
     _set_feed_task_id(task_id)
     _set_feed_round(round_num)
 
     _log(f"Loaded task card: {task_id}")
     _log(f"Goal: {task_card.get('goal', '<no goal>')}")
     _log(f"Single-round state contract: task_id={task_id} base_sha={base_sha}")
+    _emit_lane_execution_plan(
+        task_id=task_id,
+        round_num=round_num,
+        lane_stages=lane_stages,
+        paths=resolved_paths,
+    )
 
     if not isinstance(state.get("round_details"), list):
         state["round_details"] = []

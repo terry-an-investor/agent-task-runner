@@ -291,8 +291,15 @@ When lanes are provided, the orchestrator validates:
 - `lane_id` values are unique
 - `depends_on` only references existing lane IDs
 - lanes do not depend on themselves
+- lane dependencies are acyclic (`lanes.depends_on` must form a DAG)
 - `owner_paths` rejects absolute paths and traversal segments
 - `owner_paths` has no overlap across lanes (same path or parent/child ownership)
+
+When lanes are present and valid, the orchestrator computes deterministic execution stages for troubleshooting and future parallel scheduling:
+- each stage contains lanes whose dependencies are already satisfied
+- lane order is deterministic for equal-priority lanes (task-card declaration order)
+- round logs include `Lane stage <index>: <lane set>`
+- feed emits `lane_plan_stage` events with `stage_index`, `stage_count`, and `lanes`
 
 `status` is system-managed while the loop runs: it is written to `in_progress` at start, `done` on approved completion, and `blocked` on non-approved terminal failures, including unsatisfied task dependencies before dispatch.
 
