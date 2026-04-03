@@ -1403,11 +1403,6 @@ def _build_codex_command(
             "--dangerously-bypass-approvals-and-sandbox",
             "-C",
             str(ROOT),
-            (
-                "Execute the context provided via stdin.  Follow the instructions"
-                " embedded in it and only finish after the required output artifact"
-                " is written."
-            ),
         ]
     )
     return (
@@ -3587,9 +3582,7 @@ def _load_task_card(task_path: str) -> tuple[Path, TaskCard, str]:
         sys.exit(EXIT_GENERAL_ERROR)
 
 
-def _sync_task_card_to_bus(
-    task_path: str, round_num: int = 1, paths: LoopPaths | None = None
-) -> tuple[TaskCard, str]:
+def _sync_task_card_to_bus(task_path: str, round_num: int = 1, paths: LoopPaths | None = None) -> tuple[TaskCard, str]:
     resolved_paths = _resolve_paths(paths)
     tp, task_card, task_id = _load_task_card(task_path)
     if _normalized_abs(tp) != _normalized_abs(resolved_paths.task_card):
