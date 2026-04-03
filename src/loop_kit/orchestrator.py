@@ -37,11 +37,87 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Literal, NotRequired, Required, TypedDict, cast
 
 if os.name == "nt":
     import msvcrt
 else:
     import fcntl
+
+
+class WorkReportTest(TypedDict):
+    name: str
+    result: str
+    output: NotRequired[str]
+
+
+class ReviewIssue(TypedDict):
+    severity: str
+    file: str
+    reason: str
+    id: NotRequired[str]
+    required_change: NotRequired[str]
+    category: NotRequired[str]
+    confidence: NotRequired[int | float | str]
+
+
+class WorkReport(TypedDict):
+    task_id: str
+    head_sha: str
+    round: int
+    files_changed: NotRequired[list[str]]
+    tests: NotRequired[list[WorkReportTest]]
+    notes: NotRequired[str]
+
+
+class ReviewReport(TypedDict):
+    task_id: str
+    decision: str
+    round: int
+    blocking_issues: NotRequired[list[ReviewIssue]]
+    non_blocking_suggestions: NotRequired[list[str]]
+
+
+class ReviewRequest(TypedDict):
+    task_id: str
+    base_sha: str
+    head_sha: str
+    commits: str
+    diff: str
+    acceptance_criteria: list[str]
+    constraints: list[str]
+    round: int
+    worker_notes: str
+    worker_tests: list[WorkReportTest]
+
+
+class TaskPacket(TypedDict):
+    target_files: list[str]
+    target_symbols: list[str]
+    invariants: list[str]
+    acceptance_checks: list[str]
+    known_risks: list[str]
+    commands_to_run: list[str]
+
+
+class FixList(TypedDict, total=False):
+    task_id: Required[str]
+    round: Required[int]
+    base_sha: Required[str]
+    head_sha: Required[str]
+    fixes: Required[list[ReviewIssue]]
+    prior_round_notes: NotRequired[str]
+    prior_review_non_blocking: NotRequired[list[str]]
+
+
+class TaskCard(TypedDict, total=False):
+    task_id: Required[str]
+    goal: Required[str]
+    in_scope: Required[list[str]]
+    out_of_scope: Required[list[str]]
+    acceptance_criteria: Required[list[str]]
+    constraints: Required[list[str]]
+
 
 ROOT = Path.cwd()
 LOOP_DIR = ROOT / ".loop"
@@ -1871,7 +1947,7 @@ def _render_knowledge_section() -> str:
 _function_index_cache: tuple[tuple[int, float], str] | None = None
 
 
-def _build_task_packet(task_card: dict, round_num: int) -> dict:
+def _build_task_packet(task_card: TaskCard, round_num: int) -> TaskPacket:
     in_scope = task_card.get("in_scope", [])
     target_files: list[str] = []
     for item in in_scope:
@@ -1903,8 +1979,9 @@ def _build_task_packet(task_card: dict, round_num: int) -> dict:
     known_risks: list[str] = _read_markdown_knowledge_lines(_PITFALLS_FILE)
 
     if round_num > 1:
-        fix_list = _read_json_if_exists(FIX_LIST)
-        if isinstance(fix_list, dict):
+        fix_list_data = _read_json_if_exists(FIX_LIST)
+        if isinstance(fix_list_data, dict):
+            fix_list = cast(FixList, fix_list_data)
             fixes = fix_list.get("fixes", [])
             if isinstance(fixes, list):
                 for issue in fixes:
@@ -1956,7 +2033,7 @@ def _function_index(path: Path) -> str:
     return result
 
 
-def _render_task_card_section(task_card: dict) -> str:
+def _render_task_card_section(task_card: TaskCard) -> str:
     return (
         "=== TASK CARD ===\n"
         f"goal: {task_card.get('goal', '<none>')}\n"
@@ -1974,10 +2051,12 @@ def _render_task_card_section(task_card: dict) -> str:
 def _render_prior_round_context_section(round_num: int) -> str | None:
     if round_num <= 1:
         return None
-    work = _read_json_if_exists(WORK_REPORT)
-    review = _read_json_if_exists(REVIEW_REPORT)
-    if not isinstance(work, dict) or not isinstance(review, dict):
+    work_data = _read_json_if_exists(WORK_REPORT)
+    review_data = _read_json_if_exists(REVIEW_REPORT)
+    if not isinstance(work_data, dict) or not isinstance(review_data, dict):
         return None
+    work = cast(WorkReport, work_data)
+    review = cast(ReviewReport, review_data)
 
     blocking = review.get("blocking_issues", [])
     if isinstance(blocking, list) and blocking:
@@ -2079,9 +2158,11 @@ def _read_text_with_default(project_path: Path, default_filename: str) -> str:
 
 
 def _render_fix_list_section(round_num: int) -> str:
-    fix_list = _read_json_if_exists(FIX_LIST)
-    if not isinstance(fix_list, dict):
+    _ = round_num
+    fix_list_data = _read_json_if_exists(FIX_LIST)
+    if not isinstance(fix_list_data, dict):
         return "- <none>"
+    fix_list = cast(FixList, fix_list_data)
     fixes = fix_list.get("fixes", [])
     if not isinstance(fixes, list) or not fixes:
         return "- <none>"
@@ -2097,9 +2178,10 @@ def _render_fix_list_section(round_num: int) -> str:
 
 
 def _render_task_packet_section() -> str:
-    packet = _read_json_if_exists(TASK_PACKET)
-    if not isinstance(packet, dict):
+    packet_data = _read_json_if_exists(TASK_PACKET)
+    if not isinstance(packet_data, dict):
         return "- <none>"
+    packet = cast(TaskPacket, packet_data)
     lines = []
     target_files = packet.get("target_files", [])
     lines.append(f"target_files:\n{_as_prompt_list(target_files)}")
@@ -2149,8 +2231,9 @@ def _build_prompt_sections(task_id: str, round_num: int) -> list[tuple[str, str]
             "agents_md_default.txt",
         )
         orchestrator_path = ROOT / "src" / "loop_kit" / "orchestrator.py"
-        task_card = _read_json_if_exists(TASK_CARD)
-        task_card_section = _render_task_card_section(task_card if isinstance(task_card, dict) else {})
+        task_card_data = _read_json_if_exists(TASK_CARD)
+        task_card = cast(TaskCard, task_card_data) if isinstance(task_card_data, dict) else cast(TaskCard, {})
+        task_card_section = _render_task_card_section(task_card)
         prior_context_section = _render_prior_round_context_section(round_num)
 
         sections = [
@@ -2198,8 +2281,9 @@ def _worker_prompt(task_id: str, round_num: int) -> str:
             "code_writer_md_default.txt",
         )
         orchestrator_path = ROOT / "src" / "loop_kit" / "orchestrator.py"
-        task_card = _read_json_if_exists(TASK_CARD)
-        task_card_section = _render_task_card_section(task_card if isinstance(task_card, dict) else {})
+        task_card_data = _read_json_if_exists(TASK_CARD)
+        task_card = cast(TaskCard, task_card_data) if isinstance(task_card_data, dict) else cast(TaskCard, {})
+        task_card_section = _render_task_card_section(task_card)
         prior_context_section = _render_prior_round_context_section(round_num)
         knowledge_section = _render_knowledge_section()
         task_packet_section = _render_task_packet_section()
@@ -2474,11 +2558,11 @@ def _enforce_clean_worktree_or_exit(*, allow_dirty: bool) -> None:
 
 
 def _validate_report(
-    report: dict,
+    report: WorkReport | ReviewReport,
     *,
     expected_task_id: str,
     expected_round: int,
-    schema: str,
+    schema: Literal["work_report", "review_report"],
 ) -> str | None:
     if schema == "work_report":
         required_types: dict[str, type] = {
@@ -2947,7 +3031,7 @@ def cmd_health(ttl: int) -> None:
 
 
 # ── main run loop ───────────────────────────────────────────────────
-def _load_task_card(task_path: str) -> tuple[Path, dict, str]:
+def _load_task_card(task_path: str) -> tuple[Path, TaskCard, str]:
     tp = Path(task_path)
     if not tp.exists():
         print(f"Error: task card not found: {tp}", file=sys.stderr)
@@ -2963,11 +3047,12 @@ def _load_task_card(task_path: str) -> tuple[Path, dict, str]:
     if not isinstance(task_card, dict):
         print(f"Error: task card must be a JSON object: {tp}", file=sys.stderr)
         sys.exit(EXIT_GENERAL_ERROR)
-    task_id = task_card.get("task_id", "UNKNOWN")
-    return tp, task_card, task_id
+    task_card_typed = cast(TaskCard, task_card)
+    task_id = cast(str, task_card_typed.get("task_id", "UNKNOWN"))
+    return tp, task_card_typed, task_id
 
 
-def _sync_task_card_to_bus(task_path: str, round_num: int = 1) -> tuple[dict, str]:
+def _sync_task_card_to_bus(task_path: str, round_num: int = 1) -> tuple[TaskCard, str]:
     tp, task_card, task_id = _load_task_card(task_path)
     if _normalized_abs(tp) != _normalized_abs(TASK_CARD):
         _archive_bus_file(TASK_CARD, task_id, round_num, "task_card")
@@ -3076,7 +3161,7 @@ def _wait_for_role_result(
     config: RunConfig,
     task_id: str,
     round_num: int,
-) -> dict | None:
+) -> WorkReport | ReviewReport | None:
     return _wait_for_file(
         artifact_path,
         f"{role.capitalize()} result",
@@ -3089,13 +3174,13 @@ def _wait_for_role_result(
     )
 
 
-def _print_blocking_issues(items: list[dict]) -> None:
+def _print_blocking_issues(items: list[ReviewIssue]) -> None:
     print(f"  Blocking issues: {len(items)}")
     for issue in items:
         print(f"    - [{issue.get('severity', '?')}] {issue.get('file', '')}: {issue.get('reason', '')}")
 
 
-def _issue_to_pitfall_line(issue: dict) -> str | None:
+def _issue_to_pitfall_line(issue: ReviewIssue) -> str | None:
     severity = str(issue.get("severity", "?")).strip() or "?"
     file_path = str(issue.get("file", "")).strip()
     reason = str(issue.get("reason", "")).strip()
@@ -3138,27 +3223,29 @@ def _append_pitfalls(lines: list[str]) -> int:
 
 
 def _update_knowledge_on_approval(task_id: str, round_num: int) -> None:
-    sources: list[dict] = []
+    sources: list[ReviewReport] = []
 
-    current_review = _read_json_if_exists(REVIEW_REPORT)
+    current_review_data = _read_json_if_exists(REVIEW_REPORT)
     if (
-        isinstance(current_review, dict)
-        and current_review.get("task_id") == task_id
-        and current_review.get("round") == round_num
+        isinstance(current_review_data, dict)
+        and current_review_data.get("task_id") == task_id
+        and current_review_data.get("round") == round_num
     ):
+        current_review = cast(ReviewReport, current_review_data)
         sources.append(current_review)
 
     archived_review_path = _task_archive_dir(task_id) / f"r{round_num}_review_report.json"
-    archived_review = _read_json_if_exists(archived_review_path)
-    if isinstance(archived_review, dict) and archived_review.get("task_id") == task_id:
+    archived_review_data = _read_json_if_exists(archived_review_path)
+    if isinstance(archived_review_data, dict) and archived_review_data.get("task_id") == task_id:
+        archived_review = cast(ReviewReport, archived_review_data)
         sources.append(archived_review)
 
-    blocking_issues: list[dict] = []
+    blocking_issues: list[ReviewIssue] = []
     for review in sources:
         raw_blocking = review.get("blocking_issues", [])
         items = [item for item in raw_blocking if isinstance(item, dict)] if isinstance(raw_blocking, list) else []
         if items:
-            blocking_issues = items
+            blocking_issues = cast(list[ReviewIssue], items)
             break
     if not blocking_issues:
         return
@@ -3272,7 +3359,7 @@ def _run_single_round(
     state["state"] = STATE_AWAITING_WORK
     _save_single_round_state()
 
-    task_packet = _build_task_packet(task_card, round_num)
+    task_packet: TaskPacket = _build_task_packet(task_card, round_num)
     TASK_PACKET.write_text(
         json.dumps(task_packet, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
@@ -3284,7 +3371,7 @@ def _run_single_round(
 
     _print_round_header(round_num, "worker")
 
-    work: dict | None = None
+    work: WorkReport | None = None
     try:
         work = _auto_dispatch_role(
             role="worker",
@@ -3363,7 +3450,7 @@ def _run_single_round(
     print(f"  Worker completed: {head_sha[:8]}")
     print(f"  Files changed: {', '.join(work.get('files_changed', []))}")
 
-    review_request = {
+    review_request: ReviewRequest = {
         "task_id": task_id,
         "base_sha": base_sha,
         "head_sha": head_sha,
@@ -3388,7 +3475,7 @@ def _run_single_round(
 
     _print_round_header(round_num, "reviewer")
 
-    review: dict | None = None
+    review: ReviewReport | None = None
     try:
         review = _auto_dispatch_role(
             role="reviewer",
@@ -3496,8 +3583,8 @@ def _run_single_round(
 
     raw_blocking = review.get("blocking_issues", [])
     blocking = raw_blocking if isinstance(raw_blocking, list) else []
-    blocking_items = [item for item in blocking if isinstance(item, dict)]
-    fix_list = {
+    blocking_items = cast(list[ReviewIssue], [item for item in blocking if isinstance(item, dict)])
+    fix_list: FixList = {
         "task_id": task_id,
         "round": round_num + 1,
         "base_sha": base_sha,
@@ -3694,8 +3781,10 @@ def _run_multi_round_via_subprocess(
                 return
 
             _ = _load_task_card(str(TASK_CARD))
-            review = _read_json_if_exists(REVIEW_REPORT)
-            fix_list = _read_json_if_exists(FIX_LIST)
+            review_data = _read_json_if_exists(REVIEW_REPORT)
+            review = cast(ReviewReport, review_data) if isinstance(review_data, dict) else None
+            fix_list_data = _read_json_if_exists(FIX_LIST)
+            fix_list = cast(FixList, fix_list_data) if isinstance(fix_list_data, dict) else None
             state = _load_state()
 
             if state.get("task_id") != task_id or state.get("base_sha") != base_sha:
@@ -3719,7 +3808,7 @@ def _run_multi_round_via_subprocess(
             if state.get("state") == STATE_AWAITING_WORK and state.get("round") == round_num + 1:
                 last_decision = "changes_required"
                 if (
-                    isinstance(fix_list, dict)
+                    fix_list is not None
                     and fix_list.get("task_id") == task_id
                     and fix_list.get("round") == round_num + 1
                 ):
@@ -3730,7 +3819,7 @@ def _run_multi_round_via_subprocess(
                         "State indicates changes_required, but fix_list.json is missing/stale; "
                         "continuing based on state.json contract."
                     )
-                if isinstance(review, dict):
+                if review is not None:
                     decision = review.get("decision")
                     if decision not in (None, "changes_required"):
                         _log(f"Ignoring stale review_report decision={decision!r}; state.json is authoritative.")
