@@ -4093,6 +4093,10 @@ def _normalize_state_for_transition(value: object) -> str:
     return STATE_IDLE
 
 
+def _normalized_state_name_from_persisted(state: dict) -> str:
+    return _normalize_state_for_transition(state.get("state"))
+
+
 STATE_TRANSITIONS: dict[str, _StateTransitionRule] = {
     STATE_TRIGGER_BOOTSTRAP: _StateTransitionRule(
         trigger=STATE_TRIGGER_BOOTSTRAP,
@@ -6815,6 +6819,7 @@ def _run_multi_round_via_subprocess(
             fix_list_data = _read_json_if_exists(resolved_paths.fix_list)
             fix_list = cast(FixList, fix_list_data) if isinstance(fix_list_data, dict) else None
             state = _load_state(paths=resolved_paths)
+            normalized_state_name = _normalized_state_name_from_persisted(state)
 
             if state.get("task_id") != task_id or state.get("base_sha") != base_sha:
                 _fail_with_state(
@@ -6830,13 +6835,13 @@ def _run_multi_round_via_subprocess(
                 )
                 return
 
-            if state.get("state") == STATE_DONE and state.get("outcome") == "approved":
+            if normalized_state_name == STATE_DONE and state.get("outcome") == "approved":
                 _write_task_card_status(config.task_path, TASK_STATUS_DONE, paths=resolved_paths)
                 _archive_task_summary(task_id, paths=resolved_paths)
                 _log(f"Task approved via state contract at round={round_num}")
                 return
 
-            if state.get("state") == STATE_AWAITING_WORK and state.get("round") == round_num + 1:
+            if normalized_state_name == STATE_AWAITING_WORK and state.get("round") == round_num + 1:
                 last_decision = "changes_required"
                 if (
                     fix_list is not None
@@ -6981,7 +6986,7 @@ def cmd_run(
             if resume:
                 resume_state = _load_state(paths=resolved_paths)
                 outcome = resume_state.get("outcome")
-                state_name = resume_state.get("state")
+                state_name = _normalized_state_name_from_persisted(resume_state)
                 if state_name == STATE_DONE and outcome == "approved":
                     _write_task_card_status(config.task_path, TASK_STATUS_DONE, paths=resolved_paths)
                     print(

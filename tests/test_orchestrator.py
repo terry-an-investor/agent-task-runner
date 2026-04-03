@@ -4280,6 +4280,43 @@ def test_outer_loop_uses_state_as_contract(tmp_path: Path, monkeypatch) -> None:
     assert state["outcome"] == "approved"
 
 
+def test_outer_loop_treats_legacy_review_done_as_terminal_approved(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+
+    task_path = tmp_path / "task_input.json"
+    task_path.write_text(
+        json.dumps({"task_id": "T-604", "goal": "legacy done alias contract"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(orchestrator, "_current_sha", lambda: "base-sha")
+
+    calls: list[list[str]] = []
+
+    def fake_subprocess_popen(cmd, **kwargs):
+        _ = kwargs
+        calls.append(cmd)
+        state = orchestrator._load_state()
+        state["state"] = "review_done"
+        state["outcome"] = "approved"
+        state["head_sha"] = "head-sha"
+        orchestrator._save_state(state)
+        return _FakeProc(stdout_lines=[])
+
+    monkeypatch.setattr(orchestrator.subprocess, "Popen", fake_subprocess_popen)
+
+    orchestrator.cmd_run(
+        _run_config(str(task_path), max_rounds=2),
+        single_round=False,
+        round_num=None,
+    )
+
+    # Legacy "review_done" must be interpreted as terminal done and stop immediately.
+    assert len(calls) == 1
+    state = orchestrator._load_state()
+    assert state["state"] == "review_done"
+    assert state["outcome"] == "approved"
+
+
 def test_outer_loop_continues_from_state_without_fresh_review_report(tmp_path: Path, monkeypatch) -> None:
     _configure_loop_paths(monkeypatch, tmp_path)
 
@@ -4377,6 +4414,39 @@ def test_cmd_run_resume_done_approved_exits_cleanly(tmp_path: Path, monkeypatch,
     orchestrator.STATE_FILE.write_text(
         json.dumps(
             {"state": orchestrator.STATE_DONE, "outcome": "approved", "task_id": "T-608"},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    called = {"outer": False}
+    monkeypatch.setattr(
+        orchestrator,
+        "_run_multi_round_via_subprocess",
+        lambda **kwargs: called.update({"outer": True}),
+    )
+
+    orchestrator.cmd_run(
+        _run_config(str(task_path)),
+        single_round=False,
+        round_num=None,
+        resume=True,
+    )
+
+    assert called["outer"] is False
+    out = capsys.readouterr().out
+    assert "done/approved" in out
+
+
+def test_cmd_run_resume_legacy_review_done_approved_exits_cleanly(tmp_path: Path, monkeypatch, capsys) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+    task_path = tmp_path / "task_input.json"
+    task_path.write_text(
+        json.dumps({"task_id": "T-608", "goal": "resume legacy done alias"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    orchestrator.STATE_FILE.write_text(
+        json.dumps(
+            {"state": "review_done", "outcome": "approved", "task_id": "T-608"},
             ensure_ascii=False,
         ),
         encoding="utf-8",
