@@ -1,5 +1,5 @@
 {
   "auto_dispatch": true,
   "worker_backend": "codex",
-  "reviewer_backend": "opencode"
+  "reviewer_backend": "codex"
 }

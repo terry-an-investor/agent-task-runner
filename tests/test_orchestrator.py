@@ -173,11 +173,19 @@ def test_agent_command_codex_uses_resume_session_when_provided(monkeypatch) -> N
         resume_session_id="tid-resume-123",
     )
 
-    assert cmd[:4] == ["codex.exe", "exec", "resume", "tid-resume-123"]
+    assert cmd[0:2] == ["codex.exe", "exec"]
+    assert "resume" in cmd
+    assert cmd[cmd.index("resume") + 1] == "tid-resume-123"
     assert "--json" in cmd
     assert "--dangerously-bypass-approvals-and-sandbox" in cmd
+    assert "stdin" in cmd[-1].lower()
     assert session_id == "tid-resume-123"
     assert stdin_text == "payload"
+
+
+def test_is_invalid_resume_session_error_handles_codex_no_rollout_message() -> None:
+    message = "Error: thread/resume failed: no rollout found for thread id deadbeef"
+    assert orchestrator._is_invalid_resume_session_error(message) is True
 
 
 def test_agent_command_claude_passes_prompt_via_stdin(monkeypatch) -> None:

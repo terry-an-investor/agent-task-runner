@@ -1394,20 +1394,29 @@ def _build_codex_command(
     prompt: str,
     resume_session_id: str | None = None,
 ) -> tuple[list[str], str | None, str | None]:
-    cmd = [exe, "exec"]
-    if isinstance(resume_session_id, str) and resume_session_id.strip():
-        cmd.extend(["resume", resume_session_id.strip()])
-    cmd.extend(
-        [
-            "--json",
-            "--dangerously-bypass-approvals-and-sandbox",
-            "-C",
-            str(ROOT),
-        ]
+    cmd = [
+        exe,
+        "exec",
+        "--json",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "-C",
+        str(ROOT),
+    ]
+    sid = resume_session_id.strip() if isinstance(resume_session_id, str) and resume_session_id.strip() else None
+    if sid:
+        cmd.extend(["resume", sid])
+    cmd.append(
+        (
+            "Execute the context provided via stdin. Follow the instructions"
+            " embedded in it and only finish after the required output artifact"
+            " is written."
+        )
     )
     return (
-        cmd,
-        (resume_session_id.strip() if isinstance(resume_session_id, str) and resume_session_id.strip() else None),
+        [
+            *cmd,
+        ],
+        sid,
         prompt,
     )
 
@@ -1826,6 +1835,7 @@ def _is_invalid_resume_session_error(text: str) -> bool:
         for token in (
             "invalid",
             "not found",
+            "no rollout found",
             "unknown",
             "expired",
             "does not exist",
