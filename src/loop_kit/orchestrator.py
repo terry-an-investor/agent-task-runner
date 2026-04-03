@@ -1308,9 +1308,7 @@ def _resolve_opencode_exe(backend: str) -> str:
 def _build_opencode_command(
     exe: str,
     prompt: str,
-    resume_session_id: str | None = None,
 ) -> tuple[list[str], str | None, str | None]:
-    _ = resume_session_id
     return (
         [
             exe,
