@@ -2003,6 +2003,25 @@ def _render_prior_round_context_section(round_num: int) -> str | None:
     )
 
 
+DEFAULT_WORKER_PROMPT_TEMPLATE = (
+    "Role: code-writer worker for PM loop.\n"
+    "Current task_id: {task_id}, round: {round_num}.\n"
+    "Execute the contract below and only finish after writing {work_report_path}.\n\n"
+    "=== BEGIN AGENTS.md ===\n"
+    "{agents_md}\n"
+    "=== END AGENTS.md ===\n\n"
+    "=== BEGIN docs/roles/code-writer.md ===\n"
+    "{role_md}\n"
+    "=== END docs/roles/code-writer.md ===\n\n"
+    "=== BEGIN FUNCTION INDEX: {orchestrator_path} ===\n"
+    "{function_index}\n"
+    "=== END FUNCTION INDEX ===\n\n"
+    "=== KNOWLEDGE ===\n{knowledge_section}\n\n"
+    "=== TASK PACKET ===\n{task_packet_section}\n\n"
+    "{task_card_section}{prior_context_section}"
+)
+
+
 DEFAULT_REVIEWER_PROMPT_TEMPLATE = (
     "Role: reviewer for PM loop.\n"
     "Current task_id: {task_id}, round: {round_num}.\n"
@@ -2107,6 +2126,47 @@ def _build_prompt(header: str, sections: list[tuple[str, str]]) -> str:
     return "\n\n".join(parts)
 
 
+def _join_prompt_sections(sections: list[tuple[str, str]]) -> str:
+    parts = []
+    for title, content in sections:
+        parts.append(f"{title}\n{content}")
+    return "\n\n".join(parts)
+
+
+def _build_prompt_sections(task_id: str, round_num: int) -> list[tuple[str, str]]:
+    knowledge_section = _render_knowledge_section()
+    agents_text = _read_text_with_default(
+        ROOT / "AGENTS.md",
+        "agents_md_default.txt",
+    )
+    role_text = _read_text_with_default(
+        ROOT / "docs" / "roles" / "code-writer.md",
+        "code_writer_md_default.txt",
+    )
+    orchestrator_path = ROOT / "src" / "loop_kit" / "orchestrator.py"
+    task_card = _read_json_if_exists(TASK_CARD)
+    task_card_section = _render_task_card_section(task_card if isinstance(task_card, dict) else {})
+    prior_context_section = _render_prior_round_context_section(round_num)
+    task_packet_section = _render_task_packet_section()
+
+    sections: list[tuple[str, str]] = [
+        ("=== BEGIN AGENTS.md ===", f"{agents_text}\n=== END AGENTS.md ==="),
+        ("=== BEGIN docs/roles/code-writer.md ===", f"{role_text}\n=== END docs/roles/code-writer.md ==="),
+        (
+            "=== BEGIN FUNCTION INDEX: " + _display_path(orchestrator_path) + " ===",
+            f"{_function_index(orchestrator_path)}\n=== END FUNCTION INDEX ===",
+        ),
+        ("=== KNOWLEDGE ===", knowledge_section),
+        ("=== TASK PACKET ===", task_packet_section),
+    ]
+    if task_card_section and task_card_section != "- <none>":
+        sections.append(("=== TASK CARD ===", task_card_section))
+    if prior_context_section:
+        lines = prior_context_section.split("\n", 1)
+        sections.append((lines[0], lines[1] if len(lines) > 1 else ""))
+    return sections
+
+
 def _worker_prompt(task_id: str, round_num: int) -> str:
     knowledge_section = _render_knowledge_section()
     if round_num > 1:
@@ -2136,39 +2196,12 @@ def _worker_prompt(task_id: str, round_num: int) -> str:
             result += "\n\n"
         return result
 
-    agents_text = _read_text_with_default(
-        ROOT / "AGENTS.md",
-        "agents_md_default.txt",
-    )
-    role_text = _read_text_with_default(
-        ROOT / "docs" / "roles" / "code-writer.md",
-        "code_writer_md_default.txt",
-    )
-    orchestrator_path = ROOT / "src" / "loop_kit" / "orchestrator.py"
-    task_card = _read_json_if_exists(TASK_CARD)
-    task_card_section = _render_task_card_section(task_card if isinstance(task_card, dict) else {})
-    prior_context_section = _render_prior_round_context_section(round_num)
-    task_packet_section = _render_task_packet_section()
+    sections = _build_prompt_sections(task_id, round_num)
     header = (
         f"Role: code-writer worker for PM loop.\n"
         f"Current task_id: {task_id}, round: {round_num}.\n"
         f"Execute the contract below and only finish after writing {_display_path(WORK_REPORT)}."
     )
-    sections: list[tuple[str, str]] = [
-        ("=== BEGIN AGENTS.md ===", f"{agents_text}\n=== END AGENTS.md ==="),
-        ("=== BEGIN docs/roles/code-writer.md ===", f"{role_text}\n=== END docs/roles/code-writer.md ==="),
-        (
-            "=== BEGIN FUNCTION INDEX: " + _display_path(orchestrator_path) + " ===",
-            f"{_function_index(orchestrator_path)}\n=== END FUNCTION INDEX ===",
-        ),
-        ("=== KNOWLEDGE ===", knowledge_section),
-        ("=== TASK PACKET ===", task_packet_section),
-    ]
-    if task_card_section and task_card_section != "- <none>":
-        sections.append(("=== TASK CARD ===", task_card_section))
-    if prior_context_section:
-        lines = prior_context_section.split("\n", 1)
-        sections.append((lines[0], lines[1] if len(lines) > 1 else ""))
     return _build_prompt(header, sections)
 
 
@@ -2749,24 +2782,7 @@ def cmd_init() -> None:
         )
         print(f"  Created: {example}")
     worker_template = _worker_prompt_template_path()
-    default_worker = (
-        "Role: code-writer worker for PM loop.\n"
-        "Current task_id: {task_id}, round: {round_num}.\n"
-        "Execute the contract below and only finish after writing {work_report_path}.\n\n"
-        "=== BEGIN AGENTS.md ===\n"
-        "{agents_md}\n"
-        "=== END AGENTS.md ===\n\n"
-        "=== BEGIN docs/roles/code-writer.md ===\n"
-        "{role_md}\n"
-        "=== END docs/roles/code-writer.md ===\n\n"
-        "=== BEGIN FUNCTION INDEX: {orchestrator_path} ===\n"
-        "{function_index}\n"
-        "=== END FUNCTION INDEX ===\n\n"
-        "=== KNOWLEDGE ===\n{knowledge_section}\n\n"
-        "=== TASK PACKET ===\n{task_packet_section}\n\n"
-        "{task_card_section}{prior_context_section}"
-    )
-    if _write_template_if_missing(worker_template, default_worker + "\n"):
+    if _write_template_if_missing(worker_template, DEFAULT_WORKER_PROMPT_TEMPLATE + "\n"):
         print(f"  Created: {worker_template}")
     reviewer_template = _reviewer_prompt_template_path()
     if _write_template_if_missing(reviewer_template, DEFAULT_REVIEWER_PROMPT_TEMPLATE + "\n"):
