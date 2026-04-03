@@ -1,0 +1,2 @@
+{"pitfall":"lock stale after crash can be misleading; confirm no live orchestrator PID before manual cleanup"}
+{"pitfall":"Windows replace needs retry when antivirus/indexers hold short file locks"}

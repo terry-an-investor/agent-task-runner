@@ -1,0 +1,2 @@
+{"fact":"single-file rule: all production logic lives in src/loop_kit/orchestrator.py"}
+{"fact":"subprocess-per-round: each review round runs in a dedicated subprocess"}

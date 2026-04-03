@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import builtins
+import hashlib
 import json
 import os
 import subprocess
@@ -5151,6 +5152,106 @@ class TestKnowledgeLayer:
         ]
         persisted_by_pattern = {item["pattern"]: item for item in persisted}
         assert persisted_by_pattern["stale pattern"]["confidence"] == 0.0
+
+    def test_patterns_deduplicated_by_category_and_pattern_keep_highest_confidence(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        context_dir = tmp_path / ".loop" / "context"
+        context_dir.mkdir(parents=True, exist_ok=True)
+        now_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        (context_dir / "patterns.jsonl").write_text(
+            json.dumps(
+                {
+                    "pattern": "run tests",
+                    "category": "workflow",
+                    "confidence": 0.2,
+                    "last_verified": now_iso,
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "pattern": "run tests",
+                    "category": "workflow",
+                    "confidence": 0.9,
+                    "last_verified": now_iso,
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "pattern": "run tests",
+                    "category": "quality",
+                    "confidence": 0.4,
+                    "last_verified": now_iso,
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        feed_events: list[tuple[str, str, dict | None]] = []
+
+        def fake_feed_event(event: str, *, level: str = "info", data: dict | None = None, **kwargs) -> None:
+            _ = kwargs
+            feed_events.append((event, level, data))
+
+        monkeypatch.setattr(orchestrator, "_feed_event", fake_feed_event)
+
+        entries, stale_count = orchestrator._load_patterns_with_governance(persist=False)
+
+        assert stale_count == 0
+        assert len(entries) == 2
+        by_key = {(item["category"], item["pattern"]): item for item in entries}
+        assert by_key[("workflow", "run tests")]["confidence"] == 0.9
+        assert by_key[("quality", "run tests")]["confidence"] == 0.4
+        dedupe_logs = [
+            data
+            for event, level, data in feed_events
+            if event == orchestrator.FEED_LOG and level == "debug" and isinstance(data, dict)
+        ]
+        assert len(dedupe_logs) == 1
+        assert dedupe_logs[0]["message"] == "Pattern deduplication: 1 duplicates removed, 2 unique kept"
+
+    def test_source_version_is_populated_for_loaded_knowledge(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        context_dir = tmp_path / ".loop" / "context"
+        context_dir.mkdir(parents=True, exist_ok=True)
+        (context_dir / "project_facts.md").write_text(
+            "# facts\n- single-file rule\n- subprocess-per-round\n",
+            encoding="utf-8",
+        )
+        (context_dir / "pitfalls.md").write_text("# pitfalls\n- stale lock handling\n", encoding="utf-8")
+        now_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        (context_dir / "patterns.jsonl").write_text(
+            json.dumps(
+                {
+                    "pattern": "fresh pattern",
+                    "category": "workflow",
+                    "confidence": 0.9,
+                    "last_verified": now_iso,
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        facts = orchestrator._load_project_facts()
+        pitfalls = orchestrator._load_pitfalls()
+        patterns, _ = orchestrator._load_patterns_with_governance(persist=False)
+
+        expected_facts_version = hashlib.sha1((context_dir / "project_facts.md").read_bytes()).hexdigest()[:8]
+        expected_pitfalls_version = hashlib.sha1((context_dir / "pitfalls.md").read_bytes()).hexdigest()[:8]
+        expected_patterns_version = hashlib.sha1((context_dir / "patterns.jsonl").read_bytes()).hexdigest()[:8]
+        assert facts and pitfalls and patterns
+        assert all(item["source_version"] == expected_facts_version for item in facts)
+        assert all(item["source_version"] == expected_pitfalls_version for item in pitfalls)
+        assert all(item["source_version"] == expected_patterns_version for item in patterns)
+        assert all(len(item["source_version"]) == 8 for item in facts + pitfalls + patterns)
 
     def test_append_pitfalls_enforces_max_lines_and_preserves_header_lines(self, tmp_path: Path, monkeypatch) -> None:
         _configure_loop_paths(monkeypatch, tmp_path)

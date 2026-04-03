@@ -21,6 +21,7 @@ All messages are JSON. Git commits are the single source of truth.
 import argparse
 import ast
 import contextlib
+import hashlib
 import importlib.metadata
 import importlib.resources
 import json
@@ -2123,19 +2124,45 @@ def _strip_list_prefix(line: str) -> str:
     return stripped
 
 
-def _read_markdown_knowledge_lines(path: Path) -> list[str]:
+def _source_version_from_file(path: Path) -> str:
+    try:
+        digest = hashlib.sha1(path.read_bytes()).hexdigest()
+        return digest[:8]
+    except OSError:
+        try:
+            fallback = str(path.stat().st_mtime_ns)
+        except OSError:
+            fallback = str(time.time_ns())
+        return hashlib.sha1(fallback.encode("utf-8")).hexdigest()[:8]
+
+
+def _load_markdown_knowledge_entries(path: Path, *, field_name: str) -> list[dict[str, str]]:
     text = _read_text_optional(path)
     if not text:
         return []
-    lines: list[str] = []
+    source_version = _source_version_from_file(path)
+    entries: list[dict[str, str]] = []
     for raw in text.splitlines():
         line = raw.strip()
         if not line or line.startswith("#") or line.startswith("<!--"):
             continue
         normalized = _strip_list_prefix(line)
         if normalized:
-            lines.append(normalized)
-    return lines
+            entries.append({field_name: normalized, "source_version": source_version})
+    return entries
+
+
+def _load_project_facts() -> list[dict[str, str]]:
+    return _load_markdown_knowledge_entries(_PROJECT_FACTS_FILE, field_name="fact")
+
+
+def _load_pitfalls() -> list[dict[str, str]]:
+    return _load_markdown_knowledge_entries(_PITFALLS_FILE, field_name="pitfall")
+
+
+def _read_markdown_knowledge_lines(path: Path) -> list[str]:
+    entries = _load_markdown_knowledge_entries(path, field_name="text")
+    return [entry["text"] for entry in entries]
 
 
 def _parse_utc_iso8601(value: object) -> datetime | None:
@@ -2179,6 +2206,7 @@ def _normalize_pattern_entry(
     entry: object,
     *,
     now_utc: datetime,
+    source_version: str,
 ) -> tuple[dict | None, bool, bool]:
     if not isinstance(entry, dict):
         return None, False, False
@@ -2206,6 +2234,7 @@ def _normalize_pattern_entry(
         "category": category.strip(),
         "confidence": confidence,
         "last_verified": last_verified,
+        "source_version": source_version,
     }
     changed = any(
         (
@@ -2220,7 +2249,10 @@ def _normalize_pattern_entry(
 
 def _write_patterns_jsonl(entries: list[dict]) -> None:
     _PATTERNS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    payload = "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in entries)
+    payload = "".join(
+        json.dumps({k: v for k, v in item.items() if k != "source_version"}, ensure_ascii=False) + "\n"
+        for item in entries
+    )
     _PATTERNS_FILE.write_text(payload, encoding="utf-8")
 
 
@@ -2228,9 +2260,10 @@ def _load_patterns_with_governance(*, persist: bool = False) -> tuple[list[dict]
     text = _read_text_optional(_PATTERNS_FILE)
     if not text:
         return [], 0
+    source_version = _source_version_from_file(_PATTERNS_FILE)
     now_utc = datetime.now(UTC)
-    entries: list[dict] = []
-    stale_count = 0
+    deduped: dict[tuple[str, str], tuple[dict, bool]] = {}
+    duplicate_count = 0
     changed = False
     for raw_line in text.splitlines():
         line = raw_line.strip()
@@ -2240,16 +2273,46 @@ def _load_patterns_with_governance(*, persist: bool = False) -> tuple[list[dict]
             raw_entry = json.loads(line)
         except json.JSONDecodeError:
             continue
-        normalized, entry_changed, stale = _normalize_pattern_entry(raw_entry, now_utc=now_utc)
+        normalized, entry_changed, stale = _normalize_pattern_entry(
+            raw_entry,
+            now_utc=now_utc,
+            source_version=source_version,
+        )
         if normalized is None:
             continue
-        entries.append(normalized)
         changed = changed or entry_changed
-        if stale:
-            stale_count += 1
+        key = (normalized["category"], normalized["pattern"])
+        existing = deduped.get(key)
+        if existing is None:
+            deduped[key] = (normalized, stale)
+            continue
+        duplicate_count += 1
+        existing_entry, existing_stale = existing
+        if _coerce_confidence(normalized.get("confidence"), default=0.0) > _coerce_confidence(
+            existing_entry.get("confidence"), default=0.0
+        ):
+            deduped[key] = (normalized, stale)
+        else:
+            deduped[key] = (existing_entry, existing_stale)
+
+    entries = [entry for entry, _ in deduped.values()]
+    stale_count = sum(1 for _, stale in deduped.values() if stale)
+    if duplicate_count > 0:
+        changed = True
+    _feed_event(
+        FEED_LOG,
+        level="debug",
+        data=_feed_data(
+            role="orchestrator",
+            message=f"Pattern deduplication: {duplicate_count} duplicates removed, {len(entries)} unique kept",
+        ),
+    )
 
     if persist and changed:
         _write_patterns_jsonl(entries)
+        persisted_source_version = _source_version_from_file(_PATTERNS_FILE)
+        for entry in entries:
+            entry["source_version"] = persisted_source_version
     return entries, stale_count
 
 
@@ -2262,8 +2325,10 @@ def _format_pattern_prompt_line(entry: dict) -> str:
 
 
 def _render_knowledge_section() -> str:
-    project_facts = _read_markdown_knowledge_lines(_PROJECT_FACTS_FILE)
-    active_pitfalls = _read_markdown_knowledge_lines(_PITFALLS_FILE)
+    project_fact_entries = _load_project_facts()
+    pitfall_entries = _load_pitfalls()
+    project_facts = [entry["fact"] for entry in project_fact_entries]
+    active_pitfalls = [entry["pitfall"] for entry in pitfall_entries]
     patterns, _ = _load_patterns_with_governance(persist=False)
     high_conf_patterns = [
         _format_pattern_prompt_line(entry)
@@ -2314,7 +2379,7 @@ def _build_task_packet(task_card: TaskCard, round_num: int) -> TaskPacket:
     acceptance_criteria = task_card.get("acceptance_criteria", [])
     acceptance_checks: list[str] = [c for c in acceptance_criteria if isinstance(c, str)]
 
-    known_risks: list[str] = _read_markdown_knowledge_lines(_PITFALLS_FILE)
+    known_risks: list[str] = [entry["pitfall"] for entry in _load_pitfalls()]
 
     if round_num > 1:
         fix_list_data = _read_json_if_exists(FIX_LIST)
@@ -3360,8 +3425,8 @@ def cmd_status(paths: LoopPaths | None = None) -> None:
         marker = "EXISTS" if p.exists() else "missing"
         print(f"  {p.name}: {marker}")
     print()
-    project_facts = _read_markdown_knowledge_lines(_PROJECT_FACTS_FILE)
-    pitfalls = _read_markdown_knowledge_lines(_PITFALLS_FILE)
+    project_facts = _load_project_facts()
+    pitfalls = _load_pitfalls()
     patterns, stale_count = _load_patterns_with_governance(persist=False)
     high_conf_count = sum(
         1 for entry in patterns if _coerce_confidence(entry.get("confidence"), default=0.0) >= PATTERN_HIGH_CONFIDENCE
