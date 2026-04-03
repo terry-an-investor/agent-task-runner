@@ -7731,6 +7731,32 @@ class TestBuildTaskPacket:
 
         assert packet["target_files"] == []
 
+    def test_literal_symlink_path_does_not_fallback_to_resolved_target(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        src = tmp_path / "src"
+        src.mkdir(parents=True)
+        generated = tmp_path / "generated"
+        generated.mkdir(parents=True)
+        target = generated / "impl.py"
+        target.write_text("def impl(): pass\n", encoding="utf-8")
+        link = src / "linked.py"
+        try:
+            link.symlink_to(target)
+        except (OSError, NotImplementedError):
+            pytest.skip("Symlink creation not supported in this environment")
+
+        task_card = {
+            "goal": "test",
+            "in_scope": ["src/linked.py"],
+            "acceptance_criteria": [],
+            "constraints": [],
+        }
+
+        packet = orchestrator._build_task_packet(task_card, 1)
+
+        assert "generated/impl.py" not in packet["target_files"]
+        assert packet["target_files"] == []
+
     def test_target_symbols_from_function_index(self, tmp_path: Path, monkeypatch) -> None:
         _configure_loop_paths(monkeypatch, tmp_path)
         src = tmp_path / "src"

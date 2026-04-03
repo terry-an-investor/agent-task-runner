@@ -3604,33 +3604,35 @@ def _build_task_packet(task_card: TaskCard, round_num: int) -> TaskPacket:
             _log(f"Ignoring invalid in_scope pattern: {item!r}")
             continue
 
-        # Process each matched file with symlink target check
-        for p in glob_matched:
-            try:
-                resolved = p.resolve()
-            except OSError:
-                continue  # Skip unreadable symlink target
-
-            # Ensure resolved path is still under repo root
-            if not resolved.is_relative_to(root_resolved):
-                continue
-
-            # For symlinks, require that the resolved (target) path also matches the pattern scope
-            if p.is_symlink():
+        # Process each matched file with symlink target check.
+        # Fall back to direct path resolution only when glob returns no matches.
+        if glob_matched:
+            for p in glob_matched:
                 try:
-                    target_rel = resolved.relative_to(ROOT).as_posix()
-                except ValueError:
-                    continue
-                # Check if target relative path matches the pattern (e.g., "src/*.py")
-                if not fnmatch.fnmatch(target_rel, pattern):
-                    continue
-                matched_path = target_rel
-            else:
-                matched_path = p.relative_to(ROOT).as_posix()
+                    resolved = p.resolve()
+                except OSError:
+                    continue  # Skip unreadable symlink target
 
-            if matched_path not in seen_target_files:
-                target_files.append(matched_path)
-                seen_target_files.add(matched_path)
+                # Ensure resolved path is still under repo root
+                if not resolved.is_relative_to(root_resolved):
+                    continue
+
+                # For symlinks, require that the resolved (target) path also matches the pattern scope
+                if p.is_symlink():
+                    try:
+                        target_rel = resolved.relative_to(ROOT).as_posix()
+                    except ValueError:
+                        continue
+                    # Check if target relative path matches the pattern (e.g., "src/*.py")
+                    if not fnmatch.fnmatch(target_rel, pattern):
+                        continue
+                    matched_path = target_rel
+                else:
+                    matched_path = p.relative_to(ROOT).as_posix()
+
+                if matched_path not in seen_target_files:
+                    target_files.append(matched_path)
+                    seen_target_files.add(matched_path)
         else:
             try:
                 resolved = (ROOT / pattern).resolve()
