@@ -337,7 +337,12 @@ def test_main_init_creates_prompt_templates_in_loop_dir(tmp_path: Path, monkeypa
     assert (templates_dir / "worker_prompt.txt").exists()
     assert (templates_dir / "reviewer_prompt.txt").exists()
     worker_template = (templates_dir / "worker_prompt.txt").read_text(encoding="utf-8")
+    reviewer_template = (templates_dir / "reviewer_prompt.txt").read_text(encoding="utf-8")
     assert "{knowledge_section}" in worker_template
+    assert "{quickstart_section}" in worker_template
+    assert "{handoff_section}" in worker_template
+    assert "{handoff_section}" in reviewer_template
+    assert (tmp_path / "my-loop" / "handoff").exists()
     module_map_path = (tmp_path / "my-loop" / "context" / "module_map.json").resolve()
     module_map = json.loads(module_map_path.read_text(encoding="utf-8"))
     assert module_map["files"] == []
@@ -1210,7 +1215,7 @@ def test_auto_dispatch_role_reuses_and_persists_worker_session(tmp_path: Path, m
     assert result == {"task_id": "T-627", "round": 2}
     assert captured["resume_session_id"] == "sid-old"
     saved = json.loads(orchestrator.STATE_FILE.read_text(encoding="utf-8"))
-    assert saved["sessions"]["worker"] == {"session_id": "sid-new", "backend": "codex"}
+    assert saved["sessions"]["worker"] == {"session_id": "sid-new", "backend": "codex", "started_round": 2}
 
 
 def test_auto_dispatch_role_reuses_and_persists_worker_session_opencode(tmp_path: Path, monkeypatch) -> None:
@@ -1261,7 +1266,11 @@ def test_auto_dispatch_role_reuses_and_persists_worker_session_opencode(tmp_path
     assert result == {"task_id": "T-628", "round": 2}
     assert captured["resume_session_id"] == "sid-opencode-old"
     saved = json.loads(orchestrator.STATE_FILE.read_text(encoding="utf-8"))
-    assert saved["sessions"]["worker"] == {"session_id": "sid-opencode-new", "backend": "opencode"}
+    assert saved["sessions"]["worker"] == {
+        "session_id": "sid-opencode-new",
+        "backend": "opencode",
+        "started_round": 2,
+    }
 
 
 def test_auto_dispatch_role_invalidates_sessions_on_base_sha_mismatch(tmp_path: Path, monkeypatch) -> None:
@@ -1312,6 +1321,72 @@ def test_auto_dispatch_role_invalidates_sessions_on_base_sha_mismatch(tmp_path: 
     assert captured["resume_session_id"] is None
     saved = json.loads(orchestrator.STATE_FILE.read_text(encoding="utf-8"))
     assert saved["sessions"] == {}
+
+
+def test_auto_dispatch_role_rotates_session_and_emits_artifact_metric(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+    state = {
+        "state": orchestrator.STATE_AWAITING_WORK,
+        "round": 3,
+        "task_id": "T-627",
+        "base_sha": "base-sha",
+        "sessions": {"worker": {"session_id": "sid-old", "backend": "codex", "started_round": 1}},
+    }
+    orchestrator._save_state(state)
+
+    captured: dict[str, object] = {}
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def fake_run_auto_dispatch(*, resume_session_id: str | None = None, **kwargs) -> str | None:
+        _ = kwargs
+        captured["resume_session_id"] = resume_session_id
+        return "sid-new"
+
+    def fake_dispatch_with_artifact_fallback(
+        *,
+        role: str,
+        dispatch_call,
+        artifact_path: Path,
+        task_id: str,
+        round_num: int,
+        timeout_sec: int = orchestrator.DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC,
+    ) -> dict:
+        _ = (role, artifact_path, timeout_sec)
+        dispatch_call()
+        return {"task_id": task_id, "round": round_num}
+
+    def fake_feed_event(event: str, *, level: str = "info", data: dict | None = None) -> None:
+        _ = level
+        events.append((event, dict(data or {})))
+
+    monkeypatch.setattr(orchestrator, "_run_auto_dispatch", fake_run_auto_dispatch)
+    monkeypatch.setattr(orchestrator, "_dispatch_with_artifact_fallback", fake_dispatch_with_artifact_fallback)
+    monkeypatch.setattr(orchestrator, "_feed_event", fake_feed_event)
+    monkeypatch.setattr(orchestrator, "_log", lambda msg: None)
+    monkeypatch.setattr(orchestrator, "_current_sha", lambda: "base-sha")
+
+    result = orchestrator._auto_dispatch_role(
+        role="worker",
+        prompt="prompt",
+        config=orchestrator.RunConfig(auto_dispatch=True, worker_backend="codex", max_session_rounds=2),
+        task_id="T-627",
+        round_num=3,
+        artifact_path=orchestrator.WORK_REPORT,
+        state=state,
+    )
+
+    assert result == {"task_id": "T-627", "round": 3}
+    assert captured["resume_session_id"] is None
+    saved = json.loads(orchestrator.STATE_FILE.read_text(encoding="utf-8"))
+    assert saved["sessions"]["worker"]["session_id"] == "sid-new"
+    assert saved["sessions"]["worker"]["started_round"] == 3
+    resume_events = [payload for event, payload in events if event == orchestrator.FEED_DISPATCH_RESUME]
+    assert resume_events
+    assert resume_events[0]["status"] == "resume_rotated"
+    artifact_events = [payload for event, payload in events if event == orchestrator.FEED_DISPATCH_ARTIFACT_WRITTEN]
+    assert artifact_events
+    assert artifact_events[0]["artifact_path"] == "work_report.json"
+    assert isinstance(artifact_events[0]["latency_ms"], int)
 
 
 def test_auto_dispatch_role_clears_sessions_on_permanent_dispatch_error(tmp_path: Path, monkeypatch) -> None:
@@ -1395,6 +1470,37 @@ def test_worker_prompt_round1_includes_task_card_section(monkeypatch) -> None:
     assert "- item-a" in prompt
 
 
+def test_worker_prompt_round1_includes_quickstart_context(monkeypatch) -> None:
+    def fake_read(path: Path) -> str | None:
+        if path.name == "AGENTS.md":
+            return "AGENTS_CONTENT"
+        if path.name == "code-writer.md":
+            return "CODE_WRITER_CONTENT"
+        if path == orchestrator._worker_prompt_template_path():
+            return None
+        return None
+
+    def fake_read_json(path: Path) -> dict | None:
+        _ = path
+        return {
+            "goal": "Quickstart payload",
+            "in_scope": [],
+            "out_of_scope": [],
+            "acceptance_criteria": [],
+            "constraints": ["state contract"],
+        }
+
+    monkeypatch.setattr(orchestrator, "_read_text_optional", fake_read)
+    monkeypatch.setattr(orchestrator, "_read_json_if_exists", fake_read_json)
+
+    prompt = orchestrator._worker_prompt("T-603", 1)
+
+    assert "=== QUICKSTART CONTEXT ===" in prompt
+    assert "single-file orchestrator architecture" in prompt
+    assert "state.json is the single source of truth" in prompt
+    assert "- state contract" in prompt
+
+
 def test_worker_prompt_round2_includes_prior_round_context(monkeypatch) -> None:
     def fake_read(path: Path) -> str | None:
         if path.name == "AGENTS.md":
@@ -1432,6 +1538,38 @@ def test_worker_prompt_round2_includes_prior_round_context(monkeypatch) -> None:
     assert "- tools/orchestrator.py" in prompt
     assert "prior_review_non_blocking:" in prompt
     assert "- suggestion-1" in prompt
+
+
+def test_worker_prompt_round2_includes_handoff_context_when_available(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+    task_id = "T-603"
+    handoff_dir = tmp_path / ".loop" / "handoff" / task_id
+    handoff_dir.mkdir(parents=True, exist_ok=True)
+    (handoff_dir / "worker_r1.json").write_text(
+        json.dumps(
+            {
+                "task_id": task_id,
+                "role": "worker",
+                "round": 1,
+                "done": ["completed baseline changes"],
+                "open_questions": [],
+                "next_actions": ["review diff"],
+                "evidence": ["head_sha=abc123"],
+                "must_read_files": ["src/loop_kit/orchestrator.py"],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    prompt = orchestrator._worker_prompt(task_id, 2)
+
+    assert "=== HANDOFF CONTEXT ===" in prompt
+    assert "role: worker" in prompt
+    assert "completed baseline changes" in prompt
+    assert "src/loop_kit/orchestrator.py" in prompt
 
 
 def test_worker_prompt_round2_skips_agents_md_and_function_index(monkeypatch) -> None:
@@ -1675,6 +1813,49 @@ def test_worker_prompt_succeeds_when_agents_and_code_writer_docs_missing(tmp_pat
     assert "code-writer.md (Default)" in prompt
 
 
+def test_persist_handoff_artifacts_are_structured(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+    task_id = "T-701"
+    orchestrator._persist_worker_handoff(
+        task_id=task_id,
+        round_num=1,
+        work={
+            "task_id": task_id,
+            "round": 1,
+            "head_sha": "abc123",
+            "files_changed": ["src/loop_kit/orchestrator.py"],
+            "tests": [{"name": "pytest", "result": "pass"}],
+            "notes": "implemented changes",
+        },
+    )
+    orchestrator._persist_reviewer_handoff(
+        task_id=task_id,
+        round_num=1,
+        review={
+            "task_id": task_id,
+            "round": 1,
+            "decision": "changes_required",
+            "blocking_issues": [{"severity": "high", "file": "src/loop_kit/orchestrator.py", "reason": "fix metric"}],
+            "non_blocking_suggestions": ["consider a smaller helper"],
+        },
+    )
+
+    worker_handoff = json.loads((tmp_path / ".loop" / "handoff" / task_id / "worker_r1.json").read_text(encoding="utf-8"))
+    reviewer_handoff = json.loads(
+        (tmp_path / ".loop" / "handoff" / task_id / "reviewer_r1.json").read_text(encoding="utf-8")
+    )
+
+    for payload in (worker_handoff, reviewer_handoff):
+        assert payload["task_id"] == task_id
+        assert isinstance(payload.get("done"), list)
+        assert isinstance(payload.get("open_questions"), list)
+        assert isinstance(payload.get("next_actions"), list)
+        assert isinstance(payload.get("evidence"), list)
+        assert isinstance(payload.get("must_read_files"), list)
+
+    assert "src/loop_kit/orchestrator.py" in reviewer_handoff["must_read_files"]
+
+
 def test_reviewer_prompt_uses_default_role_doc_when_project_file_missing(tmp_path: Path, monkeypatch) -> None:
     _configure_loop_paths(monkeypatch, tmp_path)
     (tmp_path / "docs" / "roles" / "reviewer.md").unlink()
@@ -1745,6 +1926,9 @@ def test_feed_event_constants_defined() -> None:
     assert orchestrator.FEED_DISPATCH_START == "dispatch_start"
     assert orchestrator.FEED_DISPATCH_COMPLETE == "dispatch_complete"
     assert orchestrator.FEED_DISPATCH_FAIL == "dispatch_fail"
+    assert orchestrator.FEED_DISPATCH_FIRST_ACTION == "dispatch_first_meaningful_action"
+    assert orchestrator.FEED_DISPATCH_ARTIFACT_WRITTEN == "dispatch_artifact_written"
+    assert orchestrator.FEED_DISPATCH_RESUME == "dispatch_resume"
     assert orchestrator.FEED_ROUND_START == "round_start"
     assert orchestrator.FEED_ROUND_COMPLETE == "round_complete"
     assert orchestrator.FEED_REVIEW_VERDICT == "review_verdict"
@@ -1792,6 +1976,105 @@ def test_run_auto_dispatch_emits_standardized_feed_events(monkeypatch) -> None:
             assert payload["task_id"] == "T-626"
             assert payload["round"] == 1
             assert payload["role"] == "worker"
+
+
+def test_run_auto_dispatch_emits_first_meaningful_action_metric(monkeypatch) -> None:
+    events: list[tuple[str, str, dict[str, object]]] = []
+    monkeypatch.setattr(orchestrator, "_log", lambda msg: None)
+    monkeypatch.setattr(orchestrator, "_write_dispatch_log", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        orchestrator,
+        "_agent_command",
+        lambda backend, prompt: (["codex.exe", "exec", "short instruction"], None, "STDIN_PAYLOAD"),
+    )
+    monkeypatch.setattr(
+        orchestrator.subprocess,
+        "Popen",
+        lambda cmd, **kwargs: _FakeProc(
+            stdout_lines=[
+                '{"type":"item.completed","item":{"type":"command_execution","command":"uv run --group dev pytest"}}\n'
+            ],
+            returncode=0,
+        ),
+    )
+
+    def fake_feed_event(event: str, *, level: str = "info", data: dict | None = None) -> None:
+        events.append((event, level, dict(data or {})))
+
+    monkeypatch.setattr(orchestrator, "_feed_event", fake_feed_event)
+
+    orchestrator._run_auto_dispatch(
+        "worker",
+        "codex",
+        "ignored",
+        30,
+        task_id="T-626",
+        round_num=1,
+    )
+
+    metric_events = [payload for event, _level, payload in events if event == orchestrator.FEED_DISPATCH_FIRST_ACTION]
+    assert metric_events
+    observed = [payload for payload in metric_events if payload.get("status") != "not_observed"]
+    assert observed
+    assert observed[0]["task_id"] == "T-626"
+    assert observed[0]["round"] == 1
+    assert observed[0]["role"] == "worker"
+    assert isinstance(observed[0]["latency_ms"], int)
+    assert str(observed[0].get("summary", "")).startswith("[worker] Running:")
+
+
+def test_run_auto_dispatch_emits_resume_fallback_event(monkeypatch) -> None:
+    events: list[tuple[str, str, dict[str, object]]] = []
+    monkeypatch.setattr(orchestrator, "_log", lambda msg: None)
+    monkeypatch.setattr(orchestrator, "_write_dispatch_log", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        orchestrator,
+        "_agent_command",
+        lambda backend, prompt, resume_session_id=None: (
+            ["codex.exe", "exec", "short instruction"],
+            resume_session_id,
+            "STDIN_PAYLOAD",
+        ),
+    )
+
+    calls = {"count": 0}
+
+    def fake_popen(cmd, **kwargs):
+        _ = (cmd, kwargs)
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return _FakeProc(stdout_lines=[], stderr_lines=["no rollout found for thread id stale-session\n"], returncode=1)
+        return _FakeProc(
+            stdout_lines=['{"type":"item.completed","item":{"type":"agent_message","text":"resumed"}}\n'],
+            returncode=0,
+        )
+
+    monkeypatch.setattr(orchestrator.subprocess, "Popen", fake_popen)
+
+    def fake_feed_event(event: str, *, level: str = "info", data: dict | None = None) -> None:
+        events.append((event, level, dict(data or {})))
+
+    monkeypatch.setattr(orchestrator, "_feed_event", fake_feed_event)
+
+    orchestrator._run_auto_dispatch(
+        "worker",
+        "codex",
+        "ignored",
+        30,
+        dispatch_retries=0,
+        task_id="T-626",
+        round_num=1,
+        resume_session_id="stale-session",
+    )
+
+    fallback_events = [
+        payload
+        for event, _level, payload in events
+        if event == orchestrator.FEED_DISPATCH_RESUME and payload.get("status") == "fallback_invalid_resume"
+    ]
+    assert fallback_events
+    assert fallback_events[0]["session_id"] == "stale-session"
+    assert calls["count"] == 2
 
 
 def test_save_state_emits_state_transition_feed_event(tmp_path: Path, monkeypatch) -> None:
@@ -1941,6 +2224,36 @@ def test_main_run_parses_dispatch_retry_flags(monkeypatch) -> None:
     assert captured["dispatch_retry_base_sec"] == 7
 
 
+def test_main_run_parses_max_session_rounds(monkeypatch) -> None:
+    captured: dict[str, int] = {}
+
+    def fake_cmd_run(
+        config: orchestrator.RunConfig,
+        single_round: bool,
+        round_num: int | None,
+        resume: bool = False,
+        reset: bool = False,
+    ) -> None:
+        _ = (single_round, round_num, resume, reset)
+        captured["max_session_rounds"] = config.max_session_rounds
+
+    monkeypatch.setattr(orchestrator, "cmd_run", fake_cmd_run)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "orchestrator.py",
+            "run",
+            "--max-session-rounds",
+            "2",
+        ],
+    )
+
+    orchestrator.main()
+
+    assert captured["max_session_rounds"] == 2
+
+
 def _configure_loop_paths(monkeypatch, tmp_path: Path) -> None:
     loop_dir = tmp_path / ".loop"
     logs_dir = loop_dir / "logs"
@@ -1962,6 +2275,7 @@ def _configure_loop_paths(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(orchestrator, "REVIEW_REPORT", loop_dir / "review_report.json")
     monkeypatch.setattr(orchestrator, "LOCK_FILE", loop_dir / "lock")
     monkeypatch.setattr(orchestrator, "TASK_PACKET", loop_dir / "task_packet.json")
+    monkeypatch.setattr(orchestrator, "_HANDOFF_DIR", loop_dir / "handoff")
     monkeypatch.setattr(orchestrator, "_CONTEXT_DIR", loop_dir / "context")
     monkeypatch.setattr(orchestrator, "_MODULE_MAP_FILE", loop_dir / "context" / "module_map.json")
     monkeypatch.setattr(orchestrator, "_PROJECT_FACTS_FILE", loop_dir / "context" / "project_facts.md")
@@ -1976,21 +2290,7 @@ def _configure_loop_paths(monkeypatch, tmp_path: Path) -> None:
     templates_dir = loop_dir / "templates"
     templates_dir.mkdir(parents=True, exist_ok=True)
     (templates_dir / "worker_prompt.txt").write_text(
-        "Role: code-writer worker for PM loop.\n"
-        "Current task_id: {task_id}, round: {round_num}.\n"
-        "Execute the contract below and only finish after writing {work_report_path}.\n\n"
-        "=== BEGIN AGENTS.md ===\n"
-        "{agents_md}\n"
-        "=== END AGENTS.md ===\n\n"
-        "=== BEGIN docs/roles/code-writer.md ===\n"
-        "{role_md}\n"
-        "=== END docs/roles/code-writer.md ===\n\n"
-        "=== BEGIN FUNCTION INDEX: {orchestrator_path} ===\n"
-        "{function_index}\n"
-        "=== END FUNCTION INDEX ===\n\n"
-        "=== KNOWLEDGE ===\n{knowledge_section}\n\n"
-        "=== TASK PACKET ===\n{task_packet_section}\n\n"
-        "{task_card_section}{prior_context_section}",
+        orchestrator.DEFAULT_WORKER_PROMPT_TEMPLATE,
         encoding="utf-8",
     )
     (templates_dir / "reviewer_prompt.txt").write_text(

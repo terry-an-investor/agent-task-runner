@@ -12,6 +12,9 @@ You are the implementation worker.
 
 1. `.loop/fix_list.json` (if present for current round)
 2. `.loop/task_card.json`
+3. Prompt sections:
+   - `QUICKSTART CONTEXT` for cold starts
+   - `HANDOFF CONTEXT` from prior role/round artifacts
 
 ## Output Contract (`.loop/work_report.json`)
 
@@ -48,6 +51,12 @@ After changes, run:
 ```bash
 uv run --group dev pytest
 ```
+
+## Continuation Signals
+
+- `state.json` session reuse is preferred when valid.
+- If the orchestrator rotates or falls back to a fresh session, use `HANDOFF CONTEXT` as continuity source.
+- Handoff artifacts are written to `.loop/handoff/{task_id}/worker_r{round}.json`.
 
 ## Style
 

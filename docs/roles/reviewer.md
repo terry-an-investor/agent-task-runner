@@ -12,6 +12,7 @@ You are the code reviewer.
 
 1. `.loop/review_request.json`
 2. `.loop/task_card.json` (if needed for context)
+3. Prompt `HANDOFF CONTEXT` section (fallback continuity evidence when session is rotated/refreshed)
 
 ## Output Contract (`.loop/review_report.json`)
 
@@ -57,6 +58,12 @@ Rules:
 - Silent fallback chains hiding contract breaks.
 - Missing validation for changed behavior.
 - Compatibility shims added without requirement.
+
+## Continuation Signals
+
+- Warm resume may reuse the same backend session from `state.json`.
+- If resume is invalid or rotation is configured, reviewer still gets prior structured handoff context.
+- Reviewer handoff artifacts are written to `.loop/handoff/{task_id}/reviewer_r{round}.json`.
 
 ## Style
 

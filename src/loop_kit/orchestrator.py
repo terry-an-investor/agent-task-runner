@@ -196,12 +196,16 @@ DEFAULT_DISPATCH_TIMEOUT_SEC = 600
 DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC = 90
 DEFAULT_DISPATCH_RETRIES = 2
 DEFAULT_DISPATCH_RETRY_BASE_SEC = 5
+DEFAULT_MAX_SESSION_ROUNDS = 0
 MAX_DISPATCH_RETRY_DELAY_SEC = 60
 DEFAULT_GIT_TIMEOUT_SEC = 30
 _STALE_STATE_KEYS = ("outcome", "failed_at", "error", "head_sha", "round_details")
 FEED_DISPATCH_START = "dispatch_start"
 FEED_DISPATCH_COMPLETE = "dispatch_complete"
 FEED_DISPATCH_FAIL = "dispatch_fail"
+FEED_DISPATCH_FIRST_ACTION = "dispatch_first_meaningful_action"
+FEED_DISPATCH_ARTIFACT_WRITTEN = "dispatch_artifact_written"
+FEED_DISPATCH_RESUME = "dispatch_resume"
 FEED_ROUND_START = "round_start"
 FEED_ROUND_COMPLETE = "round_complete"
 FEED_REVIEW_VERDICT = "review_verdict"
@@ -281,6 +285,7 @@ _SUMMARY_FILE = _path("summary.json")
 _CONFIG_FILE = _path("config.json")
 _TASKS_DIR = LOOP_DIR / "tasks"
 TASK_PACKET = _path("task_packet.json")
+_HANDOFF_DIR = LOOP_DIR / "handoff"
 _CONTEXT_DIR = LOOP_DIR / "context"
 _MODULE_MAP_FILE = _CONTEXT_DIR / "module_map.json"
 _PROJECT_FACTS_FILE = _CONTEXT_DIR / "project_facts.md"
@@ -314,6 +319,7 @@ class RunConfig:
     dispatch_timeout: int = DEFAULT_DISPATCH_TIMEOUT_SEC
     dispatch_retries: int = DEFAULT_DISPATCH_RETRIES
     dispatch_retry_base_sec: int = DEFAULT_DISPATCH_RETRY_BASE_SEC
+    max_session_rounds: int = DEFAULT_MAX_SESSION_ROUNDS
     artifact_timeout: int = DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC
     allow_dirty: bool = False
     verbose: bool = False
@@ -402,6 +408,7 @@ def _apply_loop_paths(paths: LoopPaths) -> None:
     global _SUMMARY_FILE
     global _CONFIG_FILE
     global _TASKS_DIR
+    global _HANDOFF_DIR
     global _LOGS_DIR_ENSURED
     global _LOGS_DIR_ENSURED_PATH
     global TASK_PACKET
@@ -428,6 +435,7 @@ def _apply_loop_paths(paths: LoopPaths) -> None:
     _CONFIG_FILE = paths.dir / "config.json"
     _TASKS_DIR = paths.dir / "tasks"
     TASK_PACKET = paths.dir / "task_packet.json"
+    _HANDOFF_DIR = paths.dir / "handoff"
     _CONTEXT_DIR = paths.dir / "context"
     _MODULE_MAP_FILE = _CONTEXT_DIR / "module_map.json"
     _PROJECT_FACTS_FILE = _CONTEXT_DIR / "project_facts.md"
@@ -470,6 +478,11 @@ def _display_path(path: Path) -> str:
 def _task_archive_dir(task_id: str, paths: LoopPaths | None = None) -> Path:
     resolved_paths = _resolve_paths(paths)
     return resolved_paths.archive / task_id
+
+
+def _task_handoff_dir(task_id: str, paths: LoopPaths | None = None) -> Path:
+    _ = _resolve_paths(paths)
+    return _HANDOFF_DIR / task_id
 
 
 def _archive_bus_file(path: Path, task_id: str, round_num: int, suffix: str) -> Path | None:
@@ -1176,6 +1189,7 @@ def _stream_dispatch_stdout_line(
     parse_event_fn: "BackendParseEventFn",
     *,
     verbose: bool,
+    on_summary: Callable[[str], None] | None = None,
 ) -> None:
     read_state = getattr(_stream_local, "read_state", None)
     if read_state is None:
@@ -1226,6 +1240,8 @@ def _stream_dispatch_stdout_line(
         if read_state.get(state_key) == read_summary:
             return
         print(read_summary, flush=True)
+        if on_summary is not None:
+            on_summary(read_summary)
         read_state[state_key] = read_summary
         return
 
@@ -1234,6 +1250,8 @@ def _stream_dispatch_stdout_line(
         return
 
     print(summary, flush=True)
+    if on_summary is not None:
+        on_summary(summary)
     if is_tool_use:
         read_state[state_key] = summary
     else:
@@ -1682,6 +1700,7 @@ def _collect_streamed_process_output(
     stdin_text: str | None,
     timeout_sec: int,
     verbose: bool,
+    summary_callback: Callable[[str], None] | None = None,
 ) -> tuple[str, str, int, bool]:
     stdout_chunks: list[str] = []
     stderr_chunks: list[str] = []
@@ -1723,6 +1742,7 @@ def _collect_streamed_process_output(
                 raw_line,
                 parse_event_fn,
                 verbose=verbose,
+                on_summary=summary_callback,
             ),
         ),
         daemon=True,
@@ -1844,6 +1864,20 @@ def _is_invalid_resume_session_error(text: str) -> bool:
     )
 
 
+def _is_meaningful_dispatch_summary(role: str, summary: str) -> bool:
+    prefixes = (
+        f"[{role}] Running:",
+        f"[{role}] Editing:",
+        f"[{role}] Writing:",
+        f"[{role}] Reading:",
+        f"[{role}] Searching:",
+        f"[{role}] Fetching:",
+        f"[{role}] Message:",
+        f"[{role}] Tool:",
+    )
+    return summary.startswith(prefixes)
+
+
 def _run_auto_dispatch(
     role: str,
     backend: str,
@@ -1879,6 +1913,30 @@ def _run_auto_dispatch(
     try:
         while attempt < max_attempts:
             attempt += 1
+            attempt_started_at = time.perf_counter()
+            first_meaningful_action_ms: int | None = None
+
+            def _on_summary(summary: str) -> None:
+                nonlocal first_meaningful_action_ms
+                if first_meaningful_action_ms is not None:
+                    return
+                if not _is_meaningful_dispatch_summary(role, summary):
+                    return
+                first_meaningful_action_ms = max(0, int((time.perf_counter() - attempt_started_at) * 1000))
+                _feed_event(
+                    FEED_DISPATCH_FIRST_ACTION,
+                    data=_feed_data(
+                        task_id=task_id,
+                        round_num=round_num,
+                        role=role,
+                        backend=backend,
+                        attempt=attempt,
+                        max_attempts=max_attempts,
+                        latency_ms=first_meaningful_action_ms,
+                        summary=summary,
+                    ),
+                )
+
             if active_resume_session_id is None:
                 cmd, cmd_sid, stdin_text = _agent_command(backend, prompt)
             else:
@@ -1898,6 +1956,7 @@ def _run_auto_dispatch(
                     attempt=attempt,
                     max_attempts=max_attempts,
                     timeout_sec=timeout_sec,
+                    resume_requested=active_resume_session_id is not None,
                 ),
             )
             proc = subprocess.Popen(
@@ -1918,6 +1977,7 @@ def _run_auto_dispatch(
                     stdin_text=stdin_text,
                     timeout_sec=timeout_sec,
                     verbose=verbose,
+                    summary_callback=_on_summary,
                 )
             except KeyboardInterrupt:
                 _terminate_subprocess_on_interrupt(
@@ -1943,6 +2003,21 @@ def _run_auto_dispatch(
                     round_num=round_num,
                 )
                 raise
+            if first_meaningful_action_ms is None:
+                _feed_event(
+                    FEED_DISPATCH_FIRST_ACTION,
+                    level="warning",
+                    data=_feed_data(
+                        task_id=task_id,
+                        round_num=round_num,
+                        role=role,
+                        backend=backend,
+                        attempt=attempt,
+                        max_attempts=max_attempts,
+                        latency_ms=None,
+                        status="not_observed",
+                    ),
+                )
             if timed_out:
                 result = _completed_proc(
                     cmd,
@@ -2011,6 +2086,19 @@ def _run_auto_dispatch(
                 _is_invalid_resume_session_error(stderr_text) or _is_invalid_resume_session_error(stdout_text)
             ):
                 _log(f"{role} resume session is invalid for backend={backend}; falling back to a new session.")
+                _feed_event(
+                    FEED_DISPATCH_RESUME,
+                    level="warning",
+                    data=_feed_data(
+                        task_id=task_id,
+                        round_num=round_num,
+                        role=role,
+                        backend=backend,
+                        status="fallback_invalid_resume",
+                        attempt=attempt,
+                        session_id=active_resume_session_id,
+                    ),
+                )
                 active_resume_session_id = None
                 max_attempts += 1
                 continue
@@ -2456,6 +2544,219 @@ def _render_task_card_section(task_card: TaskCard) -> str:
     )
 
 
+def _render_quickstart_context_section(task_card: TaskCard) -> str:
+    return (
+        "project_baseline:\n"
+        "- Core owner: src/loop_kit/orchestrator.py (single-file orchestrator architecture)\n"
+        "- Wrappers: src/loop_kit/cli.py, src/loop_kit/__main__.py, src/loop_kit/__init__.py\n"
+        "- Primary tests: tests/test_orchestrator.py, tests/test_integration.py\n"
+        "execution_constraints:\n"
+        "- state.json is the single source of truth between outer and inner processes\n"
+        "- JSON writes use UTF-8 with ensure_ascii=False and indent=2\n"
+        "- Extend backends through register_backend() instead of dispatch rewrites\n"
+        f"task_goal: {task_card.get('goal', '<none>')}\n"
+        "task_constraints:\n"
+        f"{_as_prompt_list(task_card.get('constraints'))}\n"
+    )
+
+
+def _handoff_round_from_filename(path: Path, role: str) -> int | None:
+    prefix = f"{role}_r"
+    suffix = ".json"
+    name = path.name
+    if not name.startswith(prefix) or not name.endswith(suffix):
+        return None
+    token = name[len(prefix) : -len(suffix)]
+    if not token.isdigit():
+        return None
+    return int(token)
+
+
+def _latest_handoff_entry(
+    task_id: str,
+    role: str,
+    *,
+    before_round: int,
+    paths: LoopPaths | None = None,
+) -> dict | None:
+    if before_round <= 1:
+        return None
+    handoff_dir = _task_handoff_dir(task_id, paths=paths)
+    if not handoff_dir.is_dir():
+        return None
+    latest_round: int | None = None
+    latest_data: dict | None = None
+    for path in sorted(handoff_dir.glob(f"{role}_r*.json")):
+        round_num = _handoff_round_from_filename(path, role)
+        if round_num is None or round_num >= before_round:
+            continue
+        data = _read_json_if_exists(path)
+        if not isinstance(data, dict):
+            continue
+        if data.get("task_id") != task_id:
+            continue
+        if data.get("role") != role:
+            continue
+        if latest_round is None or round_num > latest_round:
+            latest_round = round_num
+            latest_data = data
+    return latest_data
+
+
+def _render_handoff_context_section(task_id: str, round_num: int, paths: LoopPaths | None = None) -> str:
+    records: list[tuple[str, dict]] = []
+    for role in _SESSION_ROLES:
+        data = _latest_handoff_entry(task_id, role, before_round=round_num, paths=paths)
+        if isinstance(data, dict):
+            records.append((role, data))
+    if not records:
+        return "- <none>"
+
+    rendered: list[str] = []
+    for role, data in records:
+        rendered.extend(
+            [
+                f"role: {role}",
+                f"round: {data.get('round', '<none>')}",
+                "done:",
+                _as_prompt_list(data.get("done")),
+                "open_questions:",
+                _as_prompt_list(data.get("open_questions")),
+                "next_actions:",
+                _as_prompt_list(data.get("next_actions")),
+                "evidence:",
+                _as_prompt_list(data.get("evidence")),
+                "must_read_files:",
+                _as_prompt_list(data.get("must_read_files")),
+                "",
+            ]
+        )
+    if rendered and rendered[-1] == "":
+        rendered.pop()
+    return "\n".join(rendered)
+
+
+def _string_list(items: object) -> list[str]:
+    if not isinstance(items, list):
+        return []
+    result: list[str] = []
+    for item in items:
+        if not isinstance(item, str):
+            continue
+        text = item.strip()
+        if text:
+            result.append(text)
+    return result
+
+
+def _issue_file_list(items: object) -> list[str]:
+    if not isinstance(items, list):
+        return []
+    result: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        file_path = str(item.get("file", "")).strip()
+        if file_path and file_path not in result:
+            result.append(file_path)
+    return result
+
+
+def _write_handoff_artifact(
+    *,
+    task_id: str,
+    role: str,
+    round_num: int,
+    done: list[str],
+    open_questions: list[str],
+    next_actions: list[str],
+    evidence: list[str],
+    must_read_files: list[str],
+    paths: LoopPaths | None = None,
+) -> Path:
+    handoff_dir = _task_handoff_dir(task_id, paths=paths)
+    handoff_dir.mkdir(parents=True, exist_ok=True)
+    target = handoff_dir / f"{role}_r{round_num}.json"
+    payload = {
+        "task_id": task_id,
+        "role": role,
+        "round": round_num,
+        "created_at": _ts(),
+        "done": done,
+        "open_questions": open_questions,
+        "next_actions": next_actions,
+        "evidence": evidence,
+        "must_read_files": must_read_files,
+    }
+    _atomic_write_json(target, payload)
+    return target
+
+
+def _persist_worker_handoff(
+    *,
+    task_id: str,
+    round_num: int,
+    work: WorkReport,
+    paths: LoopPaths | None = None,
+) -> None:
+    tests_summary = _tests_summary(work.get("tests", []))
+    notes = str(work.get("notes", "")).strip()
+    head_sha = str(work.get("head_sha", "")).strip()
+    files_changed = _string_list(work.get("files_changed"))
+    done = [f"Worker produced work_report.json for round {round_num}."]
+    if head_sha:
+        done.append(f"Head commit: {head_sha}")
+    if notes:
+        done.append(f"Worker notes: {notes}")
+    evidence = [
+        f"tests_total={tests_summary['total']} pass={tests_summary['pass']} fail={tests_summary['fail']} other={tests_summary['other']}",
+        f"files_changed_count={len(files_changed)}",
+    ]
+    if files_changed:
+        evidence.append("files_changed=" + ", ".join(files_changed))
+    _write_handoff_artifact(
+        task_id=task_id,
+        role="worker",
+        round_num=round_num,
+        done=done,
+        open_questions=[],
+        next_actions=["Reviewer validates review_request.json against acceptance criteria and constraints."],
+        evidence=evidence,
+        must_read_files=files_changed,
+        paths=paths,
+    )
+
+
+def _persist_reviewer_handoff(
+    *,
+    task_id: str,
+    round_num: int,
+    review: ReviewReport,
+    paths: LoopPaths | None = None,
+) -> None:
+    decision = str(review.get("decision", "")).strip() or "changes_required"
+    blocking = review.get("blocking_issues", [])
+    non_blocking = _string_list(review.get("non_blocking_suggestions"))
+    done = [f"Reviewer decision for round {round_num}: {decision}."]
+    evidence = [f"blocking_issues={len(blocking) if isinstance(blocking, list) else 0}"]
+    if decision == "approve":
+        next_actions = ["No further implementation changes required for this task."]
+    else:
+        next_actions = ["Worker must address all blocking issues in fix_list.json in the next round."]
+    must_read_files = _issue_file_list(blocking)
+    _write_handoff_artifact(
+        task_id=task_id,
+        role="reviewer",
+        round_num=round_num,
+        done=done,
+        open_questions=non_blocking,
+        next_actions=next_actions,
+        evidence=evidence,
+        must_read_files=must_read_files,
+        paths=paths,
+    )
+
+
 def _render_prior_round_context_section(round_num: int) -> str | None:
     if round_num <= 1:
         return None
@@ -2503,6 +2804,8 @@ DEFAULT_WORKER_PROMPT_TEMPLATE = (
     "=== BEGIN FUNCTION INDEX: {orchestrator_path} ===\n"
     "{function_index}\n"
     "=== END FUNCTION INDEX ===\n\n"
+    "=== QUICKSTART CONTEXT ===\n{quickstart_section}\n\n"
+    "=== HANDOFF CONTEXT ===\n{handoff_section}\n\n"
     "=== KNOWLEDGE ===\n{knowledge_section}\n\n"
     "=== TASK PACKET ===\n{task_packet_section}\n\n"
     "{task_card_section}{prior_context_section}"
@@ -2513,6 +2816,7 @@ DEFAULT_REVIEWER_PROMPT_TEMPLATE = (
     "Role: reviewer for PM loop.\n"
     "Current task_id: {task_id}, round: {round_num}.\n"
     "Execute the contract below and only finish after writing {review_report_path}.\n\n"
+    "=== HANDOFF CONTEXT ===\n{handoff_section}\n\n"
     "=== BEGIN docs/roles/reviewer.md ===\n"
     "{role_md}\n"
     "=== END docs/roles/reviewer.md ===\n"
@@ -2630,6 +2934,9 @@ def _build_prompt_sections(task_id: str, round_num: int) -> list[tuple[str, str]
         "code_writer_md_default.txt",
     )
     task_packet_section = _render_task_packet_section()
+    task_card_data = _read_json_if_exists(TASK_CARD)
+    task_card = cast(TaskCard, task_card_data) if isinstance(task_card_data, dict) else cast(TaskCard, {})
+    handoff_section = _render_handoff_context_section(task_id, round_num)
 
     sections: list[tuple[str, str]] = []
 
@@ -2639,9 +2946,8 @@ def _build_prompt_sections(task_id: str, round_num: int) -> list[tuple[str, str]
             "agents_md_default.txt",
         )
         orchestrator_path = ROOT / "src" / "loop_kit" / "orchestrator.py"
-        task_card_data = _read_json_if_exists(TASK_CARD)
-        task_card = cast(TaskCard, task_card_data) if isinstance(task_card_data, dict) else cast(TaskCard, {})
         task_card_section = _render_task_card_section(task_card)
+        quickstart_section = _render_quickstart_context_section(task_card)
         prior_context_section = _render_prior_round_context_section(round_num)
 
         sections = [
@@ -2651,6 +2957,8 @@ def _build_prompt_sections(task_id: str, round_num: int) -> list[tuple[str, str]
                 "=== BEGIN FUNCTION INDEX: " + _display_path(orchestrator_path) + " ===",
                 f"{_function_index(orchestrator_path)}\n=== END FUNCTION INDEX ===",
             ),
+            ("=== QUICKSTART CONTEXT ===", quickstart_section),
+            ("=== HANDOFF CONTEXT ===", handoff_section),
             ("=== KNOWLEDGE ===", knowledge_section),
             ("=== TASK PACKET ===", task_packet_section),
         ]
@@ -2665,6 +2973,7 @@ def _build_prompt_sections(task_id: str, round_num: int) -> list[tuple[str, str]
 
         sections = [
             ("=== BEGIN docs/roles/code-writer.md ===", f"{role_text}\n=== END docs/roles/code-writer.md ==="),
+            ("=== HANDOFF CONTEXT ===", handoff_section),
             ("=== KNOWLEDGE ===", knowledge_section),
             ("=== TASK PACKET ===", task_packet_section),
             (f"=== FIX LIST (round {round_num}) ===", f"fixes:\n{fix_list_section}"),
@@ -2681,9 +2990,14 @@ def _worker_prompt(task_id: str, round_num: int, paths: LoopPaths | None = None)
     template_path = _worker_prompt_template_path(paths=resolved_paths)
     template_text = _read_text_optional(template_path)
     if template_text is not None:
-        agents_text = _read_text_with_default(
-            ROOT / "AGENTS.md",
-            "agents_md_default.txt",
+        include_cold_start_context = round_num == 1
+        agents_text = (
+            _read_text_with_default(
+                ROOT / "AGENTS.md",
+                "agents_md_default.txt",
+            )
+            if include_cold_start_context
+            else "<warm session: AGENTS.md omitted>"
         )
         role_text = _read_text_with_default(
             ROOT / "docs" / "roles" / "code-writer.md",
@@ -2692,8 +3006,14 @@ def _worker_prompt(task_id: str, round_num: int, paths: LoopPaths | None = None)
         orchestrator_path = ROOT / "src" / "loop_kit" / "orchestrator.py"
         task_card_data = _read_json_if_exists(TASK_CARD)
         task_card = cast(TaskCard, task_card_data) if isinstance(task_card_data, dict) else cast(TaskCard, {})
-        task_card_section = _render_task_card_section(task_card)
+        task_card_section = _render_task_card_section(task_card) if include_cold_start_context else ""
         prior_context_section = _render_prior_round_context_section(round_num)
+        quickstart_section = (
+            _render_quickstart_context_section(task_card)
+            if include_cold_start_context
+            else "- warm session path; quickstart context is intentionally omitted"
+        )
+        handoff_section = _render_handoff_context_section(task_id, round_num, paths=resolved_paths)
         knowledge_section = _render_knowledge_section()
         task_packet_section = _render_task_packet_section()
         context = {
@@ -2703,7 +3023,13 @@ def _worker_prompt(task_id: str, round_num: int, paths: LoopPaths | None = None)
             "agents_md": agents_text,
             "role_md": role_text,
             "orchestrator_path": _display_path(orchestrator_path),
-            "function_index": _function_index(orchestrator_path),
+            "function_index": (
+                _function_index(orchestrator_path)
+                if include_cold_start_context
+                else "<warm session: function index omitted>"
+            ),
+            "quickstart_section": quickstart_section,
+            "handoff_section": handoff_section,
             "knowledge_section": knowledge_section,
             "task_packet_section": task_packet_section,
             "task_card_section": task_card_section,
@@ -2736,6 +3062,7 @@ def _reviewer_prompt(task_id: str, round_num: int, paths: LoopPaths | None = Non
         "role_md": role_text,
         "task_card_section": "",
         "prior_context_section": "",
+        "handoff_section": _render_handoff_context_section(task_id, round_num, paths=resolved_paths),
         "review_report_path": _display_path(resolved_paths.review_report),
     }
     return _render_prompt_template(
@@ -3353,12 +3680,14 @@ def cmd_init(paths: LoopPaths | None = None) -> None:
     logs_dir = resolved_paths.logs
     runtime_dir = loop_dir / "runtime"
     archive_dir = resolved_paths.archive
+    handoff_dir = loop_dir / "handoff"
     context_dir = loop_dir / "context"
     loop_dir.mkdir(exist_ok=True)
     (loop_dir / "examples").mkdir(exist_ok=True)
     logs_dir.mkdir(exist_ok=True)
     runtime_dir.mkdir(exist_ok=True)
     archive_dir.mkdir(exist_ok=True)
+    handoff_dir.mkdir(exist_ok=True)
     context_dir.mkdir(exist_ok=True)
     templates_dir = _loop_templates_dir(paths=resolved_paths)
     templates_dir.mkdir(exist_ok=True)
@@ -3367,6 +3696,7 @@ def cmd_init(paths: LoopPaths | None = None) -> None:
     print(f"  Created: {logs_dir}")
     print(f"  Created: {runtime_dir}")
     print(f"  Created: {archive_dir}")
+    print(f"  Created: {handoff_dir}")
     print(f"  Created: {context_dir}")
     print(f"  Created: {templates_dir}")
     if not _MODULE_MAP_FILE.exists():
@@ -3636,6 +3966,8 @@ def _single_round_subprocess_cmd(
         str(config.dispatch_retries),
         "--dispatch-retry-base-sec",
         str(config.dispatch_retry_base_sec),
+        "--max-session-rounds",
+        str(config.max_session_rounds),
         "--artifact-timeout",
         str(config.artifact_timeout),
     ]
@@ -3665,8 +3997,8 @@ def _print_round_header(round_num: int, role: str) -> None:
         print(f"  Review request: {REVIEW_REQ}")
 
 
-def _normalize_sessions_map(value: object) -> dict[str, dict[str, str]]:
-    normalized: dict[str, dict[str, str]] = {}
+def _normalize_sessions_map(value: object) -> dict[str, dict[str, str | int]]:
+    normalized: dict[str, dict[str, str | int]] = {}
     if not isinstance(value, dict):
         return normalized
     for role in _SESSION_ROLES:
@@ -3679,10 +4011,14 @@ def _normalize_sessions_map(value: object) -> dict[str, dict[str, str]]:
             continue
         if not isinstance(backend_raw, str) or not backend_raw.strip():
             continue
-        normalized[role] = {
+        entry: dict[str, str | int] = {
             "session_id": session_id_raw.strip(),
             "backend": backend_raw.strip().lower(),
         }
+        started_round_raw = raw_entry.get("started_round")
+        if isinstance(started_round_raw, int) and started_round_raw >= 1:
+            entry["started_round"] = started_round_raw
+        normalized[role] = entry
     return normalized
 
 
@@ -3708,11 +4044,29 @@ def _session_resume_id(state: dict, *, role: str, backend: str) -> str | None:
     return session_id
 
 
-def _store_session(state: dict, *, role: str, backend: str, session_id: str | None) -> bool:
+def _session_started_round(entry: dict[str, str | int], *, round_num: int) -> int:
+    started_round_raw = entry.get("started_round")
+    if isinstance(started_round_raw, int) and started_round_raw >= 1:
+        return started_round_raw
+    return max(1, round_num - 1)
+
+
+def _store_session(state: dict, *, role: str, backend: str, session_id: str | None, round_num: int) -> bool:
     if not isinstance(session_id, str) or not session_id.strip():
         return False
     sessions = _normalize_sessions_map(state.get("sessions"))
-    next_entry = {"session_id": session_id.strip(), "backend": backend.strip().lower()}
+    normalized_session_id = session_id.strip()
+    existing = sessions.get(role)
+    started_round = round_num
+    if isinstance(existing, dict):
+        existing_session_id = existing.get("session_id")
+        if isinstance(existing_session_id, str) and existing_session_id.strip() == normalized_session_id:
+            started_round = _session_started_round(existing, round_num=round_num)
+    next_entry: dict[str, str | int] = {
+        "session_id": normalized_session_id,
+        "backend": backend.strip().lower(),
+        "started_round": started_round,
+    }
     if sessions.get(role) == next_entry:
         state["sessions"] = sessions
         return False
@@ -3731,7 +4085,7 @@ def _invalidate_sessions_for_dispatch(
     state["sessions"] = _normalize_sessions_map(state.get("sessions"))
     if role != "worker":
         return False
-    sessions = cast(dict[str, dict[str, str]], state.get("sessions"))
+    sessions = cast(dict[str, dict[str, str | int]], state.get("sessions"))
     if not sessions:
         return False
 
@@ -3789,7 +4143,41 @@ def _auto_dispatch_role(
     if state_updated:
         _save_state(current_state)
     resume_session_id = _session_resume_id(current_state, role=role, backend=backend)
+    candidate_session_id = resume_session_id
+    resume_status = "resume_miss"
+    session_started_round: int | None = None
+    if resume_session_id:
+        sessions = _normalize_sessions_map(current_state.get("sessions"))
+        entry = sessions.get(role)
+        if isinstance(entry, dict):
+            session_started_round = _session_started_round(entry, round_num=round_num)
+        if config.max_session_rounds > 0 and session_started_round is not None:
+            if round_num - session_started_round >= config.max_session_rounds:
+                resume_status = "resume_rotated"
+                _log(
+                    f"{role} session rotation triggered: started_round={session_started_round}, "
+                    f"round={round_num}, max_session_rounds={config.max_session_rounds}"
+                )
+                resume_session_id = None
+            else:
+                resume_status = "resume_hit"
+        else:
+            resume_status = "resume_hit"
+    _feed_event(
+        FEED_DISPATCH_RESUME,
+        data=_feed_data(
+            task_id=task_id,
+            round_num=round_num,
+            role=role,
+            backend=backend,
+            status=resume_status,
+            session_id=candidate_session_id,
+            session_started_round=session_started_round,
+            max_session_rounds=config.max_session_rounds,
+        ),
+    )
     dispatch_session_id: str | None = None
+    dispatch_started_at = time.monotonic()
 
     def _dispatch_call() -> None:
         nonlocal dispatch_session_id
@@ -3817,12 +4205,30 @@ def _auto_dispatch_role(
             round_num=round_num,
             timeout_sec=config.artifact_timeout,
         )
+        _feed_event(
+            FEED_DISPATCH_ARTIFACT_WRITTEN,
+            data=_feed_data(
+                task_id=task_id,
+                round_num=round_num,
+                role=role,
+                backend=backend,
+                artifact_path=artifact_path.name,
+                latency_ms=max(0, int((time.monotonic() - dispatch_started_at) * 1000)),
+                status="written",
+            ),
+        )
     except PermanentDispatchError:
         if _clear_sessions(current_state):
             _save_state(current_state)
         raise
 
-    if _store_session(current_state, role=role, backend=backend, session_id=dispatch_session_id):
+    if _store_session(
+        current_state,
+        role=role,
+        backend=backend,
+        session_id=dispatch_session_id,
+        round_num=round_num,
+    ):
         _save_state(current_state)
     return artifact
 
@@ -4139,6 +4545,12 @@ def _run_single_round(
         return
 
     _log(f"Worker done. head_sha={head_sha}")
+    _persist_worker_handoff(
+        task_id=task_id,
+        round_num=round_num,
+        work=work,
+        paths=resolved_paths,
+    )
     print(f"  Worker completed: {head_sha[:8]}")
     print(f"  Files changed: {', '.join(work.get('files_changed', []))}")
 
@@ -4219,6 +4631,12 @@ def _run_single_round(
         )
         return
 
+    _persist_reviewer_handoff(
+        task_id=task_id,
+        round_num=round_num,
+        review=review,
+        paths=resolved_paths,
+    )
     decision = str(review["decision"])
     _log(f"Reviewer decision: {decision}")
     _feed_event(
@@ -4804,6 +5222,12 @@ def main() -> None:
         help="Base retry backoff seconds (default: 5, max delay: 60)",
     )
     run_p.add_argument(
+        "--max-session-rounds",
+        type=int,
+        default=None,
+        help="Max rounds to reuse one backend session before rotating (0 disables rotation)",
+    )
+    run_p.add_argument(
         "--artifact-timeout",
         type=int,
         default=None,
@@ -4863,6 +5287,9 @@ def main() -> None:
                 dispatch_retries=int(_cfg_val(args.dispatch_retries, "dispatch_retries", DEFAULT_DISPATCH_RETRIES)),
                 dispatch_retry_base_sec=int(
                     _cfg_val(args.dispatch_retry_base_sec, "dispatch_retry_base_sec", DEFAULT_DISPATCH_RETRY_BASE_SEC)
+                ),
+                max_session_rounds=int(
+                    _cfg_val(args.max_session_rounds, "max_session_rounds", DEFAULT_MAX_SESSION_ROUNDS)
                 ),
                 artifact_timeout=int(
                     _cfg_val(args.artifact_timeout, "artifact_timeout", DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC)

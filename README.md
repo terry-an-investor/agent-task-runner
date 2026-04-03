@@ -55,6 +55,7 @@ loop extract-diff BASE HEAD  Print git diff between two commits
 | `--dispatch-timeout N` | 600 | Per-dispatch timeout in seconds |
 | `--dispatch-retries N` | 2 | Retries on non-zero dispatch exit |
 | `--dispatch-retry-base-sec N` | 5 | Base backoff seconds between dispatch retries (max delay 60s) |
+| `--max-session-rounds N` | 0 | Max rounds to reuse one backend session before rotating (0 disables rotation) |
 | `--artifact-timeout N` | 90 | Post-dispatch artifact wait in seconds |
 | `--require-heartbeat` | off | Require live heartbeat while waiting |
 | `--heartbeat-ttl N` | 30 | Heartbeat freshness threshold in seconds |
@@ -85,10 +86,19 @@ Reviewer -> PM:   review_report.json
 - **pitfalls.md** — Known pitfalls (auto-appended from review blocking issues)
 - **patterns.jsonl** — High-confidence patterns (auto-populated from review issues on approval)
 - **module_map.json** — Offline module index (populated by `loop index`)
+- **handoff/** — Per-task role handoff artifacts (`.loop/handoff/{task_id}/{role}_r{round}.json`)
 
 The worker first reads project `AGENTS.md` and `docs/roles/code-writer.md`, and the reviewer first reads project `docs/roles/reviewer.md`.
 If any of those files are missing, agent-task-runner falls back to built-in defaults in `src/loop_kit/defaults/`.
 Project files always override built-in defaults when present.
+
+### Quickstart vs Handoff vs Warm Resume
+
+- **Quickstart context**: injected for cold task starts (round 1) with stable project constraints and execution contract.
+- **Handoff context**: structured bridge built every round for both roles (`done`, `open_questions`, `next_actions`, `evidence`, `must_read_files`) and injected into later prompts when available.
+- **Warm resume**: reuses backend session IDs from `state.json` for low-latency continuation.
+- **Session rotation**: set `--max-session-rounds` to intentionally start a fresh backend session after N rounds while preserving continuity via handoff context.
+- **Fallback behavior**: invalid resume sessions are detected, logged, and retried with a fresh session.
 
 ### Key JSON schemas
 
