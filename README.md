@@ -43,23 +43,27 @@ Loop Kit orchestrates the entire cycle:
 ## Quick Start
 
 ```bash
-# Initialize loop directory in your project
+# 1. Initialize loop directory in your project
 loop init
 
-# (optional) Build offline module map for faster context
+# 2. (optional) Build offline module map for faster context
 loop index
 
-# Create task card (see example below)
-# Run with auto-dispatch
+# 3. Create a task card, then run
 loop run --task .loop/task_card.json --auto-dispatch --worker-backend codex --reviewer-backend codex
 ```
 
-**Example task card** (`.loop/task_card.json`):
+**What you need:**
+
+- Python >= 3.11
+- Git repository
+- At least one AI backend: [codex](https://github.com/openai/codex), [claude](https://docs.anthropic.com/en/docs/claude-code), or [opencode](https://opencode.ai)
+
+**The only thing you write is the task card:**
 
 ```json
 {
   "task_id": "T-001",
-  "status": "todo",
   "goal": "Add input validation to user registration endpoint",
   "in_scope": ["src/api/auth.py", "tests/test_auth.py"],
   "out_of_scope": ["UI changes"],
@@ -67,57 +71,153 @@ loop run --task .loop/task_card.json --auto-dispatch --worker-backend codex --re
     "Email format validated",
     "Password strength enforced",
     "Tests cover edge cases"
-  ],
-  "lanes": [
-    {
-      "lane_id": "lane_core",
-      "owner_paths": ["src/api/auth.py"],
-      "depends_on": [],
-      "backend_preference": "codex"
-    }
   ]
 }
 ```
 
-Run and watch rounds progress in `.loop/state.json`.
+That's it. Loop Kit handles the rest — writing, reviewing, iterating — until the code meets your criteria.
 
-## Prerequisites
+## How It Works
 
-- Python >= 3.11
-- Git repository (the orchestrator uses git commits as the source of truth)
-- At least one AI backend installed: [codex](https://github.com/openai/codex), [claude](https://docs.anthropic.com/en/docs/claude-code), or [opencode](https://opencode.ai)
+### The Loop
 
-## 📋 Contents
+```
+You define the task → AI writes → AI reviews → AI fixes → ... → ✅ Approved
+```
 
-- [CLI Reference](#cli-reference)
-- [Core Concepts](#core-concepts)
-- [Architecture](#architecture)
-- [Typical Workflow](#typical-workflow)
-- [Performance](#performance)
-- [Troubleshooting](#troubleshooting)
-- [Development](#development)
+Each round:
 
-## Typical Workflow
-
-1. **Create task card** — Define goal, scope, acceptance criteria
-2. **Run loop** — System executes rounds automatically:
-   - Worker writes code based on task card
-   - Reviewer validates against criteria
-   - On `changes_required`, loop repeats (max rounds)
-3. **Monitor** — Check `.loop/state.json` and `.loop/logs/` for progress
-4. **Approve or fix** — Loop ends when reviewer approves or max rounds exhausted
+1. **Worker AI** reads your task card and writes code
+2. **Reviewer AI** checks the output against your acceptance criteria
+3. If changes are needed, the loop repeats automatically (up to `--max-rounds`)
+4. When approved, you get a clean diff and full audit trail
 
 ```
 Round 1: Worker → Reviewer → changes_required
 Round 2: Worker → Reviewer → approve ✅
 ```
 
-Key files:
-- `.loop/state.json` — Current state and round number
-- `.loop/logs/feed.jsonl` — Event log for debugging
-- `.loop/archive/{task_id}/` — Historical artifacts per round
+### Stay in the Loop
 
-## CLI Reference
+Everything is tracked in `.loop/`:
+
+| File | What it tells you |
+|------|-------------------|
+| `state.json` | Current round, status, decisions |
+| `logs/feed.jsonl` | Full event log for debugging |
+| `archive/{task_id}/` | Artifacts from every round |
+
+Run `loop status --tree` anytime to see where things stand.
+
+## Deep Dive
+
+<details>
+<summary><strong>Architecture & File Bus Protocol</strong></summary>
+
+### How Components Talk
+
+All communication happens through JSON files in `.loop/`:
+
+```
+PM → Worker:   task_card.json / fix_list.json
+Worker → PM:   work_report.json
+PM → Reviewer: review_request.json
+Reviewer → PM: review_report.json
+```
+
+```
+                    ┌──────────┐
+                    │   PM     │  orchestrator.py
+                    │(outer)   │
+                    └────┬─────┘
+              ┌──────────┼──────────┐
+              ▼          ▼          ▼
+       ┌──────────┐ ┌──────────┐
+       │  Worker  │ │ Reviewer │   (codex/claude/opencode subprocess)
+       │(codex/   │ │(codex/   │
+       │claude/   │ │claude/   │
+       │opencode) │ │opencode) │
+       └──────────┘ └──────────┘
+```
+
+### Artifact Formats
+
+**task_card.json** — Your instructions to the system:
+
+```json
+{
+  "task_id": "T-001",
+  "status": "todo",
+  "goal": "One-sentence goal",
+  "in_scope": ["file or module"],
+  "out_of_scope": [],
+  "acceptance_criteria": ["measurable criterion"],
+  "depends_on": ["T-000"],
+  "lanes": [
+    {
+      "lane_id": "lane_core",
+      "owner_paths": ["src/loop_kit/orchestrator.py"],
+      "depends_on": [],
+      "backend_preference": "codex",
+      "acceptance_checks": ["unit tests pass for lane-owned files"]
+    }
+  ],
+  "constraints": []
+}
+```
+
+**review_report.json** — The reviewer's verdict:
+
+```json
+{
+  "task_id": "T-001",
+  "round": 1,
+  "decision": "approve|changes_required",
+  "blocking_issues": [{"severity": "high", "file": "src/main.py", "reason": "..."}],
+  "non_blocking_suggestions": ["..."]
+}
+```
+
+`state.json` is the single source of truth between rounds.
+
+</details>
+
+<details>
+<summary><strong>Core Concepts</strong></summary>
+
+### Knowledge System
+
+Loop Kit doesn't just send raw code to the AI — it retrieves **relevant context**:
+
+- **Facts** — Project-specific conventions (`project_facts.md`)
+- **Pitfalls** — Known issues to avoid (`pitfalls.md`)
+- **Patterns** — High-confidence coding patterns (`patterns.jsonl`)
+- **Module Map** — Offline codebase index (`module_map.json`)
+
+Context is scored by relevance, keeping prompts focused and costs down.
+
+### State Machine
+
+| State | Meaning |
+|-------|---------|
+| `idle` | No active contract |
+| `awaiting_work` | Worker phase |
+| `awaiting_review` | Reviewer phase |
+| `done` | Terminal (approved, timeout, or blocked) |
+
+### Session Management
+
+- **Quickstart**: Fresh context for cold starts (round 1)
+- **Handoff**: Structured bridge every round for both roles
+- **Warm resume**: Reuse backend sessions for low-latency continuation
+- **Session rotation**: Set `--max-session-rounds` to intentionally rotate
+
+</details>
+
+<details>
+<summary><strong>CLI Reference</strong></summary>
+
+### Commands
 
 ```
 loop init                  Create .loop/ directory structure and templates
@@ -164,18 +264,16 @@ loop report                Summarize task progress from state/archive artifacts
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--tree` | off | Render dependency tree from `task_card.json` and show blocked reasons per node |
+| `--tree` | off | Render dependency tree from `task_card.json` |
 | `--loop-dir PATH` | .loop | Loop bus directory |
 
 ### `loop dispatch-metrics` flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--task-id ID` | all task IDs | Filter `dispatch_phase_metrics` rows by task ID |
-| `--role all\|worker\|reviewer` | all | Filter rows by role |
+| `--task-id ID` | all task IDs | Filter by task ID |
+| `--role all\|worker\|reviewer` | all | Filter by role |
 | `--loop-dir PATH` | .loop | Loop bus directory |
-
-Example:
 
 ```bash
 loop dispatch-metrics --task-id T-715 --role worker
@@ -185,13 +283,11 @@ loop dispatch-metrics --task-id T-715 --role worker
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--task-id ID` | required | Task ID archive key (for example `T-604`) |
-| `--base-round N` | required | Base archive round number (`>=1`) |
-| `--head-round N` | required | Head archive round number (`>=1`) |
-| `--artifact all\|state\|work_report\|review_report` | all | Which archived artifact to diff |
+| `--task-id ID` | **required** | Task ID archive key (e.g. `T-604`) |
+| `--base-round N` | **required** | Base archive round number (`>=1`) |
+| `--head-round N` | **required** | Head archive round number (`>=1`) |
+| `--artifact all\|state\|work_report\|review_report` | all | Which artifact to diff |
 | `--loop-dir PATH` | .loop | Loop bus directory |
-
-The command compares archived `state`, `work_report`, and/or `review_report` JSON artifacts between two rounds and prints a deterministic unified diff. Missing rounds, missing required artifacts, or archive identity mismatches (`task_id`/`round` not matching filename routing) fail fast with a validation error.
 
 ### `loop report` flags
 
@@ -201,280 +297,73 @@ The command compares archived `state`, `work_report`, and/or `review_report` JSO
 | `--format json\|markdown` | json | Output format |
 | `--loop-dir PATH` | .loop | Loop bus directory |
 
-`--format markdown` renders a deterministic task summary including goal, status, rounds, per-round decisions, and changed files when available. The report command only consumes artifacts whose payload identity matches the requested task and round; inconsistent archived artifacts fail with validation errors.
-
-`loop knowledge` manages built-in defaults:
+### `loop knowledge` subcommands
 
 - `list [--category CAT]` — Print facts, pitfalls, patterns
 - `add --pattern TEXT --category CAT --confidence 0..1 --source ORIGIN` — Append pattern
 - `prune --older-than DAYS` — Remove stale entries
 - `dedupe` — Remove duplicates
 
-All writes are atomic and modify `src/loop_kit/defaults/*.jsonl`.
+### Configuration
 
-### Configuration files and env vars
-
-`loop run` also reads defaults from `.loop/config.yaml` (preferred) or `.loop/config.json` (backward compatible).
-
-- YAML support is optional and uses `PyYAML` when installed. If `config.yaml` exists but `PyYAML` is unavailable, it is skipped with a warning.
-- Existing `.loop/config.json` files continue to work unchanged.
+`loop run` reads defaults from `.loop/config.yaml` (preferred) or `.loop/config.json`.
 
 Environment variable overrides:
 
-- `LOOP_MAX_ROUNDS` -> `RunConfig.max_rounds`
-- `LOOP_DISPATCH_TIMEOUT` -> `RunConfig.dispatch_timeout`
-- `LOOP_BACKEND_PREFERENCE` -> `RunConfig.backend_preference` (comma-separated, e.g. `codex,claude,opencode`)
+- `LOOP_MAX_ROUNDS` → `RunConfig.max_rounds`
+- `LOOP_DISPATCH_TIMEOUT` → `RunConfig.dispatch_timeout`
+- `LOOP_BACKEND_PREFERENCE` → `RunConfig.backend_preference` (comma-separated)
 
-Resolution order:
+Resolution order: `CLI args > env vars > config file > built-in defaults`
 
-`CLI args > environment variables > config file > built-in defaults`
+</details>
 
-## Architecture
+<details>
+<summary><strong>Performance & Optimization</strong></summary>
 
-**task_card.json**
-```json
-{
-  "task_id": "T-001",
-  "status": "todo",
-  "goal": "One-sentence goal",
-  "in_scope": ["file or module"],
-  "out_of_scope": [],
-  "acceptance_criteria": ["measurable criterion"],
-  "depends_on": ["T-000"],
-  "lanes": [
-    {
-      "lane_id": "lane_core",
-      "owner_paths": ["src/loop_kit/orchestrator.py"],
-      "depends_on": [],
-      "backend_preference": "codex",
-      "acceptance_checks": ["unit tests pass for lane-owned files"]
-    }
-  ],
-  "constraints": []
-}
-```
+### Metrics
 
-`depends_on` is optional. A legacy alias field `dependencies` is also accepted.
-
-`status` is system-managed: `in_progress` at start, `done` on approval, `blocked` on failures.
-
-**work_report.json**
-```json
-{
-  "task_id": "T-001",
-  "round": 1,
-  "head_sha": "abc123...",
-  "files_changed": ["src/main.py"],
-  "notes": "What was done",
-  "tests": [{"name": "test_foo", "result": "pass"}]
-}
-```
-
-**review_request.json**
-```json
-{
-  "task_id": "T-001",
-  "round": 1,
-  "base_sha": "def456...",
-  "head_sha": "abc123...",
-  "commits": ["abc123 Fix foo"],
-  "diff": "diff output...",
-  "acceptance_criteria": ["measurable criterion"],
-  "constraints": [],
-  "worker_notes": "What was done",
-  "worker_tests": [{"name": "test_foo", "result": "pass"}]
-}
-```
-
-**fix_list.json**
-```json
-{
-  "task_id": "T-001",
-  "round": 2,
-  "base_sha": "def456...",
-  "head_sha": "abc123...",
-  "fixes": [{"severity": "high", "file": "src/main.py", "reason": "..."}],
-  "prior_round_notes": "What was done",
-  "prior_review_non_blocking": ["..."]
-}
-```
-
-**review_report.json**
-```json
-{
-  "task_id": "T-001",
-  "round": 1,
-  "decision": "approve|changes_required",
-  "blocking_issues": [{"severity": "high", "file": "src/main.py", "reason": "..."}],
-  "non_blocking_suggestions": ["..."]
-}
-```
-
-**state.json** — Internal orchestrator state, the single source of truth between rounds.
-
-### Architecture Overview
-
-```
-                   ┌──────────┐
-                   │   PM     │  orchestrator.py
-                   │(outer)   │
-                   └────┬─────┘
-             ┌──────────┼──────────┐
-             ▼          ▼          ▼
-      ┌──────────┐ ┌──────────┐
-      │  Worker  │ │ Reviewer │   (codex/claude/opencode subprocess)
-      │(codex/   │ │(codex/   │
-      │claude/   │ │claude/   │
-      │opencode) │ │opencode) │
-      └──────────┘ └──────────┘
-```
-
-Each round runs as a fresh subprocess (`python -m loop_kit run --single-round`), so code changes take effect immediately.
-
-Backend discovery uses `shutil.which()` plus known install paths. The backend registry (`register_backend()`) supports adding custom backends.
-
-## Core Concepts
-
-### Worker-Reviewer Loop
-
-The orchestrator coordinates two AI agents:
-
-1. **Worker** - Writes/updates code based on task requirements
-2. **Reviewer** - Validates against acceptance criteria, provides feedback
-
-The loop continues until:
-- ✅ Reviewer approves
-- ⏰ Max rounds exhausted
-- ❌ Non-recoverable error
-
-### File Bus Protocol
-
-All communication uses JSON files in `.loop/`:
-
-```
-PM → Worker:   task_card.json / fix_list.json
-Worker → PM:   work_report.json
-PM → Reviewer: review_request.json
-Reviewer → PM:   review_report.json
-```
-
-### Knowledge System
-
-- **Facts** - Project-specific conventions (`project_facts.md`)
-- **Pitfalls** - Known issues to avoid (`pitfalls.md`)
-- **Patterns** - High-confidence coding patterns (`patterns.jsonl`)
-- **Module Map** - Offline codebase index (`module_map.json`)
-
-Context is **retrieved by relevance** (keyword scoring) rather than injected wholesale, keeping prompts focused.
-
-### Core Run-Loop State Machine
-
-The orchestrator uses explicit state metadata and trigger-driven transitions:
-
-- `idle` - No active contract
-- `awaiting_work` - Worker phase
-- `awaiting_review` - Reviewer phase
-- `done` - Terminal (approved, timeout, or blocked)
-
-Transitions are trigger-driven:
-
-| Trigger | Transition | Kind |
-|---------|------------|------|
-| `bootstrap` | any → `awaiting_work` | normal |
-| `worker_completed` | `awaiting_work` → `awaiting_review` | normal |
-| `reviewer_approved` | `awaiting_review` → `done` | normal |
-| `reviewer_changes_required` | `awaiting_review` → `awaiting_work` | retry |
-| `*_timeout` | → `done` | timeout |
-| `terminal_error` | any → `done` | error |
-| `max_rounds_exhausted` | → `done` | retry |
-
-### Quickstart vs Handoff vs Warm Resume
-
-- **Quickstart context**: injected for cold task starts (round 1)
-- **Handoff context**: structured bridge built every round for both roles (`done`, `open_questions`, `next_actions`, `evidence`, `must_read_files`)
-- **Warm resume**: reuses backend session IDs from `state.json` for low-latency continuation
-- **Session rotation**: set `--max-session-rounds` to intentionally rotate sessions
-- **Fallback**: invalid resume sessions are detected and retried with fresh sessions
-
-## Performance Metrics
-
-`loop dispatch-metrics` analyzes `.loop/logs/feed.jsonl` to report:
-
-- **Phase latencies**: `startup_ms`, `context_to_work_ms`, `work_to_artifact_ms`, `total_ms`
-- **Work subphases**: `read/search/edit/test/unknown` (counts & durations)
-
-Interpretation:
-- `startup_ms`: process startup + first output
-- `context_to_work_ms`: initial prompt processing before execution
-- `work_to_artifact_ms`: actual code work duration
+`loop dispatch-metrics` reports phase latencies (`startup_ms`, `context_to_work_ms`, `work_to_artifact_ms`, `total_ms`) and work subphases (`read/search/edit/test/unknown`).
 
 ### Optimization Tips
 
-**Slow startup** (`startup_ms` high):
-- Use `--max-session-rounds N` to reuse backend sessions
-- Pre-index with `loop index` for faster context
+| Symptom | Fix |
+|---------|-----|
+| Slow startup (`startup_ms` high) | Use `--max-session-rounds N`, pre-index with `loop index` |
+| Slow work phase (`work_to_artifact_ms` high) | Narrow `in_scope`, sharpen `acceptance_criteria`, split into lanes |
+| High retry count | Improve criteria clarity, add project facts, tune templates |
 
-**Slow work phase** (`work_to_artifact_ms` high):
-- Narrow `in_scope` files in task card
-- Add precise `acceptance_criteria` to reduce back-and-forth
-- Consider splitting into multiple lanes
+### Backend Choice
 
-**High retry count**:
-- Improve acceptance criteria clarity
-- Add more project facts via `loop knowledge add`
-- Tune prompt templates in `.loop/templates/`
-
-Monitor with: `loop dispatch-metrics --task-id <id> --role worker`
+| Backend | Best for |
+|---------|----------|
+| `codex` | Fast, good for boilerplate |
+| `claude` | Strong reasoning, complex refactors |
+| `opencode` | Local, no API costs |
 
 ### Best Practices
 
-**Task cards**
-- One clear goal per task (avoid scope creep)
-- Specific, testable acceptance criteria
-- Use `lanes` for multi-module changes to isolate worktrees
+- **Task cards**: One clear goal, specific acceptance criteria, use `lanes` for multi-module changes
+- **Reviewer tuning**: Make criteria objective and verifiable, use `out_of_scope` to prevent creep
+- **State management**: Use `--resume` to continue interrupted work, `loop status --tree` to visualize dependencies
 
-**Backend choice**
-- `codex`: Fast, good for boilerplate
-- `claude`: Strong reasoning, complex refactors
-- `opencode`: Local, no API costs
+</details>
 
-**Lanes**
-- Enable for changes spanning multiple subsystems
-- Each lane gets isolated git worktree
-- Define explicit dependencies between lanes
+<details>
+<summary><strong>Troubleshooting</strong></summary>
 
-**Reviewer tuning**
-- Make `acceptance_criteria` objective and verifiable
-- Provide examples of "done" in task description
-- Use `out_of_scope` to prevent creep
+| Problem | Fix |
+|---------|-----|
+| Backend not found | Ensure CLI is in PATH, or use `--dispatch-backend native` |
+| Timeouts | Increase `--dispatch-timeout` or `--artifact-timeout`, check `.loop/logs/` |
+| Worker/reviewer not responding | Use `loop health`, add `--require-heartbeat` |
+| State stuck | Inspect `.loop/state.json`, use `--reset` to clear stale files |
+| Permission errors | Ensure `.loop/` is writable, git worktree needs repo write access |
 
-**State management**
-- Use `--resume` to continue interrupted work
-- `loop status --tree` to visualize dependencies
+</details>
 
-## Troubleshooting
-
-**Backend not found**
-- Ensure backend CLI is in PATH (`codex`, `claude`, or `opencode`)
-- Or set `--dispatch-backend native` for local module execution
-
-**Timeouts**
-- Increase `--dispatch-timeout` or `--artifact-timeout`
-- Check `.loop/logs/` for slow phases
-
-**Worker/reviewer not responding**
-- Use `loop health` to check heartbeats
-- Add `--require-heartbeat` to fail fast on stalls
-
-**State stuck**
-- Inspect `.loop/state.json`
-- Use `--reset` to clear stale bus files
-
-**Permission errors**
-- `.loop/` must be writable
-- Git worktree operations need repo write access
-
-## Development
+<details>
+<summary><strong>Development</strong></summary>
 
 ```bash
 # Clone and install editable
@@ -499,7 +388,7 @@ GitHub Actions workflow [`loop-ci.yml`](.github/workflows/loop-ci.yml) runs on `
 - `uv run --group dev ruff check src/loop_kit tests`
 - `uv run --group dev --with mypy mypy src/loop_kit` (optional, non-blocking)
 
-The workflow uploads `coverage.xml` to Codecov and stores JUnit XML test results as workflow artifacts.
+</details>
 
 ## License
 
