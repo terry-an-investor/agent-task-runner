@@ -106,6 +106,7 @@ Project files always override built-in defaults when present.
 ```json
 {
   "task_id": "T-001",
+  "status": "todo",
   "goal": "One-sentence goal",
   "in_scope": ["file or module"],
   "out_of_scope": [],
@@ -113,6 +114,8 @@ Project files always override built-in defaults when present.
   "constraints": []
 }
 ```
+
+`status` is system-managed while the loop runs: it is written to `in_progress` at start, `done` on approved completion, and `blocked` on non-approved terminal failures.
 
 **work_report.json**
 ```json

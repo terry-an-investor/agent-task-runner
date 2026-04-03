@@ -3049,6 +3049,124 @@ def test_single_round_approved_summary_includes_round_details(tmp_path: Path, mo
     assert detail["tests_summary"]["fail"] == 1
 
 
+def test_single_round_status_writeback_transitions_and_source_sync(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+
+    task_path = tmp_path / "task_input.json"
+    task_path.write_text(
+        json.dumps({"task_id": "T-604", "goal": "status writeback", "status": "todo"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    orchestrator.STATE_FILE.write_text(
+        json.dumps(
+            {
+                "state": orchestrator.STATE_AWAITING_WORK,
+                "round": 1,
+                "task_id": "T-604",
+                "base_sha": "base-sha",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    work_report = {
+        "task_id": "T-604",
+        "round": 1,
+        "head_sha": "head-sha",
+        "files_changed": ["src/loop_kit/orchestrator.py"],
+        "tests": [],
+        "notes": "ok",
+    }
+    review_report = {
+        "task_id": "T-604",
+        "round": 1,
+        "decision": "approve",
+        "blocking_issues": [],
+        "non_blocking_suggestions": [],
+    }
+    observed: list[tuple[str, str | None, str | None]] = []
+
+    def fake_wait_for_role_result(
+        *,
+        role: str,
+        artifact_path: Path,
+        config: orchestrator.RunConfig,
+        task_id: str,
+        round_num: int,
+    ) -> dict | None:
+        _ = (artifact_path, config, task_id, round_num)
+        bus_payload = json.loads(orchestrator.TASK_CARD.read_text(encoding="utf-8"))
+        src_payload = json.loads(task_path.read_text(encoding="utf-8"))
+        observed.append((role, bus_payload.get("status"), src_payload.get("status")))
+        if role == "worker":
+            return work_report
+        if role == "reviewer":
+            return review_report
+        return None
+
+    monkeypatch.setattr(orchestrator, "_auto_dispatch_role", lambda **kwargs: None)
+    monkeypatch.setattr(orchestrator, "_wait_for_role_result", fake_wait_for_role_result)
+    monkeypatch.setattr(orchestrator, "_diff", lambda base, head: f"diff {base}->{head}")
+    monkeypatch.setattr(orchestrator, "_log_oneline", lambda base, head: f"log {base}->{head}")
+
+    orchestrator.cmd_run(
+        _run_config(str(task_path)),
+        single_round=True,
+        round_num=1,
+    )
+
+    assert observed[0] == ("worker", "in_progress", "in_progress")
+    assert observed[1] == ("reviewer", "in_progress", "in_progress")
+    bus_after = json.loads(orchestrator.TASK_CARD.read_text(encoding="utf-8"))
+    src_after = json.loads(task_path.read_text(encoding="utf-8"))
+    assert bus_after["status"] == "done"
+    assert src_after["status"] == "done"
+
+
+def test_single_round_dispatch_failure_marks_task_status_blocked(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+
+    task_path = tmp_path / "task_input.json"
+    task_path.write_text(
+        json.dumps({"task_id": "T-604", "goal": "dispatch failure", "status": "todo"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    orchestrator.STATE_FILE.write_text(
+        json.dumps(
+            {
+                "state": orchestrator.STATE_AWAITING_WORK,
+                "round": 1,
+                "task_id": "T-604",
+                "base_sha": "base-sha",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    def fail_dispatch(**kwargs):
+        _ = kwargs
+        raise RuntimeError("dispatch failed")
+
+    monkeypatch.setattr(orchestrator, "_auto_dispatch_role", fail_dispatch)
+
+    with pytest.raises(SystemExit) as exc:
+        orchestrator.cmd_run(
+            _run_config(str(task_path)),
+            single_round=True,
+            round_num=1,
+        )
+
+    assert exc.value.code == 3
+    state = json.loads(orchestrator.STATE_FILE.read_text(encoding="utf-8"))
+    assert state["outcome"] == "worker_dispatch_failed"
+    bus_after = json.loads(orchestrator.TASK_CARD.read_text(encoding="utf-8"))
+    src_after = json.loads(task_path.read_text(encoding="utf-8"))
+    assert bus_after["status"] == "blocked"
+    assert src_after["status"] == "blocked"
+
+
 def test_outer_loop_spawns_single_round_subprocess(tmp_path: Path, monkeypatch) -> None:
     _configure_loop_paths(monkeypatch, tmp_path)
 
@@ -3117,6 +3235,60 @@ def test_outer_loop_spawns_single_round_subprocess(tmp_path: Path, monkeypatch) 
     assert "--par-worker-target" not in cmd
     assert "--par-reviewer-target" not in cmd
     assert "--require-heartbeat" in cmd
+
+
+def test_outer_loop_approved_status_is_written_back_to_source_task_card(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+
+    task_path = tmp_path / "task_input.json"
+    task_path.write_text(
+        json.dumps({"task_id": "T-604", "goal": "outer status sync", "status": "todo"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(orchestrator, "_current_sha", lambda: "base-sha")
+
+    observed: dict[str, tuple[str | None, str | None]] = {}
+
+    def fake_subprocess_popen(cmd, **kwargs):
+        _ = kwargs
+        round_num = int(cmd[cmd.index("--round") + 1])
+        bus_payload = json.loads(orchestrator.TASK_CARD.read_text(encoding="utf-8"))
+        src_payload = json.loads(task_path.read_text(encoding="utf-8"))
+        observed["during_subprocess"] = (bus_payload.get("status"), src_payload.get("status"))
+        orchestrator.REVIEW_REPORT.write_text(
+            json.dumps(
+                {
+                    "task_id": "T-604",
+                    "round": round_num,
+                    "decision": "approve",
+                    "blocking_issues": [],
+                    "non_blocking_suggestions": [],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        state = orchestrator._load_state()
+        state["state"] = orchestrator.STATE_DONE
+        state["outcome"] = "approved"
+        state["head_sha"] = "head-sha"
+        state["round"] = round_num
+        orchestrator._save_state(state)
+        return _FakeProc(stdout_lines=[])
+
+    monkeypatch.setattr(orchestrator.subprocess, "Popen", fake_subprocess_popen)
+
+    orchestrator.cmd_run(
+        _run_config(str(task_path)),
+        single_round=False,
+        round_num=None,
+    )
+
+    assert observed["during_subprocess"] == ("in_progress", "in_progress")
+    bus_after = json.loads(orchestrator.TASK_CARD.read_text(encoding="utf-8"))
+    src_after = json.loads(task_path.read_text(encoding="utf-8"))
+    assert bus_after["status"] == "done"
+    assert src_after["status"] == "done"
 
 
 def test_outer_loop_streams_single_round_subprocess_stdout_in_real_time(tmp_path: Path, monkeypatch, capsys) -> None:

@@ -3077,6 +3077,9 @@ STATE_IDLE = "idle"
 STATE_AWAITING_WORK = "awaiting_work"
 STATE_AWAITING_REVIEW = "awaiting_review"
 STATE_DONE = "done"
+TASK_STATUS_IN_PROGRESS = "in_progress"
+TASK_STATUS_DONE = "done"
+TASK_STATUS_BLOCKED = "blocked"
 
 
 def _default_state(task_id: str | None = None, round_num: int = 0) -> dict:
@@ -3309,6 +3312,35 @@ def _sync_task_card(task_path: str, paths: LoopPaths | None = None) -> None:
     _log(f"Synced task card: {src} -> {task_card_path}")
 
 
+def _task_card_status_targets(task_path: str, paths: LoopPaths | None = None) -> list[Path]:
+    resolved_paths = _resolve_paths(paths)
+    targets = [resolved_paths.task_card]
+    source = Path(task_path)
+    try:
+        if _normalized_abs(source) == _normalized_abs(resolved_paths.task_card):
+            return targets
+    except OSError:
+        pass
+    targets.append(source)
+    return targets
+
+
+def _write_task_card_status(task_path: str, status: str, paths: LoopPaths | None = None) -> None:
+    updated_targets: list[str] = []
+    for target in _task_card_status_targets(task_path, paths=paths):
+        payload = _read_json_if_exists(target)
+        if not isinstance(payload, dict):
+            continue
+        current_status = payload.get("status")
+        if current_status == status:
+            continue
+        payload["status"] = status
+        _atomic_write_json(target, payload)
+        updated_targets.append(_display_path(target))
+    if updated_targets:
+        _log(f"Task card status -> {status}: {', '.join(updated_targets)}")
+
+
 def _resolve_task_path(task_ref: str | None) -> str | None:
     """Resolve a task ID or path to an absolute task card path.
 
@@ -3486,6 +3518,7 @@ def _fail_with_state(
     outcome: str,
     message: str,
     exit_code: int = EXIT_GENERAL_ERROR,
+    task_path: str | None = None,
     paths: LoopPaths | None = None,
 ) -> None:
     _log(message)
@@ -3495,6 +3528,7 @@ def _fail_with_state(
     state["failed_at"] = _ts()
     state["error"] = message
     _save_state(state, paths=paths)
+    _write_task_card_status(task_path or str(_resolve_paths(paths).task_card), TASK_STATUS_BLOCKED, paths=paths)
     try:
         # Map exit code to appropriate exception type
         if exit_code == EXIT_VALIDATION_ERROR:
@@ -4372,6 +4406,7 @@ def _run_single_round(
     task_packet_path = resolved_paths.dir / "task_packet.json"
     _ = single_round
     task_card, task_id_from_card = _sync_task_card_to_bus(config.task_path, round_num=round_num, paths=resolved_paths)
+    _write_task_card_status(config.task_path, TASK_STATUS_IN_PROGRESS, paths=resolved_paths)
 
     state = _load_state(paths=resolved_paths)
     state_task_id = state.get("task_id")
@@ -4388,6 +4423,7 @@ def _run_single_round(
             outcome=outcome,
             message=message,
             exit_code=exit_code,
+            task_path=config.task_path,
             paths=resolved_paths,
         )
 
@@ -4506,6 +4542,7 @@ def _run_single_round(
         state["outcome"] = "worker_timeout"
         state["error"] = "Worker timed out"
         _save_single_round_state()
+        _write_task_card_status(config.task_path, TASK_STATUS_BLOCKED, paths=resolved_paths)
         raise DispatchError("Worker timed out")
 
     report_error = _validate_report(
@@ -4615,6 +4652,7 @@ def _run_single_round(
         state["outcome"] = "reviewer_timeout"
         state["error"] = "Reviewer timed out"
         _save_single_round_state()
+        _write_task_card_status(config.task_path, TASK_STATUS_BLOCKED, paths=resolved_paths)
         raise DispatchError("Reviewer timed out")
 
     review_error = _validate_report(
@@ -4673,6 +4711,7 @@ def _run_single_round(
         state["state"] = STATE_DONE
         state["outcome"] = "approved"
         _save_single_round_state()
+        _write_task_card_status(config.task_path, TASK_STATUS_DONE, paths=resolved_paths)
         print(f"\n{'=' * 60}")
         print(f"  APPROVED at round {round_num}")
         print(f"  base: {base_sha[:8]}  head: {head_sha[:8]}")
@@ -4807,6 +4846,7 @@ def _run_multi_round_via_subprocess(
                     "state.json is missing required resume contract (task_id/base_sha/round). Re-run without --resume."
                 ),
                 exit_code=EXIT_VALIDATION_ERROR,
+                task_path=config.task_path,
             )
             return
         _, task_card, task_id_from_card = _load_task_card(str(resolved_paths.task_card))
@@ -4819,6 +4859,7 @@ def _run_multi_round_via_subprocess(
                     f"state={state_task_id!r} task={task_id_from_card!r}"
                 ),
                 exit_code=EXIT_VALIDATION_ERROR,
+                task_path=config.task_path,
             )
             return
         task_id = state_task_id
@@ -4838,6 +4879,8 @@ def _run_multi_round_via_subprocess(
         state["round"] = start_round
         state["started_at"] = _ts()
         _save_state(state, paths=resolved_paths)
+
+    _write_task_card_status(config.task_path, TASK_STATUS_IN_PROGRESS, paths=resolved_paths)
 
     _prepare_bus_file(resolved_paths.work_report, task_id, start_round, "work_report")
     _prepare_bus_file(resolved_paths.review_report, task_id, start_round, "review_report")
@@ -4928,6 +4971,7 @@ def _run_multi_round_via_subprocess(
                     outcome="single_round_failed",
                     message=f"single-round subprocess failed for round={round_num} rc={result.returncode}",
                     exit_code=EXIT_VALIDATION_ERROR,
+                    task_path=config.task_path,
                 )
                 return
 
@@ -4948,10 +4992,12 @@ def _run_multi_round_via_subprocess(
                         f"got task_id={state.get('task_id')} base_sha={state.get('base_sha')}"
                     ),
                     exit_code=EXIT_VALIDATION_ERROR,
+                    task_path=config.task_path,
                 )
                 return
 
             if state.get("state") == STATE_DONE and state.get("outcome") == "approved":
+                _write_task_card_status(config.task_path, TASK_STATUS_DONE, paths=resolved_paths)
                 _archive_task_summary(task_id, paths=resolved_paths)
                 _log(f"Task approved via state contract at round={round_num}")
                 return
@@ -4984,6 +5030,7 @@ def _run_multi_round_via_subprocess(
                     f"state={state.get('state')!r} outcome={state.get('outcome')!r} round={state.get('round')!r}"
                 ),
                 exit_code=EXIT_VALIDATION_ERROR,
+                task_path=config.task_path,
             )
             return
     finally:
@@ -5000,12 +5047,15 @@ def _run_multi_round_via_subprocess(
             outcome="interrupted",
             message="User interrupted (SIGINT)",
             exit_code=EXIT_INTERRUPTED,
+            task_path=config.task_path,
+            paths=resolved_paths,
         )
 
     state = _load_state(paths=resolved_paths)
     state["state"] = STATE_DONE
     state["outcome"] = "max_rounds_exhausted"
     _save_state(state, paths=resolved_paths)
+    _write_task_card_status(config.task_path, TASK_STATUS_BLOCKED, paths=resolved_paths)
     print(f"\n  MAX ROUNDS ({config.max_rounds}) reached without approval.")
     print(f"  Last review decision: {last_decision}")
     print("  PM should re-evaluate task scope or split the task.")
@@ -5094,12 +5144,14 @@ def cmd_run(
                 outcome = resume_state.get("outcome")
                 state_name = resume_state.get("state")
                 if state_name == STATE_DONE and outcome == "approved":
+                    _write_task_card_status(config.task_path, TASK_STATUS_DONE, paths=resolved_paths)
                     print(
                         "Resume not needed: state.json already marked done/approved "
                         f"for task_id={resume_state.get('task_id')!r}."
                     )
                     return
                 if state_name == STATE_DONE and outcome != "approved":
+                    _write_task_card_status(config.task_path, TASK_STATUS_BLOCKED, paths=resolved_paths)
                     error_text = resume_state.get("error") or "<no error details in state.json>"
                     print(
                         "Error: cannot resume because state.json indicates a failed run: "
