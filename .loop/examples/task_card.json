@@ -8,5 +8,6 @@
   "acceptance_criteria": [
     "<measurable criterion>"
   ],
+  "depends_on": [],
   "constraints": []
 }

@@ -49,7 +49,7 @@ loop init                  Create .loop/ directory structure and templates
 loop index                 Build offline module map for src/loop_kit
 loop run                   Run the full PM-controlled review loop
 loop knowledge             Manage built-in defaults knowledge JSONL files
-loop status                Show current loop state
+loop status                Show current loop state (use --tree for dependency DAG view)
 loop health                Show worker/reviewer heartbeat health
 loop dispatch-metrics      Summarize dispatch phase latency metrics from feed logs
 loop heartbeat             Write role heartbeat continuously
@@ -83,6 +83,13 @@ loop report                Summarize task progress from state/archive artifacts
 | `--reset` | off | Reset stale bus files before running |
 | `--allow-dirty` | off | Allow starting with dirty tracked files |
 | `--verbose` | off | Stream full backend stdout |
+| `--loop-dir PATH` | .loop | Loop bus directory |
+
+### `loop status` flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--tree` | off | Render dependency tree from `task_card.json` and show blocked reasons per node |
 | `--loop-dir PATH` | .loop | Loop bus directory |
 
 ### `loop dispatch-metrics` flags
@@ -244,11 +251,14 @@ Interpretation limits for the command output:
   "in_scope": ["file or module"],
   "out_of_scope": [],
   "acceptance_criteria": ["measurable criterion"],
+  "depends_on": ["T-000"],
   "constraints": []
 }
 ```
 
-`status` is system-managed while the loop runs: it is written to `in_progress` at start, `done` on approved completion, and `blocked` on non-approved terminal failures.
+`depends_on` is optional. A legacy alias field `dependencies` is also accepted.
+
+`status` is system-managed while the loop runs: it is written to `in_progress` at start, `done` on approved completion, and `blocked` on non-approved terminal failures, including unsatisfied task dependencies before dispatch.
 
 **work_report.json**
 ```json

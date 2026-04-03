@@ -3758,6 +3758,130 @@ def test_load_task_card_rejects_non_dict_json(tmp_path: Path, capsys) -> None:
     assert "task card must be a JSON object" in capsys.readouterr().err
 
 
+def test_load_task_card_rejects_invalid_depends_on_shape(tmp_path: Path, capsys) -> None:
+    task_path = tmp_path / "task_input.json"
+    task_path.write_text(
+        json.dumps({"task_id": "T-900", "goal": "bad deps", "depends_on": "T-901"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        orchestrator._load_task_card(str(task_path))
+
+    assert exc.value.code == 1
+    assert "field 'depends_on' must be a list of task IDs" in capsys.readouterr().err
+
+
+def test_dependency_snapshot_ready_when_dependencies_done(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+    task_path = tmp_path / "task_input.json"
+    task_path.write_text(
+        json.dumps(
+            {
+                "task_id": "T-900",
+                "goal": "ready task",
+                "dependencies": ["T-901"],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    dep_task_path = tmp_path / ".loop" / "tasks" / "T-901_task_card.json"
+    dep_task_path.parent.mkdir(parents=True, exist_ok=True)
+    dep_task_path.write_text(
+        json.dumps({"task_id": "T-901", "goal": "dep done", "status": "done"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    snapshot = orchestrator._build_task_dependency_snapshot(str(task_path))
+
+    assert snapshot.root_task_id == "T-900"
+    assert snapshot.graph["T-900"] == ["T-901"]
+    assert orchestrator._dependency_blocked_reasons(snapshot) == []
+
+
+def test_single_round_blocks_when_dependency_not_done(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+    task_path = tmp_path / "task_input.json"
+    task_path.write_text(
+        json.dumps(
+            {
+                "task_id": "T-900",
+                "goal": "blocked task",
+                "status": "todo",
+                "depends_on": ["T-901"],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    dep_task_path = tmp_path / ".loop" / "tasks" / "T-901_task_card.json"
+    dep_task_path.parent.mkdir(parents=True, exist_ok=True)
+    dep_task_path.write_text(
+        json.dumps({"task_id": "T-901", "goal": "dep", "status": "in_progress"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        orchestrator.cmd_run(
+            _run_config(str(task_path), allow_dirty=True),
+            single_round=True,
+            round_num=1,
+        )
+
+    assert exc.value.code == 3
+    state = json.loads(orchestrator.STATE_FILE.read_text(encoding="utf-8"))
+    assert state["outcome"] == "blocked_dependencies"
+    assert "T-901" in state["error"]
+    bus_task_card = json.loads(orchestrator.TASK_CARD.read_text(encoding="utf-8"))
+    src_task_card = json.loads(task_path.read_text(encoding="utf-8"))
+    assert bus_task_card["status"] == "blocked"
+    assert src_task_card["status"] == "blocked"
+
+
+def test_single_round_fails_on_dependency_cycle(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+    task_path = tmp_path / "task_input.json"
+    task_path.write_text(
+        json.dumps(
+            {
+                "task_id": "T-900",
+                "goal": "cycle task",
+                "status": "todo",
+                "depends_on": ["T-901"],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    dep_task_path = tmp_path / ".loop" / "tasks" / "T-901_task_card.json"
+    dep_task_path.parent.mkdir(parents=True, exist_ok=True)
+    dep_task_path.write_text(
+        json.dumps(
+            {
+                "task_id": "T-901",
+                "goal": "dep",
+                "status": "todo",
+                "depends_on": ["T-900"],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        orchestrator.cmd_run(
+            _run_config(str(task_path), allow_dirty=True),
+            single_round=True,
+            round_num=1,
+        )
+
+    assert exc.value.code == 3
+    state = json.loads(orchestrator.STATE_FILE.read_text(encoding="utf-8"))
+    assert state["outcome"] == "dependency_cycle"
+    assert "Circular task dependencies detected: T-900 -> T-901 -> T-900" in state["error"]
+
+
 def test_single_round_approved_summary_includes_round_details(tmp_path: Path, monkeypatch) -> None:
     _configure_loop_paths(monkeypatch, tmp_path)
 
@@ -5458,6 +5582,36 @@ class TestCmdStatus:
         assert "project_facts.md: EXISTS (facts=2)" in out
         assert "pitfalls.md: EXISTS (pitfalls=1)" in out
         assert "patterns.jsonl: EXISTS (entries=2, high_confidence=1, stale=1)" in out
+
+    def test_status_tree_shows_dependencies_and_blockers(self, tmp_path: Path, monkeypatch, capsys) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        orchestrator.TASK_CARD.write_text(
+            json.dumps(
+                {
+                    "task_id": "T-910",
+                    "goal": "tree view",
+                    "status": "todo",
+                    "depends_on": ["T-911"],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        dep_task_path = tmp_path / ".loop" / "tasks" / "T-911_task_card.json"
+        dep_task_path.parent.mkdir(parents=True, exist_ok=True)
+        dep_task_path.write_text(
+            json.dumps({"task_id": "T-911", "goal": "dep", "status": "in_progress"}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        orchestrator.cmd_status(tree=True)
+        out = capsys.readouterr().out
+
+        assert "Dependency tree:" in out
+        assert "T-910 [todo]" in out
+        assert "T-911 [in_progress]" in out
+        assert "blocked by T-911: status='in_progress' (expected 'done')" in out
+        assert "Root blockers:" in out
 
 
 class TestCmdHealth:

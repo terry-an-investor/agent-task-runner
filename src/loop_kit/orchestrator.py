@@ -123,6 +123,8 @@ class TaskCard(TypedDict, total=False):
     out_of_scope: Required[list[str]]
     acceptance_criteria: Required[list[str]]
     constraints: Required[list[str]]
+    depends_on: NotRequired[list[str]]
+    dependencies: NotRequired[list[str]]
 
 
 # ── single-file architecture boundaries (T-722) ────────────────────────────
@@ -3478,6 +3480,8 @@ def _render_task_card_section(task_card: TaskCard) -> str:
         f"{_as_prompt_list(task_card.get('out_of_scope'))}\n"
         "acceptance_criteria:\n"
         f"{_as_prompt_list(task_card.get('acceptance_criteria'))}\n"
+        "depends_on:\n"
+        f"{_as_prompt_list(task_card.get('depends_on'))}\n"
         "constraints:\n"
         f"{_as_prompt_list(task_card.get('constraints'))}\n"
     )
@@ -4022,6 +4026,7 @@ STATE_DONE = "done"
 TASK_STATUS_IN_PROGRESS = "in_progress"
 TASK_STATUS_DONE = "done"
 TASK_STATUS_BLOCKED = "blocked"
+_DEPENDENCY_FIELDS = ("depends_on", "dependencies")
 TRANSITION_KIND_NORMAL = "normal"
 TRANSITION_KIND_RETRY = "retry"
 TRANSITION_KIND_TIMEOUT = "timeout"
@@ -4521,12 +4526,251 @@ def _resolve_task_path(task_ref: str | None) -> str | None:
     p = Path(task_ref)
     if p.is_file():
         return str(p)
-    if _TASKS_DIR.is_dir():
-        escaped = task_ref.translate(str.maketrans({"[": "[[]", "]": "[]]", "*": "[*]", "?": "[?]"}))
-        matches = sorted(_TASKS_DIR.glob(f"{escaped}-*.json"))
-        if matches:
-            return str(matches[0])
+    try:
+        normalized = _validate_task_id_arg(task_ref)
+    except ValidationError:
+        return task_ref
+    try:
+        resolved = _resolve_task_card_path_by_id(normalized)
+    except ConfigError:
+        return task_ref
+    if resolved is not None:
+        return str(resolved)
     return task_ref
+
+
+def _normalize_task_dependencies(task_card: dict, *, source: Path, task_id: str) -> list[str]:
+    dependencies: list[str] = []
+    seen: dict[str, str] = {}
+    for field_name in _DEPENDENCY_FIELDS:
+        if field_name not in task_card:
+            continue
+        raw = task_card.get(field_name)
+        if raw is None:
+            continue
+        if not isinstance(raw, list):
+            raise ConfigError(f"task card {source}: field '{field_name}' must be a list of task IDs")
+        for index, item in enumerate(raw):
+            location = f"{field_name}[{index}]"
+            if not isinstance(item, str) or not item.strip():
+                raise ConfigError(f"task card {source}: field '{location}' must be a non-empty task ID string")
+            dependency_id = item.strip()
+            try:
+                _validate_task_id_arg(dependency_id)
+            except ValidationError as e:
+                raise ConfigError(
+                    f"task card {source}: field '{location}' must be a valid task ID: {e}"
+                ) from e
+            if task_id and dependency_id == task_id:
+                raise ConfigError(f"task card {source}: task_id '{task_id}' must not depend on itself")
+            first_seen = seen.get(dependency_id)
+            if first_seen is not None:
+                raise ConfigError(
+                    f"task card {source}: duplicate dependency '{dependency_id}' at '{location}' (first seen at '{first_seen}')"
+                )
+            seen[dependency_id] = location
+            dependencies.append(dependency_id)
+    return dependencies
+
+
+def _task_card_candidate_paths(task_id: str, *, paths: LoopPaths | None = None) -> list[Path]:
+    resolved_paths = _resolve_paths(paths)
+    tasks_dir = resolved_paths.dir / "tasks"
+    if not tasks_dir.is_dir():
+        return []
+    candidates: list[Path] = []
+    for pattern in (f"{task_id}_*.json", f"{task_id}-*.json", f"{task_id}.json"):
+        candidates.extend(sorted(tasks_dir.glob(pattern)))
+    return candidates
+
+
+def _resolve_task_card_path_by_id(task_id: str, *, paths: LoopPaths | None = None) -> Path | None:
+    candidates = _task_card_candidate_paths(task_id, paths=paths)
+    if len(candidates) > 1:
+        names = ", ".join(path.name for path in candidates)
+        raise ConfigError(f"multiple task cards found for task_id {task_id!r}: {names}")
+    if len(candidates) == 1:
+        return candidates[0]
+
+    resolved_paths = _resolve_paths(paths)
+    tasks_dir = resolved_paths.dir / "tasks"
+    if not tasks_dir.is_dir():
+        return None
+
+    scanned_matches: list[Path] = []
+    for path in sorted(tasks_dir.glob("*.json")):
+        payload = _read_json_if_exists(path)
+        if not isinstance(payload, dict):
+            continue
+        payload_task_id = payload.get("task_id")
+        if isinstance(payload_task_id, str) and payload_task_id.strip() == task_id:
+            scanned_matches.append(path)
+    if len(scanned_matches) > 1:
+        names = ", ".join(path.name for path in scanned_matches)
+        raise ConfigError(f"multiple task cards found for task_id {task_id!r}: {names}")
+    if scanned_matches:
+        return scanned_matches[0]
+    return None
+
+
+def _load_task_card_or_raise(task_path: str | Path) -> tuple[Path, TaskCard, str]:
+    tp = Path(task_path)
+    if not tp.exists():
+        raise ConfigError(f"task card not found: {tp}")
+    try:
+        task_card_raw = _load_json_with_limit(tp, label=f"task card {tp}")
+    except ConfigError:
+        raise
+    except json.JSONDecodeError as e:
+        raise ConfigError(f"task card at {tp} contains invalid JSON: {e}") from e
+    except OSError as e:
+        raise ConfigError(f"unable to read task card at {tp}: {e}") from e
+    if not isinstance(task_card_raw, dict):
+        raise ConfigError(f"task card must be a JSON object: {tp}")
+
+    task_card_typed = cast(TaskCard, task_card_raw)
+    task_id_raw = task_card_typed.get("task_id", "UNKNOWN")
+    task_id = str(task_id_raw).strip() if isinstance(task_id_raw, str) else str(task_id_raw)
+    dependencies = _normalize_task_dependencies(task_card_typed, source=tp, task_id=task_id)
+    if dependencies:
+        task_card_typed["depends_on"] = dependencies
+    elif "depends_on" in task_card_typed:
+        task_card_typed["depends_on"] = []
+    return tp, task_card_typed, task_id or "UNKNOWN"
+
+
+@dataclass(slots=True)
+class _TaskDependencySnapshot:
+    root_task_id: str
+    graph: dict[str, list[str]]
+    status_by_task: dict[str, str]
+    path_by_task: dict[str, Path]
+    missing_reason_by_task: dict[str, str]
+
+
+def _task_card_status(task_card: TaskCard) -> str:
+    raw = task_card.get("status")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return "unknown"
+
+
+def _detect_dependency_cycle(graph: dict[str, list[str]], root_task_id: str) -> list[str] | None:
+    visited: set[str] = set()
+    in_stack: set[str] = set()
+    stack: list[str] = []
+
+    def visit(node: str) -> list[str] | None:
+        visited.add(node)
+        in_stack.add(node)
+        stack.append(node)
+        for dep in graph.get(node, []):
+            if dep not in graph:
+                continue
+            if dep in in_stack:
+                start_index = stack.index(dep)
+                return stack[start_index:] + [dep]
+            if dep not in visited:
+                cycle = visit(dep)
+                if cycle is not None:
+                    return cycle
+        stack.pop()
+        in_stack.remove(node)
+        return None
+
+    cycle = visit(root_task_id)
+    if cycle is not None:
+        return cycle
+    for node in sorted(graph):
+        if node in visited:
+            continue
+        cycle = visit(node)
+        if cycle is not None:
+            return cycle
+    return None
+
+
+def _build_task_dependency_snapshot(task_path: str, *, paths: LoopPaths | None = None) -> _TaskDependencySnapshot:
+    root_path, root_task_card, root_task_id = _load_task_card_or_raise(task_path)
+    graph: dict[str, list[str]] = {
+        root_task_id: list(cast(list[str], root_task_card.get("depends_on", []))),
+    }
+    status_by_task = {root_task_id: _task_card_status(root_task_card)}
+    path_by_task = {root_task_id: root_path}
+    missing_reason_by_task: dict[str, str] = {}
+    queue: list[str] = [root_task_id]
+    while queue:
+        current_task_id = queue.pop(0)
+        for dep_task_id in graph.get(current_task_id, []):
+            if dep_task_id in graph or dep_task_id in missing_reason_by_task:
+                continue
+            dep_path = _resolve_task_card_path_by_id(dep_task_id, paths=paths)
+            if dep_path is None:
+                missing_reason_by_task[dep_task_id] = f"task card not found for dependency '{dep_task_id}'"
+                graph[dep_task_id] = []
+                continue
+            loaded_path, dep_task_card, dep_card_task_id = _load_task_card_or_raise(dep_path)
+            if dep_card_task_id != dep_task_id:
+                raise ConfigError(
+                    f"dependency task card mismatch: expected task_id {dep_task_id!r}, "
+                    f"found {dep_card_task_id!r} in {loaded_path}"
+                )
+            graph[dep_task_id] = list(cast(list[str], dep_task_card.get("depends_on", [])))
+            status_by_task[dep_task_id] = _task_card_status(dep_task_card)
+            path_by_task[dep_task_id] = loaded_path
+            queue.append(dep_task_id)
+    cycle = _detect_dependency_cycle(graph, root_task_id)
+    if cycle is not None:
+        raise ValidationError(f"Circular task dependencies detected: {' -> '.join(cycle)}")
+    return _TaskDependencySnapshot(
+        root_task_id=root_task_id,
+        graph=graph,
+        status_by_task=status_by_task,
+        path_by_task=path_by_task,
+        missing_reason_by_task=missing_reason_by_task,
+    )
+
+
+def _dependency_blocked_reasons(snapshot: _TaskDependencySnapshot, *, task_id: str | None = None) -> list[str]:
+    target_task_id = task_id or snapshot.root_task_id
+    reasons: list[str] = []
+    for dep_task_id in snapshot.graph.get(target_task_id, []):
+        missing_reason = snapshot.missing_reason_by_task.get(dep_task_id)
+        if missing_reason is not None:
+            reasons.append(f"{dep_task_id}: {missing_reason}")
+            continue
+        dep_status = snapshot.status_by_task.get(dep_task_id, "unknown")
+        if dep_status != TASK_STATUS_DONE:
+            reasons.append(f"{dep_task_id}: status={dep_status!r} (expected {TASK_STATUS_DONE!r})")
+    return reasons
+
+
+def _render_dependency_tree(snapshot: _TaskDependencySnapshot) -> list[str]:
+    lines: list[str] = []
+
+    def format_node(task_id: str) -> str:
+        if task_id in snapshot.missing_reason_by_task:
+            return f"{task_id} [missing]"
+        return f"{task_id} [{snapshot.status_by_task.get(task_id, 'unknown')}]"
+
+    def emit_node(task_id: str, prefix: str, is_last: bool, seen: set[str]) -> None:
+        connector = "- " if not prefix else ("`- " if is_last else "|- ")
+        lines.append(f"{prefix}{connector}{format_node(task_id)}")
+        blockers = _dependency_blocked_reasons(snapshot, task_id=task_id)
+        detail_prefix = prefix + ("   " if is_last else "|  ")
+        for reason in blockers:
+            lines.append(f"{detail_prefix}! blocked by {reason}")
+        if task_id in seen:
+            return
+        next_seen = set(seen)
+        next_seen.add(task_id)
+        children = snapshot.graph.get(task_id, [])
+        for index, child_task_id in enumerate(children):
+            child_is_last = index == len(children) - 1
+            emit_node(child_task_id, detail_prefix, child_is_last, next_seen)
+
+    emit_node(snapshot.root_task_id, "", True, set())
+    return lines
 
 
 def _load_config() -> dict:
@@ -5089,6 +5333,7 @@ def cmd_init(paths: LoopPaths | None = None) -> None:
                     "in_scope": ["<file or module>"],
                     "out_of_scope": [],
                     "acceptance_criteria": ["<measurable criterion>"],
+                    "depends_on": [],
                     "constraints": [],
                 },
                 indent=2,
@@ -5107,7 +5352,7 @@ def cmd_init(paths: LoopPaths | None = None) -> None:
 
 
 # ── status ──────────────────────────────────────────────────────────
-def cmd_status(paths: LoopPaths | None = None) -> None:
+def cmd_status(*, tree: bool = False, paths: LoopPaths | None = None) -> None:
     resolved_paths = _resolve_paths(paths)
     state = _load_state(paths=resolved_paths)
     print(f"State: {state.get('state', 'unknown')}")
@@ -5156,6 +5401,22 @@ def cmd_status(paths: LoopPaths | None = None) -> None:
         hb = _heartbeat_path(role)
         marker = "EXISTS" if hb.exists() else "missing"
         print(f"  {hb.name}: {marker}")
+    if tree:
+        print()
+        print("Dependency tree:")
+        if not resolved_paths.task_card.exists():
+            print("  task_card.json missing; cannot render dependency tree.")
+            return
+        snapshot = _build_task_dependency_snapshot(str(resolved_paths.task_card), paths=resolved_paths)
+        for line in _render_dependency_tree(snapshot):
+            print(f"  {line}")
+        root_blockers = _dependency_blocked_reasons(snapshot)
+        if root_blockers:
+            print("  Root blockers:")
+            for reason in root_blockers:
+                print(f"    - {reason}")
+        else:
+            print("  Root blockers: none")
 
 
 def _restore_target_name_from_archive(stem: str) -> str:
@@ -5641,27 +5902,7 @@ def cmd_dispatch_metrics(
 # ── main run loop ───────────────────────────────────────────────────
 def _load_task_card(task_path: str) -> tuple[Path, TaskCard, str]:
     try:
-        tp = Path(task_path)
-        if not tp.exists():
-            print(f"Error: task card not found: {tp}", file=sys.stderr)
-            raise ConfigError(f"Task card not found: {tp}")
-        try:
-            task_card = _load_json_with_limit(tp, label=f"task card {tp}")
-        except ConfigError as e:
-            print(f"Error: {e}", file=sys.stderr)
-            raise
-        except json.JSONDecodeError as e:
-            print(f"Error: task card at {tp} contains invalid JSON: {e}", file=sys.stderr)
-            raise ConfigError(f"Invalid JSON in task card: {e}") from e
-        except OSError as e:
-            print(f"Error: unable to read task card at {tp}: {e}", file=sys.stderr)
-            raise ConfigError(f"Cannot read task card: {e}") from e
-        if not isinstance(task_card, dict):
-            print(f"Error: task card must be a JSON object: {tp}", file=sys.stderr)
-            raise ConfigError("Task card must be a JSON object")
-        task_card_typed = cast(TaskCard, task_card)
-        task_id = cast(str, task_card_typed.get("task_id", "UNKNOWN"))
-        return tp, task_card_typed, task_id
+        return _load_task_card_or_raise(task_path)
     except ConfigError as e:
         print(f"Error: config error: {e}", file=sys.stderr)
         sys.exit(EXIT_GENERAL_ERROR)
@@ -6209,6 +6450,45 @@ def _update_knowledge_on_approval(task_id: str, round_num: int) -> None:
     )
 
 
+def _enforce_dependencies_or_fail(
+    *,
+    state: dict,
+    task_path: str,
+    round_num: int,
+    paths: LoopPaths | None = None,
+) -> None:
+    try:
+        snapshot = _build_task_dependency_snapshot(task_path, paths=paths)
+    except (ConfigError, ValidationError) as e:
+        if not isinstance(state.get("round"), int) or cast(int, state.get("round")) < 1:
+            state["round"] = round_num
+        _fail_with_state(
+            state,
+            outcome="dependency_cycle" if "Circular task dependencies" in str(e) else "invalid_task_dependencies",
+            message=str(e),
+            exit_code=EXIT_VALIDATION_ERROR,
+            task_path=task_path,
+            paths=paths,
+        )
+        return
+    blockers = _dependency_blocked_reasons(snapshot)
+    if not blockers:
+        return
+    if not isinstance(state.get("round"), int) or cast(int, state.get("round")) < 1:
+        state["round"] = round_num
+    if not isinstance(state.get("task_id"), str) or not cast(str, state.get("task_id")).strip():
+        state["task_id"] = snapshot.root_task_id
+    blocker_summary = "; ".join(blockers)
+    _fail_with_state(
+        state,
+        outcome="blocked_dependencies",
+        message=f"task {snapshot.root_task_id} is blocked by unsatisfied dependencies: {blocker_summary}",
+        exit_code=EXIT_VALIDATION_ERROR,
+        task_path=task_path,
+        paths=paths,
+    )
+
+
 def _run_single_round(
     *,
     config: RunConfig,
@@ -6221,9 +6501,18 @@ def _run_single_round(
     task_packet_path = resolved_paths.dir / "task_packet.json"
     _ = single_round
     task_card, task_id_from_card = _sync_task_card_to_bus(config.task_path, round_num=round_num, paths=resolved_paths)
-    _write_task_card_status(config.task_path, TASK_STATUS_IN_PROGRESS, paths=resolved_paths)
 
     state = _load_state(paths=resolved_paths)
+    if round_num == 1:
+        if not isinstance(state.get("task_id"), str) or not cast(str, state.get("task_id")).strip():
+            state["task_id"] = task_id_from_card
+        _enforce_dependencies_or_fail(
+            state=state,
+            task_path=config.task_path,
+            round_num=round_num,
+            paths=resolved_paths,
+        )
+    _write_task_card_status(config.task_path, TASK_STATUS_IN_PROGRESS, paths=resolved_paths)
     state_task_id = state.get("task_id")
     state_base_sha = state.get("base_sha")
 
@@ -6640,6 +6929,15 @@ def _run_multi_round_via_subprocess(
     base_sha = ""
     if resume_from_state is None:
         task_card, task_id = _sync_task_card_to_bus(config.task_path, round_num=1, paths=resolved_paths)
+        preflight_state = _load_state(paths=resolved_paths)
+        if not isinstance(preflight_state.get("task_id"), str) or not cast(str, preflight_state.get("task_id")).strip():
+            preflight_state["task_id"] = task_id
+        _enforce_dependencies_or_fail(
+            state=preflight_state,
+            task_path=config.task_path,
+            round_num=1,
+            paths=resolved_paths,
+        )
         _set_feed_task_id(task_id)
         _set_feed_round(1)
 
@@ -7066,7 +7364,12 @@ def main() -> None:
     sub.add_parser("init", parents=[shared], help="Create loop directory structure")
     sub.add_parser("index", parents=[shared], help="Generate offline module map for src/loop_kit")
 
-    sub.add_parser("status", parents=[shared], help="Show current loop state")
+    status_p = sub.add_parser("status", parents=[shared], help="Show current loop state")
+    status_p.add_argument(
+        "--tree",
+        action="store_true",
+        help="Render task dependency tree and blocked reasons from task_card.json",
+    )
 
     health_p = sub.add_parser("health", parents=[shared], help="Show worker/reviewer heartbeat health")
     health_p.add_argument(
@@ -7227,7 +7530,10 @@ def main() -> None:
         elif args.cmd == "index":
             cmd_index()
         elif args.cmd == "status":
-            cmd_status()
+            if args.tree:
+                cmd_status(tree=True)
+            else:
+                cmd_status()
         elif args.cmd == "health":
             cmd_health(args.ttl)
         elif args.cmd == "dispatch-metrics":
