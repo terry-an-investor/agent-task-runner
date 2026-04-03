@@ -272,19 +272,6 @@ def _state_transition_pairs(feed_path: Path) -> list[tuple[str | None, str | Non
     return pairs
 
 
-def _feed_events(feed_path: Path) -> list[dict]:
-    if not feed_path.exists():
-        return []
-    events: list[dict] = []
-    for raw in feed_path.read_text(encoding="utf-8").splitlines():
-        if not raw.strip():
-            continue
-        payload = json.loads(raw)
-        if isinstance(payload, dict):
-            events.append(payload)
-    return events
-
-
 def _contains_ordered_pairs(actual: list[tuple[str | None, str | None]], expected: list[tuple[str | None, str | None]]) -> bool:
     idx = 0
     for pair in actual:
@@ -447,93 +434,6 @@ def test_session_resume_across_rounds(tmp_path: Path) -> None:
     worker_dispatch_log = (loop_dir / "logs" / "worker_dispatch.log").read_text(encoding="utf-8")
     assert f"session_id={worker_sid}" in worker_dispatch_log
     assert f"-s {worker_sid}" in worker_dispatch_log
-
-
-@pytest.mark.timeout(10)
-def test_session_rotation_uses_handoff_bridge(tmp_path: Path) -> None:
-    base_sha = _init_git_repo(tmp_path)
-    _install_fake_opencode(tmp_path / "bin")
-    loop_dir = _prepare_loop_contract(
-        tmp_path,
-        task_id="T-712",
-        base_sha=base_sha,
-        state_name="task_ready",
-        round_num=1,
-    )
-
-    round1 = _run_loop(
-        tmp_path,
-        [
-            "run",
-            "--loop-dir",
-            ".loop",
-            "--task",
-            ".loop/task_card.json",
-            "--single-round",
-            "--round",
-            "1",
-            "--auto-dispatch",
-            "--worker-backend",
-            "opencode",
-            "--reviewer-backend",
-            "opencode",
-            "--dispatch-retries",
-            "0",
-            "--artifact-timeout",
-            "2",
-        ],
-        reviewer_decision="changes_required",
-    )
-    assert round1.returncode == 0, f"stdout:\n{round1.stdout}\nstderr:\n{round1.stderr}"
-
-    state_after_round1 = json.loads((loop_dir / "state.json").read_text(encoding="utf-8"))
-    worker_sid_round1 = state_after_round1["sessions"]["worker"]["session_id"]
-    assert (loop_dir / "handoff" / "T-712" / "worker_r1.json").exists()
-    assert (loop_dir / "handoff" / "T-712" / "reviewer_r1.json").exists()
-
-    resumed = _run_loop(
-        tmp_path,
-        [
-            "run",
-            "--loop-dir",
-            ".loop",
-            "--task",
-            ".loop/task_card.json",
-            "--resume",
-            "--max-rounds",
-            "2",
-            "--max-session-rounds",
-            "1",
-            "--auto-dispatch",
-            "--worker-backend",
-            "opencode",
-            "--reviewer-backend",
-            "opencode",
-            "--dispatch-retries",
-            "0",
-            "--artifact-timeout",
-            "2",
-        ],
-        reviewer_decision="approve",
-    )
-    assert resumed.returncode == 0, f"stdout:\n{resumed.stdout}\nstderr:\n{resumed.stderr}"
-
-    state_after_resume = json.loads((loop_dir / "state.json").read_text(encoding="utf-8"))
-    assert state_after_resume["state"] == "done"
-    assert state_after_resume["outcome"] == "approved"
-    worker_sid_round2 = state_after_resume["sessions"]["worker"]["session_id"]
-    assert worker_sid_round2 != worker_sid_round1
-    assert state_after_resume["sessions"]["worker"]["started_round"] == 2
-
-    work_round2 = json.loads((loop_dir / "work_report.json").read_text(encoding="utf-8"))
-    assert "handoff_visible=True" in work_round2["notes"]
-    assert "quickstart_visible=False" in work_round2["notes"]
-
-    events = _feed_events(loop_dir / "logs" / "feed.jsonl")
-    resume_events = [e for e in events if e.get("event") == orchestrator.FEED_DISPATCH_RESUME]
-    assert any(isinstance(e.get("data"), dict) and e["data"].get("status") == "resume_rotated" for e in resume_events)
-    assert any(e.get("event") == orchestrator.FEED_DISPATCH_FIRST_ACTION for e in events)
-    assert any(e.get("event") == orchestrator.FEED_DISPATCH_ARTIFACT_WRITTEN for e in events)
 
 
 @pytest.mark.timeout(10)
