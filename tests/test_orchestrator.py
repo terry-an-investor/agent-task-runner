@@ -207,7 +207,8 @@ def test_agent_command_claude_reuses_resume_session_id(monkeypatch) -> None:
     )
 
     assert cmd[0] == "claude.exe"
-    assert cmd[cmd.index("--session-id") + 1] == "sid-reuse-456"
+    assert "--resume" in cmd
+    assert cmd[cmd.index("--resume") + 1] == "sid-reuse-456"
     assert session_id == "sid-reuse-456"
     assert stdin_text == "claude prompt payload"
 
