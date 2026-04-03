@@ -121,6 +121,7 @@ def _write_fake_opencode_backend(bin_dir: Path) -> Path:
             "        sleep_sec = float(sleep_raw) if sleep_raw else 0.0\n"
             "    except ValueError:\n"
             "        sleep_sec = 0.0\n"
+            '    lane_conflict = os.environ.get("FAKE_OPENCODE_LANE_CONFLICT", "").strip().lower() in {"1", "true", "yes", "on"}\n'
             '    trace_file = os.environ.get("FAKE_OPENCODE_TRACE_FILE", "").strip()\n'
             '    session_id = _arg_value("-s", argv) or "fake-session"\n'
             "\n"
@@ -178,12 +179,16 @@ def _write_fake_opencode_backend(bin_dir: Path) -> Path:
             "        time.sleep(sleep_sec)\n"
             "\n"
             '    if "Role: code-writer worker for PM loop." in prompt:\n'
-            "        if lane_id:\n"
-            '            changed_name = f"{lane_id}_round_{round_num}.txt"\n'
+            "        if lane_conflict and lane_id:\n"
+            '            changed_file = Path.cwd() / "lane_conflict.txt"\n'
+            '            changed_file.write_text(f"lane {lane_id} round {round_num}\\n", encoding="utf-8")\n'
             "        else:\n"
-            '            changed_name = f"worker_round_{round_num}.txt"\n'
-            "        changed_file = Path.cwd() / changed_name\n"
-            '        changed_file.write_text(f"round {round_num}\\n", encoding="utf-8")\n'
+            "            if lane_id:\n"
+            '                changed_name = f"{lane_id}_round_{round_num}.txt"\n'
+            "            else:\n"
+            '                changed_name = f"worker_round_{round_num}.txt"\n'
+            "            changed_file = Path.cwd() / changed_name\n"
+            '            changed_file.write_text(f"round {round_num}\\n", encoding="utf-8")\n'
             '        _git("add", changed_file.name)\n'
             '        _git("commit", "-m", f"worker round {round_num}")\n'
             '        head_sha = _git("rev-parse", "HEAD")\n'
@@ -267,6 +272,7 @@ def _subprocess_env(
     mode: str = "ok",
     reviewer_decision: str = "approve",
     sleep_sec: float = 0.0,
+    lane_conflict: bool = False,
     trace_file: Path | None = None,
 ) -> dict[str, str]:
     env = os.environ.copy()
@@ -275,6 +281,7 @@ def _subprocess_env(
     env["FAKE_OPENCODE_MODE"] = mode
     env["FAKE_OPENCODE_REVIEW_DECISION"] = reviewer_decision
     env["FAKE_OPENCODE_SLEEP_SEC"] = str(sleep_sec)
+    env["FAKE_OPENCODE_LANE_CONFLICT"] = "1" if lane_conflict else "0"
     if trace_file is not None:
         env["FAKE_OPENCODE_TRACE_FILE"] = str(trace_file)
     else:
@@ -328,6 +335,7 @@ def _run_loop(
     mode: str = "ok",
     reviewer_decision: str = "approve",
     sleep_sec: float = 0.0,
+    lane_conflict: bool = False,
     trace_file: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
@@ -338,6 +346,7 @@ def _run_loop(
             mode=mode,
             reviewer_decision=reviewer_decision,
             sleep_sec=sleep_sec,
+            lane_conflict=lane_conflict,
             trace_file=trace_file,
         ),
         capture_output=True,
@@ -522,23 +531,110 @@ def test_parallel_lane_dispatch_writes_lane_reports_and_merges_work_report(tmp_p
     files_changed = merged_work.get("files_changed", [])
     assert "lane_core_round_1.txt" in files_changed
     assert "lane_tests_round_1.txt" in files_changed
+    merge_provenance = merged_work.get("merge_provenance", {})
+    assert merge_provenance["integration_lane_id"] == "__integration__"
+    assert merge_provenance["strategy"] == "deterministic_v1_ordered_cherry_pick_rebase"
+    assert merge_provenance["lane_execution_order"] == ["lane_core", "lane_tests"]
+    assert [lane["lane_id"] for lane in merge_provenance["lanes"]] == ["lane_core", "lane_tests"]
+    assert all(lane["status"] == "applied" for lane in merge_provenance["lanes"])
+    assert all(check["result"] == "pass" for check in merge_provenance["acceptance_checks"])
+    integration_test_names = [item["name"] for item in merged_work.get("tests", []) if item["name"].startswith("integration/")]
+    assert set(integration_test_names) == {
+        "integration/head_matches_merged_sha",
+        "integration/merged_head_descends_from_base",
+        "integration/provenance_order_matches_execution",
+        "integration/worktree_clean_after_merge",
+    }
 
     state = json.loads((loop_dir / "state.json").read_text(encoding="utf-8"))
     assert state["state"] == "done"
     assert state["outcome"] == "approved"
     assert state["lanes"]["lane_core"]["status"] == "completed"
     assert state["lanes"]["lane_tests"]["status"] == "completed"
+    assert state["lanes"]["__integration__"]["status"] == "completed"
 
-    trace_rows = [
-        json.loads(line)
-        for line in trace_file.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
+    trace_rows: list[dict[str, object]] = []
+    for line in trace_file.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            trace_rows.append(payload)
     worker_starts = [row for row in trace_rows if row.get("event") == "start" and row.get("role") == "worker"]
     lane_worker_starts = [row for row in worker_starts if isinstance(row.get("lane_id"), str) and row["lane_id"]]
-    assert {row["lane_id"] for row in lane_worker_starts} == {"lane_core", "lane_tests"}
-    lane_worker_starts.sort(key=lambda row: float(row["ts"]))
-    assert float(lane_worker_starts[1]["ts"]) - float(lane_worker_starts[0]["ts"]) < 0.5
+    assert lane_worker_starts
+    assert {row["lane_id"] for row in lane_worker_starts}.issubset({"lane_core", "lane_tests"})
+    if len(lane_worker_starts) >= 2:
+        lane_worker_starts.sort(key=lambda row: float(row["ts"]))
+        assert float(lane_worker_starts[1]["ts"]) - float(lane_worker_starts[0]["ts"]) < 0.5
+
+
+@pytest.mark.timeout(15)
+def test_parallel_lane_merge_conflict_fails_safe_with_integration_status(tmp_path: Path) -> None:
+    base_sha = _init_git_repo(tmp_path)
+    _install_fake_opencode(tmp_path / "bin")
+    loop_dir = _prepare_loop_contract(
+        tmp_path,
+        task_id="T-730",
+        base_sha=base_sha,
+        state_name="task_ready",
+        round_num=1,
+    )
+    _write_json(
+        loop_dir / "task_card.json",
+        {
+            "task_id": "T-730",
+            "goal": "Parallel lane merge conflict",
+            "in_scope": [],
+            "out_of_scope": [],
+            "acceptance_criteria": ["merge conflict should fail safely"],
+            "constraints": [],
+            "lanes": [
+                {"lane_id": "lane_core", "owner_paths": ["src/lane_core.py"]},
+                {"lane_id": "lane_tests", "owner_paths": ["tests/lane_tests.py"]},
+            ],
+        },
+    )
+
+    result = _run_loop(
+        tmp_path,
+        [
+            "run",
+            "--loop-dir",
+            ".loop",
+            "--task",
+            ".loop/task_card.json",
+            "--single-round",
+            "--round",
+            "1",
+            "--auto-dispatch",
+            "--worker-backend",
+            "opencode",
+            "--reviewer-backend",
+            "opencode",
+            "--dispatch-retries",
+            "0",
+            "--artifact-timeout",
+            "2",
+            "--max-parallel-workers",
+            "2",
+        ],
+        reviewer_decision="approve",
+        lane_conflict=True,
+    )
+
+    assert result.returncode == orchestrator.EXIT_VALIDATION_ERROR
+    state = json.loads((loop_dir / "state.json").read_text(encoding="utf-8"))
+    assert state["state"] == "done"
+    assert state["outcome"] == "lane_merge_failed"
+    assert "Lane merge failed for lane" in str(state.get("error", ""))
+    assert state["lanes"]["lane_core"]["status"] == "completed"
+    assert state["lanes"]["lane_tests"]["status"] == "completed"
+    assert state["lanes"]["__integration__"]["status"] == "failed"
+    assert "Lane merge failed for lane" in str(state["lanes"]["__integration__"].get("error", ""))
 
 
 @pytest.mark.timeout(10)

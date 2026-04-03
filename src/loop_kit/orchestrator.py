@@ -59,6 +59,24 @@ class WorkReportTest(TypedDict):
     output: NotRequired[str]
 
 
+class LaneMergeRecord(TypedDict):
+    lane_id: str
+    lane_head_sha: str
+    status: str
+    source_commits: list[str]
+    applied_commits: list[str]
+
+
+class LaneMergeProvenance(TypedDict):
+    integration_lane_id: str
+    strategy: str
+    base_sha: str
+    merged_head_sha: str
+    lane_execution_order: list[str]
+    lanes: list[LaneMergeRecord]
+    acceptance_checks: list[WorkReportTest]
+
+
 class ReviewIssue(TypedDict):
     severity: str
     file: str
@@ -76,6 +94,7 @@ class WorkReport(TypedDict):
     files_changed: NotRequired[list[str]]
     tests: NotRequired[list[WorkReportTest]]
     notes: NotRequired[str]
+    merge_provenance: NotRequired[LaneMergeProvenance]
 
 
 class ReviewReport(TypedDict):
@@ -213,6 +232,8 @@ MAX_JSON_PAYLOAD_BYTES = 5 * 1024 * 1024
 _STALE_STATE_KEYS = ("outcome", "failed_at", "error", "head_sha", "round_details")
 _LANE_WORKTREES_DIRNAME = "worktrees"
 _LANE_WORKTREE_BRANCH_PREFIX = "loop"
+_INTEGRATION_LANE_ID = "__integration__"
+_LANE_MERGE_STRATEGY_V1 = "deterministic_v1_ordered_cherry_pick_rebase"
 FEED_DISPATCH_START = "dispatch_start"
 FEED_DISPATCH_COMPLETE = "dispatch_complete"
 FEED_DISPATCH_FAIL = "dispatch_fail"
@@ -5032,6 +5053,14 @@ def _lane_dependency_blockers(
     return blockers
 
 
+def _integration_lane_state_entry(*, lane_execution_order: list[str]) -> dict[str, object]:
+    return {
+        "status": "pending",
+        "depends_on": list(lane_execution_order),
+        "strategy": _LANE_MERGE_STRATEGY_V1,
+    }
+
+
 def _merge_lane_work_reports(
     *,
     task_id: str,
@@ -5039,6 +5068,8 @@ def _merge_lane_work_reports(
     lane_execution_order: list[str],
     lane_reports: dict[str, WorkReport],
     merged_head_sha: str,
+    integration_tests: list[WorkReportTest] | None = None,
+    merge_provenance: LaneMergeProvenance | None = None,
 ) -> WorkReport:
     merged_files: list[str] = []
     seen_files: set[str] = set()
@@ -5060,6 +5091,8 @@ def _merge_lane_work_reports(
         notes = str(report.get("notes", "")).strip()
         if notes:
             notes_chunks.append(f"{lane_id}: {notes}")
+    if integration_tests:
+        merged_tests.extend(integration_tests)
     merged: WorkReport = {
         "task_id": task_id,
         "head_sha": merged_head_sha,
@@ -5071,6 +5104,8 @@ def _merge_lane_work_reports(
         merged["tests"] = merged_tests
     if notes_chunks:
         merged["notes"] = "; ".join(notes_chunks)
+    if merge_provenance is not None:
+        merged["merge_provenance"] = merge_provenance
     return merged
 
 
@@ -5079,7 +5114,7 @@ def _cherry_pick_lane_reports(
     base_sha: str,
     lane_execution_order: list[str],
     lane_reports: dict[str, WorkReport],
-) -> str:
+) -> tuple[str, list[LaneMergeRecord]]:
     current_head = _current_sha()
     if current_head != base_sha:
         raise ValidationError(
@@ -5087,18 +5122,36 @@ def _cherry_pick_lane_reports(
             f"expected {base_sha}, got {current_head}"
         )
 
+    merge_records: list[LaneMergeRecord] = []
     for lane_id in lane_execution_order:
+        lane_record: LaneMergeRecord = {
+            "lane_id": lane_id,
+            "lane_head_sha": "",
+            "status": "pending",
+            "source_commits": [],
+            "applied_commits": [],
+        }
         report = lane_reports.get(lane_id)
         if report is None:
+            lane_record["status"] = "missing_report"
+            merge_records.append(lane_record)
             continue
         lane_head = str(report["head_sha"]).strip()
+        lane_record["lane_head_sha"] = lane_head
         if not lane_head or lane_head == base_sha:
+            lane_record["status"] = "noop"
+            merge_records.append(lane_record)
             continue
         if _git_is_ancestor(lane_head, "HEAD"):
+            lane_record["status"] = "already_integrated"
+            merge_records.append(lane_record)
             continue
         commit_text = _git("rev-list", "--reverse", f"{base_sha}..{lane_head}")
         commit_chain = [item.strip() for item in commit_text.splitlines() if item.strip()]
+        lane_record["source_commits"] = commit_chain
         if not commit_chain:
+            lane_record["status"] = "no_commits"
+            merge_records.append(lane_record)
             continue
         for commit_sha in commit_chain:
             if _git_is_ancestor(commit_sha, "HEAD"):
@@ -5111,8 +5164,70 @@ def _cherry_pick_lane_reports(
                 raise RuntimeError(
                     f"Lane merge failed for lane '{lane_id}' on commit {commit_sha}: {e}"
                 ) from e
+            lane_record["applied_commits"].append(_current_sha())
+        lane_record["status"] = "applied" if lane_record["applied_commits"] else "already_integrated"
+        merge_records.append(lane_record)
         current_head = _current_sha()
-    return current_head
+    return current_head, merge_records
+
+
+def _run_integration_acceptance_checks(
+    *,
+    base_sha: str,
+    merged_head_sha: str,
+    lane_execution_order: list[str],
+    lane_merge_records: list[LaneMergeRecord],
+) -> list[WorkReportTest]:
+    checks: list[WorkReportTest] = []
+
+    def _record(name: str, *, passed: bool, output: str) -> None:
+        checks.append({"name": name, "result": "pass" if passed else "fail", "output": output})
+
+    current_head = _current_sha()
+    _record(
+        "integration/head_matches_merged_sha",
+        passed=current_head == merged_head_sha,
+        output=f"current={current_head} merged={merged_head_sha}",
+    )
+
+    try:
+        merged_descends_from_base = _git_is_ancestor(base_sha, merged_head_sha)
+        merge_base_output = f"base={base_sha} merged={merged_head_sha}"
+    except RuntimeError as e:
+        merged_descends_from_base = False
+        merge_base_output = f"base={base_sha} merged={merged_head_sha} error={e}"
+    _record(
+        "integration/merged_head_descends_from_base",
+        passed=merged_descends_from_base,
+        output=merge_base_output,
+    )
+
+    recorded_order = [record["lane_id"] for record in lane_merge_records]
+    _record(
+        "integration/provenance_order_matches_execution",
+        passed=recorded_order == lane_execution_order,
+        output=f"recorded={recorded_order} expected={lane_execution_order}",
+    )
+
+    try:
+        status_output = _git("status", "--porcelain", "--untracked-files=no")
+    except RuntimeError as e:
+        status_output = f"error={e}"
+        worktree_clean = False
+    else:
+        worktree_clean = not bool(status_output.strip())
+    _record(
+        "integration/worktree_clean_after_merge",
+        passed=worktree_clean,
+        output=status_output if status_output else "clean",
+    )
+
+    failures = [test["name"] for test in checks if test.get("result") != "pass"]
+    if failures:
+        raise ValidationError(
+            "Integration acceptance checks failed on merged head: " + ", ".join(failures)
+        )
+    return checks
 
 
 def _is_valid_ref(ref: str) -> bool:
@@ -7838,13 +7953,24 @@ def _run_single_round(
             )
             return
 
+        integration_entry: dict[str, object] | None = None
+        if lane_state:
+            integration_entry = _integration_lane_state_entry(lane_execution_order=lane_execution_order)
+            lane_state[_INTEGRATION_LANE_ID] = integration_entry
+            integration_entry["status"] = "running"
+            _save_lane_state_snapshot(state, lane_state, paths=resolved_paths)
+
         try:
-            merged_head_sha = _cherry_pick_lane_reports(
+            merged_head_sha, lane_merge_records = _cherry_pick_lane_reports(
                 base_sha=base_sha,
                 lane_execution_order=lane_execution_order,
                 lane_reports=lane_reports,
             )
         except (RuntimeError, ValidationError) as e:
+            if integration_entry is not None:
+                integration_entry["status"] = "failed"
+                integration_entry["error"] = str(e)
+                _save_lane_state_snapshot(state, lane_state, paths=resolved_paths)
             preserve_lane_worktrees = True
             _fail_single_round(
                 outcome="lane_merge_failed",
@@ -7854,12 +7980,52 @@ def _run_single_round(
             )
             return
 
+        try:
+            integration_tests = _run_integration_acceptance_checks(
+                base_sha=base_sha,
+                merged_head_sha=merged_head_sha,
+                lane_execution_order=lane_execution_order,
+                lane_merge_records=lane_merge_records,
+            )
+        except ValidationError as e:
+            if integration_entry is not None:
+                integration_entry["status"] = "failed"
+                integration_entry["head_sha"] = merged_head_sha
+                integration_entry["error"] = str(e)
+                _save_lane_state_snapshot(state, lane_state, paths=resolved_paths)
+            preserve_lane_worktrees = True
+            _fail_single_round(
+                outcome="integration_checks_failed",
+                message=str(e),
+                exit_code=EXIT_VALIDATION_ERROR,
+                cleanup_lane_worktrees=False,
+            )
+            return
+
+        if integration_entry is not None:
+            integration_entry["status"] = "completed"
+            integration_entry["head_sha"] = merged_head_sha
+            integration_entry["checks"] = [test["name"] for test in integration_tests]
+            _save_lane_state_snapshot(state, lane_state, paths=resolved_paths)
+
+        merge_provenance: LaneMergeProvenance = {
+            "integration_lane_id": _INTEGRATION_LANE_ID,
+            "strategy": _LANE_MERGE_STRATEGY_V1,
+            "base_sha": base_sha,
+            "merged_head_sha": merged_head_sha,
+            "lane_execution_order": list(lane_execution_order),
+            "lanes": lane_merge_records,
+            "acceptance_checks": integration_tests,
+        }
+
         work = _merge_lane_work_reports(
             task_id=task_id,
             round_num=round_num,
             lane_execution_order=lane_execution_order,
             lane_reports=lane_reports,
             merged_head_sha=merged_head_sha,
+            integration_tests=integration_tests,
+            merge_provenance=merge_provenance,
         )
         _atomic_write_json(resolved_paths.work_report, work)
     else:

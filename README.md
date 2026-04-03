@@ -137,6 +137,15 @@ Reviewer → PM: review_report.json
 - **Warm resume**: Reuse backend sessions for low-latency continuation
 - **Session rotation**: Set `--max-session-rounds` to intentionally rotate
 
+### Integration Lane (Deterministic Merge V1)
+
+When `lanes` run in parallel, Loop Kit adds an explicit internal integration lane before reviewer handoff:
+
+- Lanes are merged in deterministic `lane_execution_order` (stage order, then task-card declaration order).
+- Merge policy: ordered replay of each lane commit chain (`base..lane_head`) via `git cherry-pick` onto the integration head (rebase-style replay).
+- Conflict handling is fail-safe: `cherry-pick --abort`, stop the round, and keep worktrees for debugging.
+- The merged `work_report.json` includes `merge_provenance` (`base_sha`, merged head, lane order, per-lane commit replay, and integration acceptance checks).
+
 ### Knowledge System
 
 Loop Kit retrieves **relevant context** rather than injecting raw code:

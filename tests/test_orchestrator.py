@@ -4643,6 +4643,103 @@ def test_single_round_with_lanes_falls_back_to_serial_when_parallel_disabled(tmp
     assert not (orchestrator.LOOP_DIR / "work_reports" / "lane_core.json").exists()
 
 
+def test_cherry_pick_lane_reports_collects_provenance_in_execution_order(monkeypatch) -> None:
+    current = {"head": "base-sha"}
+    cherry_picks: list[str] = []
+
+    def fake_current_sha() -> str:
+        return current["head"]
+
+    def fake_git_is_ancestor(ancestor_ref: str, descendant_ref: str, *, timeout=None) -> bool:
+        _ = (ancestor_ref, descendant_ref, timeout)
+        return False
+
+    def fake_git(*args: str, timeout=None) -> str:
+        _ = timeout
+        if args[:2] == ("rev-list", "--reverse"):
+            if args[2] == "base-sha..lane-core-head":
+                return "c1\nc2"
+            if args[2] == "base-sha..lane-tests-head":
+                return "c3"
+            raise AssertionError(f"unexpected rev-list range: {args[2]}")
+        if args[0] == "cherry-pick" and len(args) == 2:
+            cherry_picks.append(args[1])
+            current["head"] = f"picked-{args[1]}"
+            return ""
+        raise AssertionError(f"unexpected git args: {args}")
+
+    monkeypatch.setattr(orchestrator, "_current_sha", fake_current_sha)
+    monkeypatch.setattr(orchestrator, "_git_is_ancestor", fake_git_is_ancestor)
+    monkeypatch.setattr(orchestrator, "_git", fake_git)
+
+    merged_head, provenance = orchestrator._cherry_pick_lane_reports(
+        base_sha="base-sha",
+        lane_execution_order=["lane_core", "lane_tests"],
+        lane_reports={
+            "lane_core": {"task_id": "T-730", "round": 1, "head_sha": "lane-core-head"},
+            "lane_tests": {"task_id": "T-730", "round": 1, "head_sha": "lane-tests-head"},
+        },
+    )
+
+    assert merged_head == "picked-c3"
+    assert cherry_picks == ["c1", "c2", "c3"]
+    assert provenance == [
+        {
+            "lane_id": "lane_core",
+            "lane_head_sha": "lane-core-head",
+            "status": "applied",
+            "source_commits": ["c1", "c2"],
+            "applied_commits": ["picked-c1", "picked-c2"],
+        },
+        {
+            "lane_id": "lane_tests",
+            "lane_head_sha": "lane-tests-head",
+            "status": "applied",
+            "source_commits": ["c3"],
+            "applied_commits": ["picked-c3"],
+        },
+    ]
+
+
+def test_cherry_pick_lane_reports_conflict_aborts_and_raises(monkeypatch) -> None:
+    current = {"head": "base-sha"}
+    abort_calls: list[tuple[str, ...]] = []
+
+    def fake_current_sha() -> str:
+        return current["head"]
+
+    def fake_git_is_ancestor(ancestor_ref: str, descendant_ref: str, *, timeout=None) -> bool:
+        _ = (ancestor_ref, descendant_ref, timeout)
+        return False
+
+    def fake_git(*args: str, timeout=None) -> str:
+        _ = timeout
+        if args[:2] == ("rev-list", "--reverse"):
+            return "c1\nc2"
+        if args == ("cherry-pick", "c1"):
+            current["head"] = "picked-c1"
+            return ""
+        if args == ("cherry-pick", "c2"):
+            raise RuntimeError("conflict in file.txt")
+        if args == ("cherry-pick", "--abort"):
+            abort_calls.append(args)
+            return ""
+        raise AssertionError(f"unexpected git args: {args}")
+
+    monkeypatch.setattr(orchestrator, "_current_sha", fake_current_sha)
+    monkeypatch.setattr(orchestrator, "_git_is_ancestor", fake_git_is_ancestor)
+    monkeypatch.setattr(orchestrator, "_git", fake_git)
+
+    with pytest.raises(RuntimeError, match="Lane merge failed for lane 'lane_core' on commit c2"):
+        orchestrator._cherry_pick_lane_reports(
+            base_sha="base-sha",
+            lane_execution_order=["lane_core"],
+            lane_reports={"lane_core": {"task_id": "T-730", "round": 1, "head_sha": "lane-core-head"}},
+        )
+
+    assert abort_calls == [("cherry-pick", "--abort")]
+
+
 def test_outer_loop_spawns_single_round_subprocess(tmp_path: Path, monkeypatch) -> None:
     _configure_loop_paths(monkeypatch, tmp_path)
 
