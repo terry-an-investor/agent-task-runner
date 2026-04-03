@@ -1295,7 +1295,9 @@ def test_auto_dispatch_role_reuses_and_persists_worker_session(tmp_path: Path, m
         state=state,
     )
 
-    assert result == {"task_id": "T-627", "round": 2}
+    assert result is not None
+    assert result["task_id"] == "T-627"
+    assert result["round"] == 2
     assert captured["resume_session_id"] == "sid-old"
     saved = json.loads(orchestrator.STATE_FILE.read_text(encoding="utf-8"))
     assert saved["sessions"]["worker"] == {"session_id": "sid-new", "backend": "codex", "started_round": 2}
@@ -1346,7 +1348,9 @@ def test_auto_dispatch_role_reuses_and_persists_worker_session_opencode(tmp_path
         state=state,
     )
 
-    assert result == {"task_id": "T-628", "round": 2}
+    assert result is not None
+    assert result["task_id"] == "T-628"
+    assert result["round"] == 2
     assert captured["resume_session_id"] == "sid-opencode-old"
     saved = json.loads(orchestrator.STATE_FILE.read_text(encoding="utf-8"))
     assert saved["sessions"]["worker"] == {
@@ -1458,7 +1462,9 @@ def test_auto_dispatch_role_rotates_session_and_emits_artifact_metric(tmp_path: 
         state=state,
     )
 
-    assert result == {"task_id": "T-627", "round": 3}
+    assert result is not None
+    assert result["task_id"] == "T-627"
+    assert result["round"] == 3
     assert captured["resume_session_id"] is None
     saved = json.loads(orchestrator.STATE_FILE.read_text(encoding="utf-8"))
     assert saved["sessions"]["worker"]["session_id"] == "sid-new"
@@ -1527,7 +1533,9 @@ def test_auto_dispatch_role_emits_dispatch_phase_metrics_with_complete_boundarie
         state=state,
     )
 
-    assert result == {"task_id": "T-715", "round": 2}
+    assert result is not None
+    assert result["task_id"] == "T-715"
+    assert result["round"] == 2
     phase_events = [payload for event, payload in events if event == orchestrator.FEED_DISPATCH_PHASE_METRICS]
     assert len(phase_events) == 1
     payload = phase_events[0]
@@ -1618,6 +1626,103 @@ def test_auto_dispatch_role_phase_metrics_graceful_when_work_boundary_missing(mo
     assert payload["edit_count"] == 0
     assert payload["test_count"] == 0
     assert payload["unknown_count"] == 0
+
+
+def test_auto_dispatch_role_emits_serial_lane_runtime_cost_fields(monkeypatch) -> None:
+    events: list[tuple[str, dict[str, object]]] = []
+    state = {
+        "state": orchestrator.STATE_AWAITING_WORK,
+        "round": 1,
+        "task_id": "T-715",
+        "sessions": {},
+    }
+    monotonic_values = iter([5.0, 5.9])
+
+    def fake_run_auto_dispatch(*, telemetry: dict[str, object] | None = None, **kwargs) -> str | None:
+        _ = kwargs
+        if telemetry is not None:
+            telemetry["first_stdout_ms"] = 120
+            telemetry["first_work_action_ms"] = 300
+        return "sid-serial"
+
+    def fake_dispatch_with_artifact_fallback(
+        *,
+        role: str,
+        dispatch_call,
+        artifact_path: Path,
+        task_id: str,
+        round_num: int,
+        timeout_sec: int = orchestrator.DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC,
+    ) -> dict:
+        _ = (role, artifact_path, timeout_sec)
+        dispatch_call()
+        return {
+            "task_id": task_id,
+            "round": round_num,
+            "head_sha": "head-sha",
+            "token_usage": {"input_tokens": 2000, "output_tokens": 1000},
+        }
+
+    def fake_feed_event(event: str, *, level: str = "info", data: dict | None = None) -> None:
+        _ = level
+        events.append((event, dict(data or {})))
+
+    monkeypatch.setattr(orchestrator, "_run_auto_dispatch", fake_run_auto_dispatch)
+    monkeypatch.setattr(orchestrator, "_dispatch_with_artifact_fallback", fake_dispatch_with_artifact_fallback)
+    monkeypatch.setattr(orchestrator, "_feed_event", fake_feed_event)
+    monkeypatch.setattr(orchestrator.time, "monotonic", lambda: next(monotonic_values, 5.9))
+    monkeypatch.setattr(orchestrator, "_save_state", lambda state_data: None)
+
+    result = orchestrator._auto_dispatch_role(
+        role="worker",
+        prompt="prompt",
+        config=orchestrator.RunConfig(auto_dispatch=True, worker_backend="codex"),
+        task_id="T-715",
+        round_num=1,
+        artifact_path=orchestrator.WORK_REPORT,
+        state=state,
+    )
+
+    assert result is not None
+    assert result["lane_id"] == orchestrator._SERIAL_LANE_ID
+    assert result["backend"] == orchestrator.BACKEND_CODEX
+    assert result["duration_ms"] == 900
+    assert result["input_tokens"] == 2000
+    assert result["output_tokens"] == 1000
+    assert result["total_tokens"] == 3000
+    assert result["cost_cents"] == 1
+    artifact_events = [payload for event, payload in events if event == orchestrator.FEED_DISPATCH_ARTIFACT_WRITTEN]
+    assert len(artifact_events) == 1
+    artifact_payload = artifact_events[0]
+    assert artifact_payload["lane_id"] == orchestrator._SERIAL_LANE_ID
+    assert artifact_payload["duration_ms"] == 900
+    assert artifact_payload["cost_cents"] == 1
+    phase_events = [payload for event, payload in events if event == orchestrator.FEED_DISPATCH_PHASE_METRICS]
+    assert len(phase_events) == 1
+    phase_payload = phase_events[0]
+    assert phase_payload["lane_id"] == orchestrator._SERIAL_LANE_ID
+    assert phase_payload["duration_ms"] == 900
+    assert phase_payload["cost_cents"] == 1
+
+
+def test_enrich_work_report_runtime_fields_sets_zero_cost_for_non_billed_backend() -> None:
+    report: orchestrator.WorkReport = {
+        "task_id": "T-715",
+        "round": 1,
+        "head_sha": "head-sha",
+        "token_usage": {"input_tokens": 5000, "output_tokens": 4000},
+    }
+    orchestrator._enrich_work_report_runtime_fields(
+        report,
+        backend=orchestrator.BACKEND_OPENCODE,
+        duration_ms=88,
+        lane_id="lane_local",
+        status="completed",
+    )
+    assert report["backend"] == orchestrator.BACKEND_OPENCODE
+    assert report["duration_ms"] == 88
+    assert report["total_tokens"] == 9000
+    assert report["cost_cents"] == 0
 
 
 def test_auto_dispatch_role_dispatch_event_ordering_includes_artifact_boundary(monkeypatch) -> None:
@@ -4556,6 +4661,129 @@ def test_single_round_lane_failure_preserves_worktrees_and_marks_blocked_depende
     assert docs_worktree.exists()
 
 
+def test_single_round_lane_dispatch_emits_lane_runtime_telemetry_and_report_fields(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+
+    task_path = tmp_path / "task_input.json"
+    task_path.write_text(
+        json.dumps(
+            {
+                "task_id": "T-731",
+                "goal": "lane telemetry",
+                "in_scope": [],
+                "out_of_scope": [],
+                "acceptance_criteria": ["lane telemetry emitted"],
+                "constraints": [],
+                "lanes": [
+                    {"lane_id": "lane_core", "owner_paths": ["src/loop_kit/orchestrator.py"]},
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(orchestrator, "_current_sha", lambda: "base-sha")
+    core_worktree = tmp_path / ".loop" / "worktrees" / "T-731" / "1" / "lane_core"
+    core_worktree.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(
+        orchestrator,
+        "_prepare_lane_worktrees",
+        lambda **kwargs: [
+            orchestrator.LaneWorktreeHandle(
+                task_id="T-731",
+                round_num=1,
+                lane_id="lane_core",
+                path=core_worktree,
+                branch="loop/T-731/r1/lane_core",
+            ),
+        ],
+    )
+
+    monotonic_values = iter([30.0, 30.75])
+
+    def fake_run_auto_dispatch(*, telemetry: dict[str, object] | None = None, **kwargs) -> str | None:
+        _ = kwargs
+        if telemetry is not None:
+            telemetry["first_stdout_ms"] = 100
+            telemetry["first_work_action_ms"] = 250
+            telemetry["subphase_ms"] = {"read": 80, "search": 100, "edit": 300, "test": 0, "unknown": 0}
+            telemetry["subphase_counts"] = {"read": 1, "search": 1, "edit": 1, "test": 0, "unknown": 0}
+            telemetry["active_subphase"] = "edit"
+            telemetry["active_subphase_started_ms"] = 500
+        return "lane-session"
+
+    def fake_dispatch_with_artifact_fallback(**kwargs):
+        kwargs["dispatch_call"]()
+        return {
+            "task_id": "T-731",
+            "round": 1,
+            "head_sha": "lane-head",
+            "files_changed": ["src/loop_kit/orchestrator.py"],
+            "tests": [],
+            "notes": "lane result",
+            "token_usage": {"input_tokens": 2000, "output_tokens": 1000},
+        }
+
+    monkeypatch.setattr(orchestrator, "_run_auto_dispatch", fake_run_auto_dispatch)
+    monkeypatch.setattr(orchestrator, "_dispatch_with_artifact_fallback", fake_dispatch_with_artifact_fallback)
+    monkeypatch.setattr(orchestrator.time, "monotonic", lambda: next(monotonic_values, 30.75))
+    monkeypatch.setattr(orchestrator, "_cherry_pick_lane_reports", lambda **kwargs: ("merged-head", []))
+    monkeypatch.setattr(orchestrator, "_run_integration_acceptance_checks", lambda **kwargs: [])
+    monkeypatch.setattr(
+        orchestrator,
+        "_auto_dispatch_role",
+        lambda **kwargs: {
+            "task_id": "T-731",
+            "round": 1,
+            "decision": "approve",
+            "blocking_issues": [],
+            "non_blocking_suggestions": [],
+        }
+        if kwargs.get("role") == "reviewer"
+        else None,
+    )
+    monkeypatch.setattr(orchestrator, "_diff", lambda base, head: f"diff {base}->{head}")
+    monkeypatch.setattr(orchestrator, "_log_oneline", lambda base, head: f"log {base}->{head}")
+    monkeypatch.setattr(orchestrator, "_cleanup_lane_worktrees_for_round", lambda **kwargs: None)
+    feed_events: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        orchestrator,
+        "_feed_event",
+        lambda event, *, level="info", data=None, paths=None: feed_events.append((event, dict(data or {}))),
+    )
+
+    orchestrator.cmd_run(
+        _run_config(
+            str(task_path),
+            auto_dispatch=True,
+            max_parallel_workers=2,
+            allow_dirty=True,
+        ),
+        single_round=True,
+        round_num=1,
+    )
+
+    lane_report = json.loads((orchestrator.LOOP_DIR / "work_reports" / "lane_core.json").read_text(encoding="utf-8"))
+    assert lane_report["lane_id"] == "lane_core"
+    assert lane_report["backend"] == orchestrator.BACKEND_CODEX
+    assert lane_report["duration_ms"] == 750
+    assert lane_report["total_tokens"] == 3000
+    assert lane_report["cost_cents"] == 1
+    merged_work = json.loads(orchestrator.WORK_REPORT.read_text(encoding="utf-8"))
+    assert merged_work["duration_ms"] == 750
+    assert merged_work["cost_cents"] == 1
+    assert merged_work["lane_metrics"][0]["lane_id"] == "lane_core"
+    assert merged_work["lane_metrics"][0]["status"] == "completed"
+    lane_phase_events = [
+        payload
+        for event, payload in feed_events
+        if event == orchestrator.FEED_DISPATCH_PHASE_METRICS and payload.get("lane_id") == "lane_core"
+    ]
+    assert len(lane_phase_events) == 1
+    assert lane_phase_events[0]["duration_ms"] == 750
+    assert lane_phase_events[0]["cost_cents"] == 1
+
+
 def test_single_round_with_lanes_falls_back_to_serial_when_parallel_disabled(tmp_path: Path, monkeypatch) -> None:
     _configure_loop_paths(monkeypatch, tmp_path)
 
@@ -6638,6 +6866,83 @@ class TestCmdReport:
         assert "- r2: approve" in out
         assert "## Changed Files" in out
         assert "- r1: a.py, b.py" in out
+
+    def test_report_includes_lane_runtime_summary_and_statuses(
+        self, tmp_path: Path, monkeypatch, capsys
+    ) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        orchestrator.TASK_CARD.write_text(
+            json.dumps({"task_id": "T-710", "goal": "Lane runtime report"}, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        orchestrator.STATE_FILE.write_text(
+            json.dumps(
+                {
+                    "state": "awaiting_review",
+                    "round": 1,
+                    "task_id": "T-710",
+                    "base_sha": "base-sha",
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        archive_dir = orchestrator.LOOP_DIR / "archive" / "T-710"
+        archive_dir.mkdir(parents=True)
+        (archive_dir / "r1_work_report.json").write_text(
+            json.dumps(
+                {
+                    "task_id": "T-710",
+                    "round": 1,
+                    "head_sha": "head-sha",
+                    "lane_metrics": [
+                        {
+                            "lane_id": "lane_core",
+                            "status": "completed",
+                            "backend": "codex",
+                            "duration_ms": 321,
+                            "cost_cents": 3,
+                            "total_tokens": 2100,
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (archive_dir / "r1_state.json").write_text(
+            json.dumps(
+                {
+                    "task_id": "T-710",
+                    "round": 1,
+                    "lanes": {
+                        "lane_core": {"status": "completed"},
+                        "lane_docs": {"status": "blocked"},
+                    },
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        orchestrator.cmd_report("T-710", output_format="markdown")
+        out = capsys.readouterr().out
+        assert "## Lane Runtime" in out
+        assert "r1: lane_count=2 total_duration_ms=321 total_cost_cents=3" in out
+        assert "lane_core: status=completed backend=codex duration_ms=321 cost_cents=3 total_tokens=2100" in out
+        assert "lane_docs: status=blocked backend=<unknown> duration_ms=0 cost_cents=0 total_tokens=n/a" in out
+
+        orchestrator.cmd_report("T-710", output_format="json")
+        out = capsys.readouterr().out
+        json_start = out.find("{")
+        payload = json.loads(out[json_start:] if json_start >= 0 else out)
+        assert payload["lane_runtime"][0]["round"] == 1
+        assert payload["lane_runtime"][0]["lane_count"] == 2
+        assert payload["lane_runtime"][0]["total_duration_ms"] == 321
+        assert payload["lane_runtime"][0]["total_cost_cents"] == 3
 
     def test_uses_state_task_id_when_argument_omitted(self, tmp_path: Path, monkeypatch, capsys) -> None:
         _configure_loop_paths(monkeypatch, tmp_path)

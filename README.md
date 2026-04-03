@@ -145,6 +145,7 @@ When `lanes` run in parallel, Loop Kit adds an explicit internal integration lan
 - Merge policy: ordered replay of each lane commit chain (`base..lane_head`) via `git cherry-pick` onto the integration head (rebase-style replay).
 - Conflict handling is fail-safe: `cherry-pick --abort`, stop the round, and keep worktrees for debugging.
 - The merged `work_report.json` includes `merge_provenance` (`base_sha`, merged head, lane order, per-lane commit replay, and integration acceptance checks).
+- Lane worker reports (`.loop/work_reports/{lane_id}.json`) include runtime telemetry: `lane_id`, `backend`, `status`, `duration_ms`, and optional token/cost fields (`input_tokens`, `output_tokens`, `total_tokens`, `cost_cents`).
 
 ### Knowledge System
 
@@ -205,6 +206,19 @@ Resolution order: `CLI args > env vars > config file > built-in defaults`
 ### Metrics
 
 `loop dispatch-metrics` reports phase latencies (`startup_ms`, `context_to_work_ms`, `work_to_artifact_ms`, `total_ms`) and work subphases (`read/search/edit/test/unknown`).
+
+`loop report` now includes `lane_runtime` summaries per round with lane statuses and timing/cost telemetry:
+
+- `lane_id`: lane identifier (`__serial__` for serial worker runs)
+- `backend`: backend that executed the lane (`codex`/`claude`/`opencode`)
+- `status`: lane status from state/runtime (`completed`, `blocked`, `failed`, etc.)
+- `duration_ms`: end-to-end lane execution latency
+- Optional usage/cost fields: `input_tokens`, `output_tokens`, `total_tokens`, `cost_cents`
+
+Cost telemetry is deterministic and estimate-only:
+
+- `codex` and `claude`: computed from token counts and fixed per-backend rates
+- `opencode` (non-billed local backend): always `cost_cents=0`
 
 ### Optimization
 

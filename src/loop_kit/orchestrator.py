@@ -87,6 +87,17 @@ class ReviewIssue(TypedDict):
     confidence: NotRequired[int | float | str]
 
 
+class LaneRuntimeMetrics(TypedDict, total=False):
+    lane_id: str
+    status: str
+    backend: str
+    duration_ms: int
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    cost_cents: int
+
+
 class WorkReport(TypedDict):
     task_id: str
     head_sha: str
@@ -94,6 +105,15 @@ class WorkReport(TypedDict):
     files_changed: NotRequired[list[str]]
     tests: NotRequired[list[WorkReportTest]]
     notes: NotRequired[str]
+    lane_id: NotRequired[str]
+    status: NotRequired[str]
+    backend: NotRequired[str]
+    duration_ms: NotRequired[int]
+    input_tokens: NotRequired[int]
+    output_tokens: NotRequired[int]
+    total_tokens: NotRequired[int]
+    cost_cents: NotRequired[int]
+    lane_metrics: NotRequired[list[LaneRuntimeMetrics]]
     merge_provenance: NotRequired[LaneMergeProvenance]
 
 
@@ -253,6 +273,14 @@ FEED_LOG = "log"
 BACKEND_CODEX = "codex"
 BACKEND_CLAUDE = "claude"
 BACKEND_OPENCODE = "opencode"
+_SERIAL_LANE_ID = "__serial__"
+# Estimated pricing table in cents per 1M tokens. These values provide deterministic
+# cost telemetry for runtime comparisons, not billing-grade accounting.
+_BACKEND_TOKEN_COST_CENTS_PER_MILLION: dict[str, tuple[int, int]] = {
+    BACKEND_CODEX: (150, 600),
+    BACKEND_CLAUDE: (300, 1500),
+    BACKEND_OPENCODE: (0, 0),
+}
 DISPATCH_BACKEND_NATIVE = "native"
 DEFAULT_WORKER_BACKEND = BACKEND_CODEX
 DEFAULT_REVIEWER_BACKEND = BACKEND_CODEX
@@ -2063,6 +2091,7 @@ def _report_dispatch_result(
     interrupted: bool = False,
     task_id: str | None = None,
     round_num: int | None = None,
+    lane_id: str | None = None,
 ) -> None:
     _write_dispatch_log(role, cmd, result, session_id)
     event_type = (
@@ -2074,6 +2103,7 @@ def _report_dispatch_result(
         task_id=task_id,
         round_num=round_num,
         role=role,
+        lane_id=lane_id,
         mode=DISPATCH_BACKEND_NATIVE,
         backend=backend,
         returncode=result.returncode,
@@ -2376,6 +2406,7 @@ def _run_auto_dispatch(
     heartbeat_ttl_sec: int = DEFAULT_HEARTBEAT_TTL_SEC,
     task_id: str | None = None,
     round_num: int | None = None,
+    lane_id: str | None = None,
     resume_session_id: str | None = None,
     dispatch_started_at: float | None = None,
     telemetry: dict[str, object] | None = None,
@@ -2446,6 +2477,7 @@ def _run_auto_dispatch(
                         task_id=task_id,
                         round_num=round_num,
                         role=role,
+                        lane_id=lane_id,
                         backend=backend,
                         attempt=_attempt,
                         max_attempts=_max_attempts,
@@ -2474,6 +2506,7 @@ def _run_auto_dispatch(
                             task_id=task_id,
                             round_num=round_num,
                             role=role,
+                            lane_id=lane_id,
                             backend=backend,
                             attempt=_attempt,
                             max_attempts=_max_attempts,
@@ -2502,6 +2535,7 @@ def _run_auto_dispatch(
                     task_id=task_id,
                     round_num=round_num,
                     role=role,
+                    lane_id=lane_id,
                     backend=backend,
                     attempt=_attempt,
                     max_attempts=_max_attempts,
@@ -2535,6 +2569,7 @@ def _run_auto_dispatch(
                     task_id=task_id,
                     round_num=round_num,
                     role=role,
+                    lane_id=lane_id,
                     mode=DISPATCH_BACKEND_NATIVE,
                     backend=backend,
                     attempt=attempt,
@@ -2586,6 +2621,7 @@ def _run_auto_dispatch(
                     interrupted=True,
                     task_id=task_id,
                     round_num=round_num,
+                    lane_id=lane_id,
                 )
                 raise
             if first_meaningful_summary_ms is None:
@@ -2596,6 +2632,7 @@ def _run_auto_dispatch(
                         task_id=task_id,
                         round_num=round_num,
                         role=role,
+                        lane_id=lane_id,
                         backend=backend,
                         attempt=attempt,
                         max_attempts=max_attempts,
@@ -2623,6 +2660,7 @@ def _run_auto_dispatch(
                     timeout_sec=timeout_sec,
                     task_id=task_id,
                     round_num=round_num,
+                    lane_id=lane_id,
                 )
                 raise DispatchTimeoutError(
                     f"{role} dispatch timeout after {timeout_sec}s (backend={backend})."
@@ -2660,6 +2698,7 @@ def _run_auto_dispatch(
                 stdout_len=len(result.stdout or ""),
                 task_id=task_id,
                 round_num=round_num,
+                lane_id=lane_id,
             )
 
             if result.returncode == 0:
@@ -2671,6 +2710,7 @@ def _run_auto_dispatch(
                             task_id=task_id,
                             round_num=round_num,
                             role=role,
+                            lane_id=lane_id,
                             backend=backend,
                             attempt=attempt,
                             max_attempts=max_attempts,
@@ -2686,6 +2726,7 @@ def _run_auto_dispatch(
                             task_id=task_id,
                             round_num=round_num,
                             role=role,
+                            lane_id=lane_id,
                             backend=backend,
                             attempt=attempt,
                             max_attempts=max_attempts,
@@ -2718,6 +2759,7 @@ def _run_auto_dispatch(
                         task_id=task_id,
                         round_num=round_num,
                         role=role,
+                        lane_id=lane_id,
                         backend=backend,
                         status="fallback_invalid_resume",
                         attempt=attempt,
@@ -3124,6 +3166,138 @@ def _coerce_non_negative_int(value: object) -> int | None:
     if value < 0:
         return None
     return value
+
+
+def _normalized_backend_name(value: object) -> str:
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized:
+            return normalized
+    return ""
+
+
+def _normalize_token_usage(payload: dict[str, object]) -> tuple[int | None, int | None, int | None]:
+    input_tokens = _coerce_non_negative_int(payload.get("input_tokens"))
+    output_tokens = _coerce_non_negative_int(payload.get("output_tokens"))
+    total_tokens = _coerce_non_negative_int(payload.get("total_tokens"))
+    usage_raw = payload.get("token_usage")
+    if isinstance(usage_raw, dict):
+        if input_tokens is None:
+            input_tokens = _coerce_non_negative_int(usage_raw.get("input_tokens"))
+        if input_tokens is None:
+            input_tokens = _coerce_non_negative_int(usage_raw.get("prompt_tokens"))
+        if output_tokens is None:
+            output_tokens = _coerce_non_negative_int(usage_raw.get("output_tokens"))
+        if output_tokens is None:
+            output_tokens = _coerce_non_negative_int(usage_raw.get("completion_tokens"))
+        if total_tokens is None:
+            total_tokens = _coerce_non_negative_int(usage_raw.get("total_tokens"))
+        if total_tokens is None:
+            total_tokens = _coerce_non_negative_int(usage_raw.get("tokens_total"))
+    if total_tokens is None and input_tokens is not None and output_tokens is not None:
+        total_tokens = input_tokens + output_tokens
+    return input_tokens, output_tokens, total_tokens
+
+
+def _estimate_backend_cost_cents(
+    *,
+    backend: str,
+    input_tokens: int | None,
+    output_tokens: int | None,
+    total_tokens: int | None,
+) -> int:
+    input_rate_cents, output_rate_cents = _BACKEND_TOKEN_COST_CENTS_PER_MILLION.get(backend, (0, 0))
+    if input_rate_cents == 0 and output_rate_cents == 0:
+        return 0
+    if input_tokens is None and output_tokens is None:
+        if total_tokens is None:
+            return 0
+        input_tokens = total_tokens
+        output_tokens = 0
+    elif input_tokens is None:
+        if total_tokens is not None and output_tokens is not None:
+            input_tokens = max(0, total_tokens - output_tokens)
+        else:
+            input_tokens = 0
+    elif output_tokens is None:
+        if total_tokens is not None:
+            output_tokens = max(0, total_tokens - input_tokens)
+        else:
+            output_tokens = 0
+    weighted_token_cost = (input_tokens * input_rate_cents) + (output_tokens * output_rate_cents)
+    if weighted_token_cost <= 0:
+        return 0
+    return int(math.ceil(weighted_token_cost / 1_000_000))
+
+
+def _runtime_cost_and_token_fields(payload: dict[str, object], *, backend: str) -> dict[str, int]:
+    input_tokens, output_tokens, total_tokens = _normalize_token_usage(payload)
+    normalized_backend = _normalized_backend_name(backend)
+    fields: dict[str, int] = {}
+    if input_tokens is not None:
+        fields["input_tokens"] = input_tokens
+    if output_tokens is not None:
+        fields["output_tokens"] = output_tokens
+    if total_tokens is not None:
+        fields["total_tokens"] = total_tokens
+    existing_cost = _coerce_non_negative_int(payload.get("cost_cents"))
+    fields["cost_cents"] = (
+        existing_cost
+        if existing_cost is not None
+        else _estimate_backend_cost_cents(
+            backend=normalized_backend,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+        )
+    )
+    return fields
+
+
+def _enrich_work_report_runtime_fields(
+    report: WorkReport,
+    *,
+    backend: str,
+    duration_ms: int,
+    lane_id: str | None = None,
+    status: str | None = None,
+) -> None:
+    normalized_backend = _normalized_backend_name(report.get("backend")) or _normalized_backend_name(backend)
+    if normalized_backend:
+        report["backend"] = normalized_backend
+    normalized_duration = _coerce_non_negative_int(report.get("duration_ms"))
+    report["duration_ms"] = normalized_duration if normalized_duration is not None else max(0, int(duration_ms))
+    if lane_id is not None:
+        report["lane_id"] = lane_id
+    if status is not None:
+        report["status"] = status
+    for field_name, field_value in _runtime_cost_and_token_fields(report, backend=normalized_backend).items():
+        report[field_name] = field_value
+
+
+def _normalize_lane_runtime_metrics(
+    payload: dict[str, object],
+    *,
+    default_lane_id: str | None,
+    default_status: str = "completed",
+    default_backend: str = "",
+) -> LaneRuntimeMetrics | None:
+    lane_id_raw = payload.get("lane_id")
+    lane_id = lane_id_raw.strip() if isinstance(lane_id_raw, str) and lane_id_raw.strip() else default_lane_id
+    if lane_id is None:
+        return None
+    status_raw = payload.get("status")
+    status = status_raw.strip() if isinstance(status_raw, str) and status_raw.strip() else default_status
+    backend = _normalized_backend_name(payload.get("backend")) or _normalized_backend_name(default_backend)
+    duration_ms = _coerce_non_negative_int(payload.get("duration_ms"))
+    runtime: LaneRuntimeMetrics = {
+        "lane_id": lane_id,
+        "status": status,
+        "backend": backend,
+        "duration_ms": duration_ms if duration_ms is not None else 0,
+    }
+    runtime.update(_runtime_cost_and_token_fields(payload, backend=backend))
+    return runtime
 
 
 def _nearest_rank_percentile(values: list[float], percentile: float) -> float | None:
@@ -5075,6 +5249,15 @@ def _merge_lane_work_reports(
     seen_files: set[str] = set()
     merged_tests: list[WorkReportTest] = []
     notes_chunks: list[str] = []
+    lane_metrics: list[LaneRuntimeMetrics] = []
+    total_duration_ms = 0
+    total_cost_cents = 0
+    total_input_tokens = 0
+    total_output_tokens = 0
+    total_tokens = 0
+    has_any_input_tokens = False
+    has_any_output_tokens = False
+    has_any_total_tokens = False
     for lane_id in lane_execution_order:
         report = lane_reports.get(lane_id)
         if report is None:
@@ -5091,13 +5274,45 @@ def _merge_lane_work_reports(
         notes = str(report.get("notes", "")).strip()
         if notes:
             notes_chunks.append(f"{lane_id}: {notes}")
+        lane_metric = _normalize_lane_runtime_metrics(
+            report,
+            default_lane_id=lane_id,
+            default_status="completed",
+            default_backend="",
+        )
+        if lane_metric is not None:
+            lane_metrics.append(lane_metric)
+            duration_ms = cast(int, lane_metric.get("duration_ms", 0))
+            total_duration_ms += duration_ms
+            total_cost_cents += cast(int, lane_metric.get("cost_cents", 0))
+            lane_input_tokens = lane_metric.get("input_tokens")
+            if isinstance(lane_input_tokens, int):
+                has_any_input_tokens = True
+                total_input_tokens += lane_input_tokens
+            lane_output_tokens = lane_metric.get("output_tokens")
+            if isinstance(lane_output_tokens, int):
+                has_any_output_tokens = True
+                total_output_tokens += lane_output_tokens
+            lane_total_tokens = lane_metric.get("total_tokens")
+            if isinstance(lane_total_tokens, int):
+                has_any_total_tokens = True
+                total_tokens += lane_total_tokens
     if integration_tests:
         merged_tests.extend(integration_tests)
     merged: WorkReport = {
         "task_id": task_id,
         "head_sha": merged_head_sha,
         "round": round_num,
+        "lane_metrics": lane_metrics,
+        "duration_ms": total_duration_ms,
+        "cost_cents": total_cost_cents,
     }
+    if has_any_input_tokens:
+        merged["input_tokens"] = total_input_tokens
+    if has_any_output_tokens:
+        merged["output_tokens"] = total_output_tokens
+    if has_any_total_tokens:
+        merged["total_tokens"] = total_tokens
     if merged_files:
         merged["files_changed"] = merged_files
     if merged_tests:
@@ -6124,9 +6339,48 @@ def _validate_report(
             return f"{prefix} field '{field_name}' must be non-empty"
 
     if schema == "work_report":
-        for list_field in ("files_changed", "tests"):
+        for list_field in ("files_changed", "tests", "lane_metrics"):
             if list_field in report and not isinstance(report[list_field], list):
                 return f"{prefix} field '{list_field}' must be a list, got {type(report[list_field]).__name__}"
+        for text_field in ("lane_id", "status", "backend"):
+            if text_field not in report:
+                continue
+            value = report[text_field]
+            if not isinstance(value, str) or not value.strip():
+                return f"{prefix} field '{text_field}' must be a non-empty string"
+        for int_field in ("duration_ms", "input_tokens", "output_tokens", "total_tokens", "cost_cents"):
+            if int_field not in report:
+                continue
+            value = report[int_field]
+            if type(value) is not int or value < 0:
+                return f"{prefix} field '{int_field}' must be non-negative int, got {value!r}"
+        if "lane_metrics" in report:
+            lane_metrics = report["lane_metrics"]
+            if isinstance(lane_metrics, list):
+                for index, lane_metric in enumerate(lane_metrics):
+                    if not isinstance(lane_metric, dict):
+                        return (
+                            f"{prefix} field 'lane_metrics[{index}]' must be an object, "
+                            f"got {type(lane_metric).__name__}"
+                        )
+                    lane_id = lane_metric.get("lane_id")
+                    if not isinstance(lane_id, str) or not lane_id.strip():
+                        return f"{prefix} lane_metrics[{index}] missing non-empty lane_id"
+                    lane_status = lane_metric.get("status")
+                    if not isinstance(lane_status, str) or not lane_status.strip():
+                        return f"{prefix} lane_metrics[{index}] missing non-empty status"
+                    lane_backend = lane_metric.get("backend")
+                    if not isinstance(lane_backend, str):
+                        return f"{prefix} lane_metrics[{index}] field 'backend' must be a string"
+                    for lane_int_field in ("duration_ms", "input_tokens", "output_tokens", "total_tokens", "cost_cents"):
+                        if lane_int_field not in lane_metric:
+                            continue
+                        lane_int_value = lane_metric[lane_int_field]
+                        if type(lane_int_value) is not int or lane_int_value < 0:
+                            return (
+                                f"{prefix} lane_metrics[{index}] field '{lane_int_field}' "
+                                f"must be non-negative int"
+                            )
     elif schema == "review_report" and report["decision"] not in {"approve", "changes_required"}:
         return (
             f"{prefix} field 'decision' must be one of "
@@ -6796,6 +7050,123 @@ def _round_artifact_payload_for_report(
     return cast(dict[str, object], live_data)
 
 
+def _lane_status_map_from_state_payload(state_payload: dict[str, object] | None) -> dict[str, str]:
+    if not isinstance(state_payload, dict):
+        return {}
+    lanes_raw = state_payload.get("lanes")
+    if not isinstance(lanes_raw, dict):
+        return {}
+    statuses: dict[str, str] = {}
+    for lane_id_raw, lane_payload in lanes_raw.items():
+        if not isinstance(lane_id_raw, str):
+            continue
+        lane_id = lane_id_raw.strip()
+        if not lane_id:
+            continue
+        lane_status = "unknown"
+        if isinstance(lane_payload, dict):
+            status_raw = lane_payload.get("status")
+            if isinstance(status_raw, str) and status_raw.strip():
+                lane_status = status_raw.strip()
+        statuses[lane_id] = lane_status
+    return statuses
+
+
+def _lane_runtime_summary_for_round(
+    *,
+    work_payload: dict[str, object] | None,
+    state_payload: dict[str, object] | None,
+) -> dict[str, object] | None:
+    lane_statuses = _lane_status_map_from_state_payload(state_payload)
+    runtime_rows: list[LaneRuntimeMetrics] = []
+    if isinstance(work_payload, dict):
+        lane_metrics_raw = work_payload.get("lane_metrics")
+        if isinstance(lane_metrics_raw, list):
+            for item in lane_metrics_raw:
+                if not isinstance(item, dict):
+                    continue
+                lane_id_raw = item.get("lane_id")
+                default_lane_id = lane_id_raw.strip() if isinstance(lane_id_raw, str) and lane_id_raw.strip() else None
+                default_status = lane_statuses.get(default_lane_id or "", "completed")
+                metric = _normalize_lane_runtime_metrics(
+                    item,
+                    default_lane_id=default_lane_id,
+                    default_status=default_status,
+                    default_backend="",
+                )
+                if metric is not None:
+                    runtime_rows.append(metric)
+        if not runtime_rows:
+            default_lane_id = (
+                cast(str, work_payload["lane_id"])
+                if isinstance(work_payload.get("lane_id"), str) and cast(str, work_payload["lane_id"]).strip()
+                else _SERIAL_LANE_ID
+            )
+            default_status = lane_statuses.get(default_lane_id, "completed")
+            default_backend = _normalized_backend_name(work_payload.get("backend"))
+            serial_metric = _normalize_lane_runtime_metrics(
+                work_payload,
+                default_lane_id=default_lane_id,
+                default_status=default_status,
+                default_backend=default_backend,
+            )
+            if serial_metric is not None:
+                runtime_rows.append(serial_metric)
+
+    existing_lane_ids = {str(metric.get("lane_id", "")) for metric in runtime_rows}
+    for lane_id in sorted(lane_statuses):
+        if lane_id in existing_lane_ids:
+            continue
+        runtime_rows.append(
+            {
+                "lane_id": lane_id,
+                "status": lane_statuses[lane_id],
+                "backend": "",
+                "duration_ms": 0,
+                "cost_cents": 0,
+            }
+        )
+    if not runtime_rows:
+        return None
+
+    total_duration_ms = 0
+    total_cost_cents = 0
+    total_input_tokens = 0
+    total_output_tokens = 0
+    total_tokens = 0
+    has_any_input_tokens = False
+    has_any_output_tokens = False
+    has_any_total_tokens = False
+    for metric in runtime_rows:
+        total_duration_ms += cast(int, metric.get("duration_ms", 0))
+        total_cost_cents += cast(int, metric.get("cost_cents", 0))
+        input_tokens = metric.get("input_tokens")
+        if isinstance(input_tokens, int):
+            has_any_input_tokens = True
+            total_input_tokens += input_tokens
+        output_tokens = metric.get("output_tokens")
+        if isinstance(output_tokens, int):
+            has_any_output_tokens = True
+            total_output_tokens += output_tokens
+        row_total_tokens = metric.get("total_tokens")
+        if isinstance(row_total_tokens, int):
+            has_any_total_tokens = True
+            total_tokens += row_total_tokens
+    summary: dict[str, object] = {
+        "lane_count": len(runtime_rows),
+        "total_duration_ms": total_duration_ms,
+        "total_cost_cents": total_cost_cents,
+        "lanes": runtime_rows,
+    }
+    if has_any_input_tokens:
+        summary["input_tokens"] = total_input_tokens
+    if has_any_output_tokens:
+        summary["output_tokens"] = total_output_tokens
+    if has_any_total_tokens:
+        summary["total_tokens"] = total_tokens
+    return summary
+
+
 def _build_task_report(task_id: str, *, paths: LoopPaths | None = None) -> dict[str, object]:
     resolved_paths = _resolve_paths(paths)
     state = _load_state(paths=resolved_paths)
@@ -6827,6 +7198,7 @@ def _build_task_report(task_id: str, *, paths: LoopPaths | None = None) -> dict[
 
     decisions: list[dict[str, object]] = []
     changed_files: list[dict[str, object]] = []
+    lane_runtime: list[dict[str, object]] = []
     for round_num in rounds:
         review = _round_artifact_payload_for_report(
             task_id,
@@ -6852,6 +7224,16 @@ def _build_task_report(task_id: str, *, paths: LoopPaths | None = None) -> dict[
                 files = sorted({item.strip() for item in raw_files if isinstance(item, str) and item.strip()})
             if files:
                 changed_files.append({"round": round_num, "files": files})
+        state_payload = _round_artifact_payload_for_report(
+            task_id,
+            round_num,
+            "state",
+            paths=resolved_paths,
+        )
+        lane_summary = _lane_runtime_summary_for_round(work_payload=work, state_payload=state_payload)
+        if lane_summary is not None:
+            lane_summary["round"] = round_num
+            lane_runtime.append(lane_summary)
 
     return {
         "task_id": task_id,
@@ -6862,6 +7244,7 @@ def _build_task_report(task_id: str, *, paths: LoopPaths | None = None) -> dict[
         "rounds": rounds,
         "decisions": decisions,
         "changed_files": changed_files,
+        "lane_runtime": lane_runtime,
     }
 
 
@@ -6902,6 +7285,45 @@ def _render_task_report_markdown(report: dict[str, object]) -> str:
             files = item.get("files")
             if isinstance(files, list) and files:
                 lines.append(f"- r{item.get('round')}: {', '.join(str(name) for name in files)}")
+    else:
+        lines.append("- none")
+
+    lines.extend(
+        [
+            "",
+            "## Lane Runtime",
+        ]
+    )
+    lane_runtime = report.get("lane_runtime")
+    if isinstance(lane_runtime, list) and lane_runtime:
+        for round_item in lane_runtime:
+            if not isinstance(round_item, dict):
+                continue
+            lines.append(
+                "- "
+                f"r{round_item.get('round')}: "
+                f"lane_count={round_item.get('lane_count', 0)} "
+                f"total_duration_ms={round_item.get('total_duration_ms', 0)} "
+                f"total_cost_cents={round_item.get('total_cost_cents', 0)}"
+            )
+            lanes = round_item.get("lanes")
+            if not isinstance(lanes, list):
+                continue
+            for lane in lanes:
+                if not isinstance(lane, dict):
+                    continue
+                lane_id = lane.get("lane_id", "<unknown>")
+                lane_status = lane.get("status", "unknown")
+                lane_backend = lane.get("backend") or "<unknown>"
+                lane_duration = lane.get("duration_ms", 0)
+                lane_cost = lane.get("cost_cents", 0)
+                lane_total_tokens = lane.get("total_tokens")
+                token_text = lane_total_tokens if isinstance(lane_total_tokens, int) else "n/a"
+                lines.append(
+                    "  - "
+                    f"{lane_id}: status={lane_status} backend={lane_backend} "
+                    f"duration_ms={lane_duration} cost_cents={lane_cost} total_tokens={token_text}"
+                )
     else:
         lines.append("- none")
     return "\n".join(lines)
@@ -7328,10 +7750,16 @@ def _auto_dispatch_role(
     round_num: int,
     artifact_path: Path,
     state: dict | None = None,
+    lane_id: str | None = None,
 ) -> dict | None:
     if not config.auto_dispatch:
         return None
     backend = (config.worker_backend if role == "worker" else config.reviewer_backend).strip().lower()
+    normalized_lane_id = (
+        lane_id.strip()
+        if isinstance(lane_id, str) and lane_id.strip()
+        else (_SERIAL_LANE_ID if role == "worker" else None)
+    )
     current_state = state if isinstance(state, dict) else _load_state()
     state_updated = _invalidate_sessions_for_dispatch(
         current_state,
@@ -7368,6 +7796,7 @@ def _auto_dispatch_role(
             task_id=task_id,
             round_num=round_num,
             role=role,
+            lane_id=normalized_lane_id,
             backend=backend,
             status=resume_status,
             session_id=candidate_session_id,
@@ -7393,6 +7822,7 @@ def _auto_dispatch_role(
             heartbeat_ttl_sec=config.heartbeat_ttl,
             task_id=task_id,
             round_num=round_num,
+            lane_id=normalized_lane_id,
             resume_session_id=resume_session_id,
             dispatch_started_at=dispatch_started_at,
             telemetry=dispatch_metrics,
@@ -7408,16 +7838,33 @@ def _auto_dispatch_role(
             timeout_sec=config.artifact_timeout,
         )
         artifact_written_latency_ms = max(0, int((time.monotonic() - dispatch_started_at) * 1000))
+        runtime_feed_fields: dict[str, object] = {}
+        if role == "worker" and isinstance(artifact, dict):
+            work_artifact = cast(WorkReport, artifact)
+            _enrich_work_report_runtime_fields(
+                work_artifact,
+                backend=backend,
+                duration_ms=artifact_written_latency_ms,
+                lane_id=normalized_lane_id,
+                status="completed",
+            )
+            for field_name in ("input_tokens", "output_tokens", "total_tokens", "cost_cents"):
+                field_value = work_artifact.get(field_name)
+                if isinstance(field_value, int) and field_value >= 0:
+                    runtime_feed_fields[field_name] = field_value
         _feed_event(
             FEED_DISPATCH_ARTIFACT_WRITTEN,
             data=_feed_data(
                 task_id=task_id,
                 round_num=round_num,
                 role=role,
+                lane_id=normalized_lane_id,
                 backend=backend,
                 artifact_path=artifact_path.name,
                 latency_ms=artifact_written_latency_ms,
+                duration_ms=artifact_written_latency_ms,
                 status="written",
+                **runtime_feed_fields,
             ),
         )
         first_stdout_ms = dispatch_metrics.get("first_stdout_ms")
@@ -7434,12 +7881,15 @@ def _auto_dispatch_role(
                 task_id=task_id,
                 round_num=round_num,
                 role=role,
+                lane_id=normalized_lane_id,
                 backend=backend,
                 session_id=SessionManager.normalize_session_id(dispatch_session_id),
                 startup_ms=startup_ms,
                 context_to_work_ms=_segment_ms(startup_ms, work_ms),
                 work_to_artifact_ms=_segment_ms(work_ms, artifact_written_latency_ms),
                 total_ms=artifact_written_latency_ms,
+                duration_ms=artifact_written_latency_ms,
+                **runtime_feed_fields,
                 **subphase_metrics,
             ),
         )
@@ -7840,9 +8290,11 @@ def _run_single_round(
             dispatch_role = _lane_dispatch_role_name(lane_id)
             dispatch_started_at = time.monotonic()
             dispatch_metrics: dict[str, object] = {}
+            dispatch_session_id: str | None = None
 
             def _dispatch_call() -> None:
-                _run_auto_dispatch(
+                nonlocal dispatch_session_id
+                dispatch_session_id = _run_auto_dispatch(
                     role=dispatch_role,
                     backend=lane_backend,
                     prompt=lane_prompt,
@@ -7854,6 +8306,7 @@ def _run_single_round(
                     heartbeat_ttl_sec=config.heartbeat_ttl,
                     task_id=task_id,
                     round_num=round_num,
+                    lane_id=lane_id,
                     dispatch_started_at=dispatch_started_at,
                     telemetry=dispatch_metrics,
                     cwd=handle.path,
@@ -7868,6 +8321,62 @@ def _run_single_round(
                 timeout_sec=config.artifact_timeout,
             )
             lane_work = cast(WorkReport, artifact)
+            artifact_written_latency_ms = max(0, int((time.monotonic() - dispatch_started_at) * 1000))
+            _enrich_work_report_runtime_fields(
+                lane_work,
+                backend=lane_backend,
+                duration_ms=artifact_written_latency_ms,
+                lane_id=lane_id,
+                status="completed",
+            )
+            runtime_feed_fields: dict[str, object] = {}
+            for field_name in ("input_tokens", "output_tokens", "total_tokens", "cost_cents"):
+                field_value = lane_work.get(field_name)
+                if isinstance(field_value, int) and field_value >= 0:
+                    runtime_feed_fields[field_name] = field_value
+            _feed_event(
+                FEED_DISPATCH_ARTIFACT_WRITTEN,
+                data=_feed_data(
+                    task_id=task_id,
+                    round_num=round_num,
+                    role=dispatch_role,
+                    lane_id=lane_id,
+                    backend=lane_backend,
+                    artifact_path=lane_local_report.name,
+                    latency_ms=artifact_written_latency_ms,
+                    duration_ms=artifact_written_latency_ms,
+                    status="written",
+                    **runtime_feed_fields,
+                ),
+                paths=resolved_paths,
+            )
+            first_stdout_ms = dispatch_metrics.get("first_stdout_ms")
+            startup_ms = first_stdout_ms if isinstance(first_stdout_ms, int) else None
+            first_work_action_ms = dispatch_metrics.get("first_work_action_ms")
+            work_ms = first_work_action_ms if isinstance(first_work_action_ms, int) else None
+            subphase_metrics = _dispatch_subphase_metrics_from_telemetry(
+                dispatch_metrics,
+                artifact_written_latency_ms=artifact_written_latency_ms,
+            )
+            _feed_event(
+                FEED_DISPATCH_PHASE_METRICS,
+                data=_feed_data(
+                    task_id=task_id,
+                    round_num=round_num,
+                    role=dispatch_role,
+                    lane_id=lane_id,
+                    backend=lane_backend,
+                    session_id=SessionManager.normalize_session_id(dispatch_session_id),
+                    startup_ms=startup_ms,
+                    context_to_work_ms=_segment_ms(startup_ms, work_ms),
+                    work_to_artifact_ms=_segment_ms(work_ms, artifact_written_latency_ms),
+                    total_ms=artifact_written_latency_ms,
+                    duration_ms=artifact_written_latency_ms,
+                    **runtime_feed_fields,
+                    **subphase_metrics,
+                ),
+                paths=resolved_paths,
+            )
             lane_error = _validate_report(
                 lane_work,
                 expected_task_id=task_id,
@@ -7938,6 +8447,9 @@ def _run_single_round(
                     lane_execution_order.append(lane_id)
                     lane_entry["status"] = "completed"
                     lane_entry["head_sha"] = str(lane_work["head_sha"])
+                    lane_entry["backend"] = lane_work.get("backend", "")
+                    lane_entry["duration_ms"] = lane_work.get("duration_ms", 0)
+                    lane_entry["cost_cents"] = lane_work.get("cost_cents", 0)
                     print(f"  Lane completed: {lane_id} -> {str(lane_work['head_sha'])[:8]}")
 
             _save_lane_state_snapshot(state, lane_state, paths=resolved_paths)
@@ -8080,6 +8592,22 @@ def _run_single_round(
             cleanup_lane_worktrees=False if preserve_lane_worktrees else True,
         )
         return
+
+    if not lane_dispatch_enabled:
+        work_lane_id = (
+            cast(str, work["lane_id"])
+            if isinstance(work.get("lane_id"), str) and cast(str, work["lane_id"]).strip()
+            else _SERIAL_LANE_ID
+        )
+        work_duration = _coerce_non_negative_int(work.get("duration_ms")) or 0
+        _enrich_work_report_runtime_fields(
+            work,
+            backend=config.worker_backend,
+            duration_ms=work_duration,
+            lane_id=work_lane_id,
+            status="completed",
+        )
+    _atomic_write_json(resolved_paths.work_report, work)
 
     report_error = _validate_report(
         work,
