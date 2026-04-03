@@ -65,14 +65,20 @@ def _write_fake_opencode_backend(bin_dir: Path) -> Path:
             "import sys\n"
             "from pathlib import Path\n"
             "\n"
+            "# Force UTF-8 output on Windows where default console encoding may differ\n"
+            'if hasattr(sys.stdout, "reconfigure"):\n'
+            '    sys.stdout.reconfigure(encoding="utf-8")\n'
+            'if hasattr(sys.stderr, "reconfigure"):\n'
+            '    sys.stderr.reconfigure(encoding="utf-8")\n'
+            "\n"
             "\n"
             "def _arg_value(name: str, argv: list[str]) -> str:\n"
             "    try:\n"
             "        i = argv.index(name)\n"
             "    except ValueError:\n"
-            "        return \"\"\n"
+            '        return ""\n'
             "    if i + 1 >= len(argv):\n"
-            "        return \"\"\n"
+            '        return ""\n'
             "    return argv[i + 1]\n"
             "\n"
             "\n"
@@ -86,11 +92,11 @@ def _write_fake_opencode_backend(bin_dir: Path) -> Path:
             "\n"
             "def _git(*args: str) -> str:\n"
             "    proc = subprocess.run(\n"
-            "        [\"git\", *args],\n"
+            '        ["git", *args],\n'
             "        cwd=Path.cwd(),\n"
             "        capture_output=True,\n"
             "        text=True,\n"
-            "        encoding=\"utf-8\",\n"
+            '        encoding="utf-8",\n'
             "        check=True,\n"
             "    )\n"
             "    return proc.stdout.strip()\n"
@@ -98,89 +104,95 @@ def _write_fake_opencode_backend(bin_dir: Path) -> Path:
             "\n"
             "def main() -> int:\n"
             "    argv = sys.argv[1:]\n"
-            "    mode = os.environ.get(\"FAKE_OPENCODE_MODE\", \"ok\").strip().lower()\n"
-            "    reviewer_decision = os.environ.get(\"FAKE_OPENCODE_REVIEW_DECISION\", \"approve\").strip()\n"
-            "    session_id = _arg_value(\"-s\", argv) or \"fake-session\"\n"
+            '    mode = os.environ.get("FAKE_OPENCODE_MODE", "ok").strip().lower()\n'
+            '    reviewer_decision = os.environ.get("FAKE_OPENCODE_REVIEW_DECISION", "approve").strip()\n'
+            '    session_id = _arg_value("-s", argv) or "fake-session"\n'
             "\n"
             "    sys.stdout.write(\n"
-            "        json.dumps({\"type\": \"step_start\", \"part\": {\"sessionID\": session_id}}) + \"\\n\"\n"
+            '        json.dumps({"type": "step_start", "part": {"sessionID": session_id}}) + "\\n"\n'
             "    )\n"
             "    sys.stdout.flush()\n"
             "\n"
-            "    if mode == \"fail\":\n"
-            "        sys.stderr.write(\"synthetic dispatch not found\\n\")\n"
+            '    if mode == "fail":\n'
+            '        sys.stderr.write("synthetic dispatch not found\\n")\n'
             "        sys.stderr.flush()\n"
             "        return 2\n"
             "\n"
             "    prompt = sys.stdin.read()\n"
-            "    handoff_visible = \"=== HANDOFF CONTEXT ===\" in prompt and \"role: \" in prompt\n"
-            "    quickstart_visible = \"project_baseline:\" in prompt\n"
-            "    loop_dir = Path.cwd() / \".loop\"\n"
-            "    task_id = _prompt_value(r\"Current task_id:\\\\s*([^,\\\\n]+)\", prompt, \"UNKNOWN\")\n"
-            "    if task_id == \"UNKNOWN\":\n"
-            "        task_card_path = loop_dir / \"task_card.json\"\n"
+            '    handoff_visible = "=== HANDOFF CONTEXT ===" in prompt and "role: " in prompt\n'
+            '    quickstart_visible = "project_baseline:" in prompt\n'
+            '    loop_dir = Path.cwd() / ".loop"\n'
+            '    task_id = _prompt_value(r"Current task_id:\\\\s*([^,\\\\n]+)", prompt, "UNKNOWN")\n'
+            '    if task_id == "UNKNOWN":\n'
+            '        task_card_path = loop_dir / "task_card.json"\n'
             "        if task_card_path.exists():\n"
             "            try:\n"
-            "                task_card = json.loads(task_card_path.read_text(encoding=\"utf-8\"))\n"
+            '                task_card = json.loads(task_card_path.read_text(encoding="utf-8"))\n'
             "            except json.JSONDecodeError:\n"
             "                task_card = {}\n"
             "            if isinstance(task_card, dict):\n"
-            "                task_card_id = task_card.get(\"task_id\")\n"
+            '                task_card_id = task_card.get("task_id")\n'
             "                if isinstance(task_card_id, str) and task_card_id.strip():\n"
             "                    task_id = task_card_id.strip()\n"
-            "    round_text = _prompt_value(r\"round:\\\\s*(\\\\d+)\", prompt, \"\")\n"
+            '    round_text = _prompt_value(r"round:\\\\s*(\\\\d+)", prompt, "")\n'
             "    if not round_text.isdigit():\n"
-            "        state_path = loop_dir / \"state.json\"\n"
+            '        state_path = loop_dir / "state.json"\n'
             "        if state_path.exists():\n"
             "            try:\n"
-            "                state_data = json.loads(state_path.read_text(encoding=\"utf-8\"))\n"
+            '                state_data = json.loads(state_path.read_text(encoding="utf-8"))\n'
             "            except json.JSONDecodeError:\n"
             "                state_data = {}\n"
-            "            if isinstance(state_data, dict) and isinstance(state_data.get(\"round\"), int):\n"
-            "                round_text = str(state_data[\"round\"])\n"
+            '            if isinstance(state_data, dict) and isinstance(state_data.get("round"), int):\n'
+            '                round_text = str(state_data["round"])\n'
             "    if not round_text.isdigit():\n"
-            "        round_text = \"1\"\n"
+            '        round_text = "1"\n'
             "    round_num = int(round_text)\n"
             "\n"
-            "    if \"Role: code-writer worker for PM loop.\" in prompt:\n"
-            "        changed_file = Path.cwd() / f\"worker_round_{round_num}.txt\"\n"
-            "        changed_file.write_text(f\"round {round_num}\\\\n\", encoding=\"utf-8\")\n"
-            "        _git(\"add\", changed_file.name)\n"
-            "        _git(\"commit\", \"-m\", f\"worker round {round_num}\")\n"
-            "        head_sha = _git(\"rev-parse\", \"HEAD\")\n"
+            '    if "Role: code-writer worker for PM loop." in prompt:\n'
+            '        changed_file = Path.cwd() / f"worker_round_{round_num}.txt"\n'
+            '        changed_file.write_text(f"round {round_num}\\n", encoding="utf-8")\n'
+            '        _git("add", changed_file.name)\n'
+            '        _git("commit", "-m", f"worker round {round_num}")\n'
+            '        head_sha = _git("rev-parse", "HEAD")\n'
             "        payload = {\n"
-            "            \"task_id\": task_id,\n"
-            "            \"head_sha\": head_sha,\n"
-            "            \"files_changed\": [changed_file.name],\n"
-            "            \"tests\": [{\"name\": \"fake-opencode\", \"result\": \"pass\", \"output\": \"ok\"}],\n"
-            "            \"notes\": (\n"
-            "                f\"worker round {round_num} handoff_visible={handoff_visible} \"\n"
-            "                f\"quickstart_visible={quickstart_visible}\"\n"
+            '            "task_id": task_id,\n'
+            '            "head_sha": head_sha,\n'
+            '            "files_changed": [changed_file.name],\n'
+            '            "tests": [{"name": "fake-opencode", "result": "pass", "output": "ok"}],\n'
+            '            "notes": (\n'
+            '                f"worker round {round_num} handoff_visible={handoff_visible} "\n'
+            '                f"quickstart_visible={quickstart_visible}"\n'
             "            ),\n"
-            "            \"round\": round_num,\n"
+            '            "round": round_num,\n'
             "        }\n"
-            "        target = loop_dir / \"work_report.json\"\n"
+            '        target = loop_dir / "work_report.json"\n'
             "    else:\n"
             "        payload = {\n"
-            "            \"task_id\": task_id,\n"
-            "            \"decision\": reviewer_decision,\n"
-            "            \"blocking_issues\": [],\n"
-            "            \"non_blocking_suggestions\": [],\n"
-            "            \"round\": round_num,\n"
+            '            "task_id": task_id,\n'
+            '            "decision": reviewer_decision,\n'
+            '            "blocking_issues": [],\n'
+            '            "non_blocking_suggestions": [],\n'
+            '            "round": round_num,\n'
             "        }\n"
-            "        target = loop_dir / \"review_report.json\"\n"
+            '        target = loop_dir / "review_report.json"\n'
             "\n"
             "    sys.stdout.write(\n"
-            "        json.dumps({\"type\": \"text\", \"part\": {\"text\": \"backend executing\"}}) + \"\\n\"\n"
+            '        json.dumps({"type": "text", "part": {"text": "backend executing"}}) + "\\n"\n'
             "    )\n"
-            "    target.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + \"\\n\", encoding=\"utf-8\")\n"
-            "    sys.stdout.write(json.dumps({\"type\": \"step_finish\", \"part\": {}}) + \"\\n\")\n"
             "    sys.stdout.flush()\n"
+            "\n"
+            '    target.write_text(json.dumps(payload, indent=2) + "\\n", encoding="utf-8")\n'
+            "\n"
+            "    sys.stdout.write(\n"
+            '        json.dumps({"type": "done", "part": {"artifact": str(target)}}) + "\\n"\n'
+            "    )\n"
+            "    sys.stdout.flush()\n"
+            "\n"
             "    return 0\n"
             "\n"
             "\n"
-            "if __name__ == \"__main__\":\n"
-            "    raise SystemExit(main())\n"
+            'if __name__ == "__main__":\n'
+            "    sys.exit(main())\n"
         ),
         encoding="utf-8",
     )
@@ -193,14 +205,14 @@ def _install_fake_opencode(bin_dir: Path) -> None:
 
     # Windows launcher (`opencode.cmd`).
     (bin_dir / "opencode.cmd").write_text(
-        f"@echo off\r\n\"{sys.executable}\" \"{backend_script}\" %*\r\n",
+        f'@echo off\r\n"{sys.executable}" "{backend_script}" %*\r\n',
         encoding="utf-8",
     )
 
     # Unix launcher (`opencode`).
     unix_launcher = bin_dir / "opencode"
     unix_launcher.write_text(
-        f"#!/bin/sh\nexec \"{sys.executable}\" \"{backend_script}\" \"$@\"\n",
+        f'#!/bin/sh\nexec "{sys.executable}" "{backend_script}" "$@"\n',
         encoding="utf-8",
     )
     unix_launcher.chmod(unix_launcher.stat().st_mode | stat.S_IEXEC)
