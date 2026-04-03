@@ -4380,8 +4380,11 @@ class TestLoadState:
 
         state = orchestrator._load_state()
 
-        assert state == backup_state
-        assert json.loads(orchestrator.STATE_FILE.read_text(encoding="utf-8")) == backup_state
+        assert state == {"version": orchestrator.STATE_SCHEMA_VERSION, **backup_state}
+        assert json.loads(orchestrator.STATE_FILE.read_text(encoding="utf-8")) == {
+            "version": orchestrator.STATE_SCHEMA_VERSION,
+            **backup_state,
+        }
         assert "state.json corrupted, recovered from backup" in capsys.readouterr().err
 
     def test_recovers_from_backup_on_read_oserror(self, tmp_path: Path, monkeypatch, capsys) -> None:
@@ -4400,8 +4403,11 @@ class TestLoadState:
 
         state = orchestrator._load_state()
 
-        assert state == backup_state
-        assert json.loads(original_read_text(orchestrator.STATE_FILE, encoding="utf-8")) == backup_state
+        assert state == {"version": orchestrator.STATE_SCHEMA_VERSION, **backup_state}
+        assert json.loads(original_read_text(orchestrator.STATE_FILE, encoding="utf-8")) == {
+            "version": orchestrator.STATE_SCHEMA_VERSION,
+            **backup_state,
+        }
         assert "state.json corrupted, recovered from backup" in capsys.readouterr().err
 
 
@@ -4410,6 +4416,7 @@ class TestSaveState:
         _configure_loop_paths(monkeypatch, tmp_path)
         orchestrator._save_state({"state": "done", "round": 2})
         data = json.loads(orchestrator.STATE_FILE.read_text(encoding="utf-8"))
+        assert data["version"] == orchestrator.STATE_SCHEMA_VERSION
         assert data["state"] == "done"
         assert data["round"] == 2
 
@@ -4421,7 +4428,12 @@ class TestSaveState:
         orchestrator._save_state({"state": "done", "round": 2})
 
         assert json.loads(orchestrator._STATE_BACKUP.read_text(encoding="utf-8")) == previous_state
-        assert json.loads(orchestrator.STATE_FILE.read_text(encoding="utf-8")) == {"state": "done", "round": 2}
+        assert json.loads(orchestrator.STATE_FILE.read_text(encoding="utf-8")) == {
+            "version": orchestrator.STATE_SCHEMA_VERSION,
+            "state": "done",
+            "round": 2,
+            "task_id": None,
+        }
 
 
 class TestArchiveTaskSummary:
@@ -6145,3 +6157,18 @@ def test_state_migration_adds_missing_core_fields(tmp_path: Path, monkeypatch) -
     assert loaded_state["state"] == orchestrator.STATE_DONE
     assert loaded_state["round"] == 0  # default
     assert loaded_state["task_id"] is None  # default
+
+
+def test_state_migration_is_idempotent(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+
+    orchestrator.STATE_FILE.write_text(
+        json.dumps({"state": orchestrator.STATE_AWAITING_WORK, "round": 1}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    first = orchestrator._load_state()
+    second = orchestrator._migrate_state_schema(first)
+
+    assert first == second
+    assert second["version"] == orchestrator.STATE_SCHEMA_VERSION

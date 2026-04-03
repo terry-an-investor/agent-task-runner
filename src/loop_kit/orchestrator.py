@@ -3092,6 +3092,20 @@ def _default_state(task_id: str | None = None, round_num: int = 0) -> dict:
     }
 
 
+def _migrate_state_schema(state: dict) -> dict:
+    """Return a schema-normalized copy of state data."""
+    migrated = dict(state)
+    version_raw = migrated.get("version", 0)
+    version = version_raw if isinstance(version_raw, int) and not isinstance(version_raw, bool) else 0
+    if version == 0:
+        migrated["version"] = STATE_SCHEMA_VERSION
+        migrated.setdefault("state", STATE_IDLE)
+        migrated.setdefault("round", 0)
+        migrated.setdefault("task_id", None)
+        return migrated
+    return migrated
+
+
 def _load_state(paths: LoopPaths | None = None) -> dict:
     resolved_paths = _resolve_paths(paths)
     state_file = resolved_paths.state
@@ -3114,7 +3128,7 @@ def _load_state(paths: LoopPaths | None = None) -> dict:
         if not isinstance(backup_data, dict):
             _log("Warning: backup state file root must be a JSON object. Ignoring backup.")
             return None
-        return backup_data
+        return _migrate_state_schema(backup_data)
 
     try:
         data = json.loads(state_file.read_text(encoding="utf-8"))
@@ -3138,25 +3152,10 @@ def _load_state(paths: LoopPaths | None = None) -> dict:
         _log("Warning: state.json root must be a JSON object. Using fresh default state.")
         return default_state.copy()
 
-    # Migration: ensure version field exists and is current
-    version = data.get("version", 0)
-    if version != STATE_SCHEMA_VERSION:
-        # Migrate: add missing fields with defaults
-        migrated = dict(data)  # shallow copy
-        migrated["version"] = STATE_SCHEMA_VERSION
-
-        # Ensure core fields exist
-        if "state" not in migrated:
-            migrated["state"] = STATE_IDLE
-        if "round" not in migrated:
-            migrated["round"] = 0
-        if "task_id" not in migrated:
-            migrated["task_id"] = None
-
-        _log(f"State schema migrated from version {version} to {STATE_SCHEMA_VERSION}.")
-        return migrated
-
-    return data
+    migrated = _migrate_state_schema(data)
+    if migrated.get("version", 0) == STATE_SCHEMA_VERSION and data.get("version", 0) != STATE_SCHEMA_VERSION:
+        _log(f"State schema migrated from version {data.get('version', 0)} to {STATE_SCHEMA_VERSION}.")
+    return migrated
 
 
 def _atomic_write_json(path: Path, data: object) -> None:
@@ -3184,6 +3183,8 @@ def _save_state(state: dict, paths: LoopPaths | None = None) -> None:
     resolved_paths = _resolve_paths(paths)
     state_file = resolved_paths.state
     state_backup = resolved_paths.dir / ".state.json.bak"
+    state_to_save = _migrate_state_schema(state)
+    state_to_save["version"] = STATE_SCHEMA_VERSION
     previous_state: dict | None = None
     if state_file.exists():
         previous = _read_json_if_exists(state_file)
@@ -3191,13 +3192,13 @@ def _save_state(state: dict, paths: LoopPaths | None = None) -> None:
             previous_state = previous
         state_backup.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(state_file, state_backup)
-    _atomic_write_json(state_file, state)
+    _atomic_write_json(state_file, state_to_save)
     from_state = previous_state.get("state") if isinstance(previous_state, dict) else None
     from_round = previous_state.get("round") if isinstance(previous_state, dict) else None
-    to_state = state.get("state")
-    to_round = state.get("round")
+    to_state = state_to_save.get("state")
+    to_round = state_to_save.get("round")
     if from_state != to_state or from_round != to_round:
-        task_id_raw = state.get("task_id")
+        task_id_raw = state_to_save.get("task_id")
         task_id = task_id_raw if isinstance(task_id_raw, str) and task_id_raw else None
         round_num = to_round if isinstance(to_round, int) else None
         _feed_event(
