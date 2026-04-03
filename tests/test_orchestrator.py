@@ -1201,6 +1201,57 @@ def test_auto_dispatch_role_reuses_and_persists_worker_session(tmp_path: Path, m
     assert saved["sessions"]["worker"] == {"session_id": "sid-new", "backend": "codex"}
 
 
+def test_auto_dispatch_role_reuses_and_persists_worker_session_opencode(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+    state = {
+        "state": orchestrator.STATE_AWAITING_WORK,
+        "round": 2,
+        "task_id": "T-628",
+        "base_sha": "base-sha",
+        "sessions": {"worker": {"session_id": "sid-opencode-old", "backend": "opencode"}},
+    }
+    orchestrator._save_state(state)
+
+    captured: dict[str, object] = {}
+
+    def fake_run_auto_dispatch(*, resume_session_id: str | None = None, **kwargs) -> str | None:
+        _ = kwargs
+        captured["resume_session_id"] = resume_session_id
+        return "sid-opencode-new"
+
+    def fake_dispatch_with_artifact_fallback(
+        *,
+        role: str,
+        dispatch_call,
+        artifact_path: Path,
+        task_id: str,
+        round_num: int,
+        timeout_sec: int = orchestrator.DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC,
+    ) -> dict:
+        _ = (role, artifact_path, timeout_sec)
+        dispatch_call()
+        return {"task_id": task_id, "round": round_num}
+
+    monkeypatch.setattr(orchestrator, "_run_auto_dispatch", fake_run_auto_dispatch)
+    monkeypatch.setattr(orchestrator, "_dispatch_with_artifact_fallback", fake_dispatch_with_artifact_fallback)
+    monkeypatch.setattr(orchestrator, "_current_sha", lambda: "base-sha")
+
+    result = orchestrator._auto_dispatch_role(
+        role="worker",
+        prompt="prompt",
+        config=orchestrator.RunConfig(auto_dispatch=True, worker_backend="opencode"),
+        task_id="T-628",
+        round_num=2,
+        artifact_path=orchestrator.WORK_REPORT,
+        state=state,
+    )
+
+    assert result == {"task_id": "T-628", "round": 2}
+    assert captured["resume_session_id"] == "sid-opencode-old"
+    saved = json.loads(orchestrator.STATE_FILE.read_text(encoding="utf-8"))
+    assert saved["sessions"]["worker"] == {"session_id": "sid-opencode-new", "backend": "opencode"}
+
+
 def test_auto_dispatch_role_invalidates_sessions_on_base_sha_mismatch(tmp_path: Path, monkeypatch) -> None:
     _configure_loop_paths(monkeypatch, tmp_path)
     state = {
