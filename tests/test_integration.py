@@ -493,3 +493,37 @@ def test_dispatch_failure_handling(tmp_path: Path) -> None:
     assert state["state"] == "done"
     assert state["outcome"] == "worker_dispatch_failed"
     assert "dispatch failed" in str(state.get("error", "")).lower()
+
+
+@pytest.mark.timeout(10)
+def test_report_rejects_cross_task_archived_review_artifact(tmp_path: Path) -> None:
+    base_sha = _init_git_repo(tmp_path)
+    loop_dir = _prepare_loop_contract(
+        tmp_path,
+        task_id="T-705",
+        base_sha=base_sha,
+        state_name="done",
+        round_num=1,
+    )
+    archive_dir = loop_dir / "archive" / "T-705"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(
+        archive_dir / "r1_review_report.json",
+        {
+            "task_id": "T-999",
+            "round": 1,
+            "decision": "approve",
+        },
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-m", "loop_kit", "report", "--loop-dir", ".loop", "--task-id", "T-705", "--format", "json"],
+        cwd=tmp_path,
+        env=_subprocess_env(tmp_path),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+
+    assert result.returncode == orchestrator.EXIT_VALIDATION_ERROR
+    assert "field 'task_id' mismatch" in result.stderr

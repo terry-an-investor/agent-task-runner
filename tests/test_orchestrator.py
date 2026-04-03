@@ -3260,6 +3260,21 @@ def test_archive_bus_file_missing_source_is_noop(tmp_path: Path, monkeypatch) ->
     assert (orchestrator.LOOP_DIR / "archive" / "T-604").exists() is False
 
 
+def test_archive_bus_file_rejects_cross_task_round_artifact(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+    orchestrator.WORK_REPORT.write_text('{"task_id":"T-999","round":1}\n', encoding="utf-8")
+
+    with pytest.raises(orchestrator.ValidationError) as exc:
+        orchestrator._archive_bus_file(
+            orchestrator.WORK_REPORT,
+            "T-604",
+            1,
+            "work_report",
+        )
+
+    assert "field 'task_id' mismatch" in str(exc.value)
+
+
 def test_archive_subcommand_lists_files(tmp_path: Path, monkeypatch, capsys) -> None:
     _configure_loop_paths(monkeypatch, tmp_path)
     archive_dir = orchestrator.LOOP_DIR / "archive" / "T-604"
@@ -3348,8 +3363,8 @@ def test_round2_start_archives_round1_bus_files(tmp_path: Path, monkeypatch) -> 
     )
 
     archive_dir = orchestrator.LOOP_DIR / "archive" / "T-604"
-    archived_work = json.loads((archive_dir / "r2_work_report.json").read_text(encoding="utf-8"))
-    archived_review = json.loads((archive_dir / "r2_review_report.json").read_text(encoding="utf-8"))
+    archived_work = json.loads((archive_dir / "r1_work_report.json").read_text(encoding="utf-8"))
+    archived_review = json.loads((archive_dir / "r1_review_report.json").read_text(encoding="utf-8"))
     assert archived_work["round"] == 1
     assert archived_work["head_sha"] == "old-head"
     assert archived_review["round"] == 1
@@ -4368,8 +4383,8 @@ def test_outer_loop_uses_state_as_contract(tmp_path: Path, monkeypatch) -> None:
     orchestrator.REVIEW_REPORT.write_text(
         json.dumps(
             {
-                "task_id": "old-task",
-                "round": 99,
+                "task_id": "T-604",
+                "round": 1,
                 "decision": "changes_required",
                 "blocking_issues": [{"id": "OLD"}],
                 "non_blocking_suggestions": [],
@@ -6026,6 +6041,29 @@ class TestCmdReport:
         payload = json.loads(out[json_start:] if json_start >= 0 else out)
         assert payload["task_id"] == "T-999"
         assert payload["goal"] == ""
+
+    def test_fails_when_archived_review_report_task_id_mismatches(self, tmp_path: Path, monkeypatch, capsys) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        orchestrator.STATE_FILE.write_text(
+            json.dumps(
+                {"state": "done", "round": 1, "task_id": "T-999", "base_sha": "base-sha", "outcome": "approved"},
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        archive_dir = orchestrator.LOOP_DIR / "archive" / "T-999"
+        archive_dir.mkdir(parents=True)
+        (archive_dir / "r1_review_report.json").write_text(
+            json.dumps({"task_id": "T-998", "round": 1, "decision": "approve"}, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            orchestrator.cmd_report("T-999", output_format="json")
+
+        assert exc.value.code == orchestrator.EXIT_VALIDATION_ERROR
+        assert "field 'task_id' mismatch" in capsys.readouterr().err
 
 
 class TestMainDiffAndReportCommands:

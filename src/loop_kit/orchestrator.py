@@ -547,12 +547,67 @@ def _task_handoff_dir(task_id: str, paths: LoopPaths | None = None) -> Path:
     return _HANDOFF_DIR / task_id
 
 
+def _parse_artifact_identity(payload: object, *, artifact_label: str) -> tuple[str, int]:
+    if not isinstance(payload, dict):
+        raise ValidationError(f"{artifact_label} must be a JSON object")
+    raw_task_id = payload.get("task_id")
+    if not isinstance(raw_task_id, str) or not raw_task_id.strip():
+        raise ValidationError(f"{artifact_label} missing required non-empty field 'task_id'")
+    raw_round = payload.get("round")
+    if type(raw_round) is not int:
+        raise ValidationError(
+            f"{artifact_label} field 'round' must be int, got {type(raw_round).__name__}"
+        )
+    return raw_task_id, raw_round
+
+
+def _enforce_artifact_identity(
+    payload: object,
+    *,
+    artifact_label: str,
+    expected_task_id: str,
+    expected_round: int,
+) -> dict[str, object]:
+    actual_task_id, actual_round = _parse_artifact_identity(payload, artifact_label=artifact_label)
+    if actual_task_id != expected_task_id:
+        raise ValidationError(
+            f"{artifact_label} field 'task_id' mismatch: expected {expected_task_id!r}, got {actual_task_id!r}"
+        )
+    if actual_round != expected_round:
+        raise ValidationError(
+            f"{artifact_label} field 'round' mismatch: expected {expected_round}, got {actual_round!r}"
+        )
+    return cast(dict[str, object], payload)
+
+
 def _archive_bus_file(path: Path, task_id: str, round_num: int, suffix: str) -> Path | None:
     if not path.exists():
         return None
+    archive_round = round_num
+    if suffix in _ROUND_ARTIFACT_NAMES:
+        try:
+            payload = _load_json_with_limit(path, label=path.name)
+        except (ConfigError, json.JSONDecodeError, OSError) as e:
+            raise ValidationError(f"Unable to archive {path.name}: {e}") from e
+        artifact_label = f"{path.name} for archive suffix={suffix!r}"
+        artifact_task_id, artifact_round = _parse_artifact_identity(payload, artifact_label=artifact_label)
+        if artifact_task_id != task_id:
+            raise ValidationError(
+                f"{artifact_label} field 'task_id' mismatch: expected {task_id!r}, got {artifact_task_id!r}"
+            )
+        if suffix in {"work_report", "review_report"}:
+            if artifact_round > round_num:
+                raise ValidationError(
+                    f"{artifact_label} has future round {artifact_round}; current archive round is {round_num}"
+                )
+            archive_round = artifact_round
+        elif artifact_round != round_num:
+            raise ValidationError(
+                f"{artifact_label} field 'round' mismatch: expected {round_num}, got {artifact_round!r}"
+            )
     archive_dir = _task_archive_dir(task_id)
     archive_dir.mkdir(parents=True, exist_ok=True)
-    dest = archive_dir / f"r{round_num}_{suffix}.json"
+    dest = archive_dir / f"r{archive_round}_{suffix}.json"
     shutil.copy2(path, dest)
     return dest
 
@@ -5215,7 +5270,6 @@ def _wait_for_file(
     if show_manual_hint:
         print(f"\n  >>> Tell the {'Worker' if 'work' in path.name else 'Reviewer'} to process their input file. <<<\n")
     start_time = time.monotonic()
-    last_ignored_signature: tuple[int, int] | None = None
     while True:
         if expected_role is not None:
             alive, reason = _role_is_alive(expected_role, heartbeat_ttl_sec)
@@ -5223,22 +5277,25 @@ def _wait_for_file(
                 _log(f"Stopping wait: {reason}")
                 return None
         if path.exists():
-            stat = path.stat()
-            signature = (stat.st_mtime_ns, stat.st_size)
             data = _read_json_if_exists(path)
             if isinstance(data, dict):
-                task_id = data.get("task_id")
-                report_has_round = "round" in data
-                round_num = data.get("round")
-                if expected_task_id is not None and task_id != expected_task_id:
-                    last_ignored_signature = signature
-                elif expected_round is not None and report_has_round and round_num != expected_round:
-                    if signature != last_ignored_signature:
-                        _log(f"Ignoring stale {path.name}: expected round={expected_round}, got {round_num!r}")
-                        last_ignored_signature = signature
-                else:
-                    _log(f"Found {path.name}")
-                    return data
+                if expected_task_id is not None or expected_round is not None:
+                    artifact_label = f"{path.name} while waiting for {description}"
+                    artifact_task_id, artifact_round = _parse_artifact_identity(
+                        data,
+                        artifact_label=artifact_label,
+                    )
+                    expected_task = expected_task_id if expected_task_id is not None else artifact_task_id
+                    expected_round_num = expected_round if expected_round is not None else artifact_round
+                    if artifact_task_id != expected_task or artifact_round != expected_round_num:
+                        mismatch_kind = "cross-task" if artifact_task_id != expected_task else "stale"
+                        raise ValidationError(
+                            f"Detected {mismatch_kind} artifact in {path.name}: "
+                            f"expected task_id={expected_task!r} round={expected_round_num}, "
+                            f"got task_id={artifact_task_id!r} round={artifact_round}"
+                        )
+                _log(f"Found {path.name}")
+                return data
         elapsed = time.monotonic() - start_time
         if timeout_sec and elapsed >= timeout_sec:
             _log(f"Timeout ({timeout_sec}s) waiting for {path.name}")
@@ -5697,11 +5754,18 @@ def _load_archived_round_artifact(
             f"Missing archived artifact for task_id={task_id} round={round_num}: {path.name}"
         )
     try:
-        return _load_json_with_limit(path, label=path.name)
+        payload = _load_json_with_limit(path, label=path.name)
     except (ConfigError, json.JSONDecodeError, OSError) as e:
         raise ValidationError(
             f"Unable to load archived artifact for task_id={task_id} round={round_num}: {path.name} ({e})"
         ) from e
+    _enforce_artifact_identity(
+        payload,
+        artifact_label=f"archived artifact {path.name}",
+        expected_task_id=task_id,
+        expected_round=round_num,
+    )
+    return payload
 
 
 def _json_for_diff(payload: object) -> str:
@@ -5798,8 +5862,13 @@ def _round_artifact_payload_for_report(
 ) -> dict[str, object] | None:
     resolved_paths = _resolve_paths(paths)
     archive_path = _archive_round_artifact_path(task_id, round_num, artifact_name, paths=resolved_paths)
-    archive_data = _read_json_if_exists(archive_path)
-    if isinstance(archive_data, dict):
+    if archive_path.exists():
+        archive_data = _load_archived_round_artifact(
+            task_id,
+            round_num,
+            artifact_name,
+            paths=resolved_paths,
+        )
         return cast(dict[str, object], archive_data)
     live_path: Path | None = None
     if artifact_name == "state":

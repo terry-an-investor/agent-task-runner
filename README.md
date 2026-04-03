@@ -116,7 +116,7 @@ loop dispatch-metrics --task-id T-715 --role worker
 | `--artifact all\|state\|work_report\|review_report` | all | Which archived artifact to diff |
 | `--loop-dir PATH` | .loop | Loop bus directory |
 
-The command compares archived `state`, `work_report`, and/or `review_report` JSON artifacts between two rounds and prints a deterministic unified diff. Missing rounds or missing required artifacts fail fast with a validation error.
+The command compares archived `state`, `work_report`, and/or `review_report` JSON artifacts between two rounds and prints a deterministic unified diff. Missing rounds, missing required artifacts, or archive identity mismatches (`task_id`/`round` not matching filename routing) fail fast with a validation error.
 
 ### `loop report` flags
 
@@ -126,7 +126,7 @@ The command compares archived `state`, `work_report`, and/or `review_report` JSO
 | `--format json\|markdown` | json | Output format |
 | `--loop-dir PATH` | .loop | Loop bus directory |
 
-`--format markdown` renders a deterministic task summary including goal, status, rounds, per-round decisions, and changed files when available.
+`--format markdown` renders a deterministic task summary including goal, status, rounds, per-round decisions, and changed files when available. The report command only consumes artifacts whose payload identity matches the requested task and round; inconsistent archived artifacts fail with validation errors.
 
 ### `loop knowledge` commands
 
@@ -362,7 +362,7 @@ Dispatch logs (`.loop/logs/*_dispatch.log`) redact common sensitive values befor
 
 ### Archive
 
-All bus files are archived to `.loop/archive/{task_id}/r{N}_{name}.json` before being overwritten, preserving full round history.
+Round artifacts are archived to `.loop/archive/{task_id}/r{N}_{name}.json` using payload identity (`task_id`, `round`) before overwrite, preserving deterministic round history and rejecting cross-task writes.
 
 ## Architecture
 
