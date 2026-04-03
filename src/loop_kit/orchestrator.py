@@ -6,6 +6,8 @@ Usage:
     loop index                                   # build offline module map
     loop run --task .loop/task_card.json         # full loop
     loop status                                  # show current state
+    loop diff --task-id T-604 --base-round 1 --head-round 2
+    loop report --task-id T-604 --format markdown
     loop archive --task-id T-604                 # list archived bus files
     loop extract-diff BASE HEAD                  # manual diff extraction
 
@@ -21,6 +23,7 @@ All messages are JSON. Git commits are the single source of truth.
 import argparse
 import ast
 import contextlib
+import difflib
 import hashlib
 import importlib.metadata
 import importlib.resources
@@ -208,6 +211,7 @@ _DISPATCH_PHASE_ROLE_CHOICES = ("all", "worker", "reviewer")
 _DISPATCH_PHASE_METRIC_NAMES = ("startup_ms", "context_to_work_ms", "work_to_artifact_ms", "total_ms")
 _DISPATCH_SUBPHASE_NAMES = ("read", "search", "edit", "test", "unknown")
 _DISPATCH_SUBPHASE_METRIC_NAMES = tuple(f"{name}_ms" for name in _DISPATCH_SUBPHASE_NAMES)
+_ROUND_ARTIFACT_NAMES = ("state", "work_report", "review_report")
 EXIT_OK = 0
 EXIT_GENERAL_ERROR = 1
 EXIT_TIMEOUT = 2
@@ -2777,12 +2781,8 @@ def _normalize_pattern_entry(
 
 
 def _write_patterns_jsonl(entries: list[dict]) -> None:
-    _PATTERNS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    payload = "".join(
-        json.dumps({k: v for k, v in item.items() if k != "source_version"}, ensure_ascii=False) + "\n"
-        for item in entries
-    )
-    _PATTERNS_FILE.write_text(payload, encoding="utf-8")
+    normalized_entries = [{k: v for k, v in item.items() if k != "source_version"} for item in entries]
+    _atomic_write_jsonl(_PATTERNS_FILE, normalized_entries)
 
 
 def _read_jsonl_entries(path: Path) -> list[dict]:
@@ -3131,6 +3131,16 @@ def _parse_non_negative_int_arg(value: str) -> int:
         raise argparse.ArgumentTypeError("value must be a non-negative integer") from exc
     if parsed < 0:
         raise argparse.ArgumentTypeError("value must be a non-negative integer")
+    return parsed
+
+
+def _parse_positive_int_arg(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("value must be a positive integer") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("value must be a positive integer")
     return parsed
 
 
@@ -4378,6 +4388,33 @@ def _coerce_str_config(value: object, *, field_name: str) -> str:
     return normalized
 
 
+def _coerce_backend_preference_config(value: object, *, field_name: str) -> list[str]:
+    if isinstance(value, str):
+        entries = [part.strip() for part in value.split(",") if part.strip()]
+        if entries:
+            return entries
+        raise ValidationError(f"{field_name} must include at least one backend name")
+    if not isinstance(value, list):
+        raise ValidationError(
+            f"{field_name} must be a comma-separated string or list of non-empty strings, got {value!r}"
+        )
+    if not value:
+        return []
+    normalized: list[str] = []
+    for item in value:
+        normalized.append(_coerce_str_config(item, field_name=f"{field_name} item"))
+    return normalized
+
+
+def _validate_registered_backend_name(value: str, *, field_name: str) -> None:
+    normalized = value.strip().lower()
+    if not normalized:
+        raise ValidationError(f"{field_name} must be a non-empty string")
+    if normalized not in _BACKEND_REGISTRY:
+        registered = ", ".join(_available_backends()) or "<none>"
+        raise ValidationError(f"{field_name} must be one of: {registered}; got {value!r}")
+
+
 def _validate_run_config(config: RunConfig) -> None:
     int_rules = (
         ("max_rounds", config.max_rounds, 1),
@@ -4399,13 +4436,24 @@ def _validate_run_config(config: RunConfig) -> None:
     ):
         _coerce_bool_config(value, field_name=bool_name)
     _coerce_str_config(config.task_path, field_name="task_path")
-    _coerce_str_config(config.dispatch_backend, field_name="dispatch_backend")
-    _coerce_str_config(config.worker_backend, field_name="worker_backend")
-    _coerce_str_config(config.reviewer_backend, field_name="reviewer_backend")
+    dispatch_backend = _coerce_str_config(config.dispatch_backend, field_name="dispatch_backend")
+    if dispatch_backend.strip().lower() != DISPATCH_BACKEND_NATIVE:
+        raise ValidationError(f"dispatch_backend must be {DISPATCH_BACKEND_NATIVE!r}, got {dispatch_backend!r}")
+    _validate_registered_backend_name(
+        _coerce_str_config(config.worker_backend, field_name="worker_backend"),
+        field_name="worker_backend",
+    )
+    _validate_registered_backend_name(
+        _coerce_str_config(config.reviewer_backend, field_name="reviewer_backend"),
+        field_name="reviewer_backend",
+    )
     if not isinstance(config.backend_preference, list):
         raise ValidationError("backend_preference must be a list of backend names")
     for item in config.backend_preference:
-        _coerce_str_config(item, field_name="backend_preference item")
+        _validate_registered_backend_name(
+            _coerce_str_config(item, field_name="backend_preference item"),
+            field_name="backend_preference item",
+        )
 
 
 def _load_env_config() -> dict:
@@ -4900,12 +4948,19 @@ def _resolve_archive_restore_source(archive_dir: Path, restore_name: str) -> Pat
     return source
 
 
+def _validate_task_id_arg(task_id: str) -> str:
+    normalized = task_id.strip()
+    if not normalized:
+        raise ValidationError("task_id must not be empty")
+    if ".." in normalized or "/" in normalized or "\\" in normalized:
+        raise ValidationError("invalid task_id (path traversal not allowed)")
+    return normalized
+
+
 def cmd_archive(task_id: str, restore: str | None = None, paths: LoopPaths | None = None) -> None:
     resolved_paths = _resolve_paths(paths)
     try:
-        if ".." in task_id or "/" in task_id or "\\" in task_id:
-            print("Error: invalid task_id (path traversal not allowed)", file=sys.stderr)
-            raise LoopKitError("Invalid task_id")
+        task_id = _validate_task_id_arg(task_id)
         archive_dir = _task_archive_dir(task_id, paths=resolved_paths)
         if restore is None:
             if not archive_dir.exists():
@@ -4936,8 +4991,9 @@ def cmd_archive(task_id: str, restore: str | None = None, paths: LoopPaths | Non
         dest = resolved_paths.dir / target_name
         shutil.copy2(src, dest)
         print(f"Restored {src.name} -> {dest}")
-    except ValidationError:
-        sys.exit(EXIT_VALIDATION_ERROR)
+    except ValidationError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(EXIT_GENERAL_ERROR)
     except LoopKitError:
         sys.exit(EXIT_GENERAL_ERROR)
 
@@ -4951,6 +5007,297 @@ def cmd_extract_diff(base: str, head: str) -> None:
                 raise LoopKitError(f"Invalid git ref: {ref}")
         print(_diff(base, head))
     except ValidationError:
+        sys.exit(EXIT_VALIDATION_ERROR)
+    except LoopKitError:
+        sys.exit(EXIT_GENERAL_ERROR)
+
+
+def _archive_round_artifact_path(
+    task_id: str,
+    round_num: int,
+    artifact_name: str,
+    *,
+    paths: LoopPaths | None = None,
+) -> Path:
+    return _task_archive_dir(task_id, paths=paths) / f"r{round_num}_{artifact_name}.json"
+
+
+def _archive_has_round_artifacts(archive_dir: Path, round_num: int) -> bool:
+    return any(path.is_file() for path in archive_dir.glob(f"r{round_num}_*.json"))
+
+
+def _load_archived_round_artifact(
+    task_id: str,
+    round_num: int,
+    artifact_name: str,
+    *,
+    paths: LoopPaths | None = None,
+) -> object:
+    path = _archive_round_artifact_path(task_id, round_num, artifact_name, paths=paths)
+    if not path.exists():
+        raise ValidationError(
+            f"Missing archived artifact for task_id={task_id} round={round_num}: {path.name}"
+        )
+    try:
+        return _load_json_with_limit(path, label=path.name)
+    except (ConfigError, json.JSONDecodeError, OSError) as e:
+        raise ValidationError(
+            f"Unable to load archived artifact for task_id={task_id} round={round_num}: {path.name} ({e})"
+        ) from e
+
+
+def _json_for_diff(payload: object) -> str:
+    return json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True) + "\n"
+
+
+def cmd_diff(
+    task_id: str,
+    base_round: int,
+    head_round: int,
+    *,
+    artifact: str = "all",
+    paths: LoopPaths | None = None,
+) -> None:
+    resolved_paths = _resolve_paths(paths)
+    try:
+        task_id = _validate_task_id_arg(task_id)
+        base_round = _coerce_int_config(base_round, field_name="base_round", minimum=1)
+        head_round = _coerce_int_config(head_round, field_name="head_round", minimum=1)
+        if base_round == head_round:
+            raise ValidationError("base_round and head_round must differ")
+        if artifact != "all" and artifact not in _ROUND_ARTIFACT_NAMES:
+            raise ValidationError(
+                f"artifact must be one of: all, {', '.join(_ROUND_ARTIFACT_NAMES)}; got {artifact!r}"
+            )
+
+        archive_dir = _task_archive_dir(task_id, paths=resolved_paths)
+        if not archive_dir.exists():
+            raise ValidationError(f"No archive directory for task_id={task_id}: {archive_dir}")
+        for round_num in (base_round, head_round):
+            if not _archive_has_round_artifacts(archive_dir, round_num):
+                raise ValidationError(f"No archived artifacts found for task_id={task_id} round={round_num}")
+
+        selected_artifacts = _ROUND_ARTIFACT_NAMES if artifact == "all" else (artifact,)
+        for i, artifact_name in enumerate(selected_artifacts):
+            base_payload = _load_archived_round_artifact(
+                task_id,
+                base_round,
+                artifact_name,
+                paths=resolved_paths,
+            )
+            head_payload = _load_archived_round_artifact(
+                task_id,
+                head_round,
+                artifact_name,
+                paths=resolved_paths,
+            )
+            base_text = _json_for_diff(base_payload)
+            head_text = _json_for_diff(head_payload)
+            diff_lines = list(
+                difflib.unified_diff(
+                    base_text.splitlines(),
+                    head_text.splitlines(),
+                    fromfile=f"r{base_round}_{artifact_name}.json",
+                    tofile=f"r{head_round}_{artifact_name}.json",
+                    lineterm="",
+                )
+            )
+            if artifact == "all":
+                print(f"## {artifact_name}")
+            if diff_lines:
+                print("\n".join(diff_lines))
+            else:
+                print("(no changes)")
+            if i != len(selected_artifacts) - 1:
+                print()
+    except ValidationError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(EXIT_VALIDATION_ERROR)
+    except LoopKitError:
+        sys.exit(EXIT_GENERAL_ERROR)
+
+
+def _archive_rounds_for_task(task_id: str, *, paths: LoopPaths | None = None) -> list[int]:
+    archive_dir = _task_archive_dir(task_id, paths=paths)
+    if not archive_dir.exists():
+        return []
+    pattern = re.compile(r"^r(\d+)_(state|work_report|review_report)\.json$")
+    rounds: set[int] = set()
+    for path in archive_dir.glob("r*_*.json"):
+        match = pattern.match(path.name)
+        if match is None:
+            continue
+        rounds.add(int(match.group(1)))
+    return sorted(rounds)
+
+
+def _round_artifact_payload_for_report(
+    task_id: str,
+    round_num: int,
+    artifact_name: str,
+    *,
+    paths: LoopPaths | None = None,
+) -> dict[str, object] | None:
+    resolved_paths = _resolve_paths(paths)
+    archive_path = _archive_round_artifact_path(task_id, round_num, artifact_name, paths=resolved_paths)
+    archive_data = _read_json_if_exists(archive_path)
+    if isinstance(archive_data, dict):
+        return cast(dict[str, object], archive_data)
+    live_path: Path | None = None
+    if artifact_name == "state":
+        live_path = resolved_paths.state
+    elif artifact_name == "work_report":
+        live_path = resolved_paths.work_report
+    elif artifact_name == "review_report":
+        live_path = resolved_paths.review_report
+    if live_path is None:
+        return None
+    live_data = _read_json_if_exists(live_path)
+    if not isinstance(live_data, dict):
+        return None
+    live_task_id = live_data.get("task_id")
+    live_round = live_data.get("round")
+    if live_task_id != task_id or live_round != round_num:
+        return None
+    return cast(dict[str, object], live_data)
+
+
+def _build_task_report(task_id: str, *, paths: LoopPaths | None = None) -> dict[str, object]:
+    resolved_paths = _resolve_paths(paths)
+    state = _load_state(paths=resolved_paths)
+    task_card_data = _read_json_if_exists(resolved_paths.task_card)
+    goal = ""
+    if isinstance(task_card_data, dict):
+        task_card_goal = task_card_data.get("goal")
+        if isinstance(task_card_goal, str):
+            goal = task_card_goal.strip()
+
+    state_task_id = state.get("task_id")
+    state_status = "unknown"
+    state_outcome: str | None = None
+    state_round = 0
+    if state_task_id == task_id:
+        status = state.get("state")
+        if isinstance(status, str) and status.strip():
+            state_status = status.strip()
+        outcome = state.get("outcome")
+        if isinstance(outcome, str) and outcome.strip():
+            state_outcome = outcome.strip()
+        round_value = state.get("round")
+        if isinstance(round_value, int) and round_value > 0:
+            state_round = round_value
+
+    archived_rounds = _archive_rounds_for_task(task_id, paths=resolved_paths)
+    rounds = sorted(set(archived_rounds + ([state_round] if state_round > 0 else [])))
+
+    decisions: list[dict[str, object]] = []
+    changed_files: list[dict[str, object]] = []
+    for round_num in rounds:
+        review = _round_artifact_payload_for_report(
+            task_id,
+            round_num,
+            "review_report",
+            paths=resolved_paths,
+        )
+        if isinstance(review, dict):
+            decision = review.get("decision")
+            if isinstance(decision, str) and decision.strip():
+                decisions.append({"round": round_num, "decision": decision.strip()})
+
+        work = _round_artifact_payload_for_report(
+            task_id,
+            round_num,
+            "work_report",
+            paths=resolved_paths,
+        )
+        if isinstance(work, dict):
+            raw_files = work.get("files_changed")
+            files: list[str] = []
+            if isinstance(raw_files, list):
+                files = sorted({item.strip() for item in raw_files if isinstance(item, str) and item.strip()})
+            if files:
+                changed_files.append({"round": round_num, "files": files})
+
+    return {
+        "task_id": task_id,
+        "goal": goal,
+        "status": state_status,
+        "outcome": state_outcome,
+        "current_round": state_round,
+        "rounds": rounds,
+        "decisions": decisions,
+        "changed_files": changed_files,
+    }
+
+
+def _render_task_report_markdown(report: dict[str, object]) -> str:
+    rounds = report.get("rounds")
+    round_text = ", ".join(str(item) for item in rounds) if isinstance(rounds, list) and rounds else "none"
+    lines = [
+        f"# Task Report: {report.get('task_id', '')}",
+        "",
+        f"- Goal: {report.get('goal') or '<unknown>'}",
+        f"- Status: {report.get('status') or 'unknown'}",
+        f"- Outcome: {report.get('outcome') or 'n/a'}",
+        f"- Current round: {report.get('current_round') or 0}",
+        f"- Rounds: {round_text}",
+        "",
+        "## Decisions",
+    ]
+    decisions = report.get("decisions")
+    if isinstance(decisions, list) and decisions:
+        for item in decisions:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"- r{item.get('round')}: {item.get('decision')}")
+    else:
+        lines.append("- none")
+
+    lines.extend(
+        [
+            "",
+            "## Changed Files",
+        ]
+    )
+    changed_files = report.get("changed_files")
+    if isinstance(changed_files, list) and changed_files:
+        for item in changed_files:
+            if not isinstance(item, dict):
+                continue
+            files = item.get("files")
+            if isinstance(files, list) and files:
+                lines.append(f"- r{item.get('round')}: {', '.join(str(name) for name in files)}")
+    else:
+        lines.append("- none")
+    return "\n".join(lines)
+
+
+def cmd_report(
+    task_id: str | None,
+    *,
+    output_format: Literal["json", "markdown"] = "json",
+    paths: LoopPaths | None = None,
+) -> None:
+    resolved_paths = _resolve_paths(paths)
+    try:
+        resolved_task_id = task_id
+        if resolved_task_id is None:
+            state = _load_state(paths=resolved_paths)
+            raw_task_id = state.get("task_id")
+            resolved_task_id = raw_task_id if isinstance(raw_task_id, str) else None
+        if resolved_task_id is None:
+            raise ValidationError("task_id is required (provide --task-id or ensure state.json has task_id)")
+        resolved_task_id = _validate_task_id_arg(resolved_task_id)
+
+        report = _build_task_report(resolved_task_id, paths=resolved_paths)
+        if output_format == "markdown":
+            print(_render_task_report_markdown(report))
+            return
+        if output_format != "json":
+            raise ValidationError(f"unsupported report format: {output_format}")
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    except ValidationError as e:
+        print(f"Error: {e}", file=sys.stderr)
         sys.exit(EXIT_VALIDATION_ERROR)
     except LoopKitError:
         sys.exit(EXIT_GENERAL_ERROR)
@@ -6473,6 +6820,37 @@ def main() -> None:
     diff_p.add_argument("base")
     diff_p.add_argument("head")
 
+    rounds_diff_p = sub.add_parser("diff", parents=[shared], help="Diff archived round artifacts")
+    rounds_diff_p.add_argument("--task-id", required=True, help="Task ID archive key (e.g. T-604)")
+    rounds_diff_p.add_argument(
+        "--base-round",
+        required=True,
+        type=_parse_positive_int_arg,
+        help="Base archive round number (>=1)",
+    )
+    rounds_diff_p.add_argument(
+        "--head-round",
+        required=True,
+        type=_parse_positive_int_arg,
+        help="Head archive round number (>=1)",
+    )
+    rounds_diff_p.add_argument(
+        "--artifact",
+        choices=["all", *_ROUND_ARTIFACT_NAMES],
+        default="all",
+        help="Artifact to diff (default: all)",
+    )
+
+    report_p = sub.add_parser("report", parents=[shared], help="Summarize task state and archived round outcomes")
+    report_p.add_argument("--task-id", default=None, help="Task ID (defaults to state.json task_id)")
+    report_p.add_argument(
+        "--format",
+        dest="report_format",
+        choices=["json", "markdown"],
+        default="json",
+        help="Output format (default: json)",
+    )
+
     archive_p = sub.add_parser("archive", parents=[shared], help="List or restore archived bus files")
     archive_p.add_argument("--task-id", required=True, help="Task ID archive key (e.g. T-604)")
     archive_p.add_argument(
@@ -6590,6 +6968,15 @@ def main() -> None:
             cmd_heartbeat(args.role, args.interval)
         elif args.cmd == "extract-diff":
             cmd_extract_diff(args.base, args.head)
+        elif args.cmd == "diff":
+            cmd_diff(
+                args.task_id,
+                args.base_round,
+                args.head_round,
+                artifact=args.artifact,
+            )
+        elif args.cmd == "report":
+            cmd_report(args.task_id, output_format=args.report_format)
         elif args.cmd == "archive":
             cmd_archive(args.task_id, args.restore)
         elif args.cmd == "knowledge":
@@ -6652,7 +7039,10 @@ def main() -> None:
                     _cfg_val(args.reviewer_backend, "reviewer_backend", DEFAULT_REVIEWER_BACKEND),
                     field_name="reviewer_backend",
                 ),
-                backend_preference=_normalize_backend_preference(_cfg_val(None, "backend_preference", [])),
+                backend_preference=_coerce_backend_preference_config(
+                    _cfg_val(None, "backend_preference", []),
+                    field_name="backend_preference",
+                ),
                 dispatch_timeout=_coerce_int_config(
                     _cfg_val(args.dispatch_timeout, "dispatch_timeout", DEFAULT_DISPATCH_TIMEOUT_SEC),
                     field_name="dispatch_timeout",

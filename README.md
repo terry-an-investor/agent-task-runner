@@ -55,6 +55,8 @@ loop dispatch-metrics      Summarize dispatch phase latency metrics from feed lo
 loop heartbeat             Write role heartbeat continuously
 loop archive               List or restore archived bus files
 loop extract-diff BASE HEAD  Print git diff between two commits
+loop diff                  Compare archived artifacts between two rounds
+loop report                Summarize task progress from state/archive artifacts
 ```
 
 ### `loop run` flags
@@ -96,6 +98,28 @@ Example:
 ```bash
 loop dispatch-metrics --task-id T-715 --role worker
 ```
+
+### `loop diff` flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--task-id ID` | required | Task ID archive key (for example `T-604`) |
+| `--base-round N` | required | Base archive round number (`>=1`) |
+| `--head-round N` | required | Head archive round number (`>=1`) |
+| `--artifact all\|state\|work_report\|review_report` | all | Which archived artifact to diff |
+| `--loop-dir PATH` | .loop | Loop bus directory |
+
+The command compares archived `state`, `work_report`, and/or `review_report` JSON artifacts between two rounds and prints a deterministic unified diff. Missing rounds or missing required artifacts fail fast with a validation error.
+
+### `loop report` flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--task-id ID` | from `state.json` | Task ID to summarize |
+| `--format json\|markdown` | json | Output format |
+| `--loop-dir PATH` | .loop | Loop bus directory |
+
+`--format markdown` renders a deterministic task summary including goal, status, rounds, per-round decisions, and changed files when available.
 
 ### `loop knowledge` commands
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import builtins
 import hashlib
 import json
@@ -8,6 +9,7 @@ import signal
 import subprocess
 import sys
 import threading
+import types
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -5122,10 +5124,13 @@ class TestLoadState:
 
     def test_rejects_oversized_state_json(self, tmp_path: Path, monkeypatch) -> None:
         _configure_loop_paths(monkeypatch, tmp_path)
-        orchestrator.STATE_FILE.write_text('{"state":"idle","round":0,"padding":"' + ("x" * 128) + '"}', encoding="utf-8")
+        orchestrator.STATE_FILE.write_text(
+            '{"state":"idle","round":0,"padding":"' + ("x" * 128) + '"}',
+            encoding="utf-8",
+        )
         monkeypatch.setattr(orchestrator, "MAX_JSON_PAYLOAD_BYTES", 64)
 
-        with pytest.raises(orchestrator.ConfigError, match="state.json rejected"):
+        with pytest.raises(orchestrator.ConfigError, match=r"state\.json rejected"):
             orchestrator._load_state()
 
 
@@ -5479,6 +5484,200 @@ class TestCmdExtractDiff:
         assert capsys.readouterr().out.strip() == "diff abc..def"
 
 
+class TestCmdDiff:
+    def test_prints_unified_diff_for_work_report(self, tmp_path: Path, monkeypatch, capsys) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        archive_dir = orchestrator.LOOP_DIR / "archive" / "T-701"
+        archive_dir.mkdir(parents=True)
+        (archive_dir / "r1_work_report.json").write_text(
+            json.dumps({"task_id": "T-701", "round": 1, "files_changed": ["alpha.py"]}, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        (archive_dir / "r2_work_report.json").write_text(
+            json.dumps({"task_id": "T-701", "round": 2, "files_changed": ["beta.py"]}, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+
+        orchestrator.cmd_diff("T-701", 1, 2, artifact="work_report")
+        out = capsys.readouterr().out
+
+        assert "--- r1_work_report.json" in out
+        assert "+++ r2_work_report.json" in out
+        assert "alpha.py" in out
+        assert "beta.py" in out
+
+    def test_reports_clear_error_when_round_is_missing(self, tmp_path: Path, monkeypatch, capsys) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        archive_dir = orchestrator.LOOP_DIR / "archive" / "T-701"
+        archive_dir.mkdir(parents=True)
+        (archive_dir / "r1_state.json").write_text('{"round": 1}\n', encoding="utf-8")
+
+        with pytest.raises(SystemExit) as exc:
+            orchestrator.cmd_diff("T-701", 1, 2)
+
+        assert exc.value.code == orchestrator.EXIT_VALIDATION_ERROR
+        assert "No archived artifacts found for task_id=T-701 round=2" in capsys.readouterr().err
+
+    def test_reports_missing_artifact_with_round_context(self, tmp_path: Path, monkeypatch, capsys) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        archive_dir = orchestrator.LOOP_DIR / "archive" / "T-701"
+        archive_dir.mkdir(parents=True)
+        (archive_dir / "r1_state.json").write_text('{"round": 1}\n', encoding="utf-8")
+        (archive_dir / "r2_state.json").write_text('{"round": 2}\n', encoding="utf-8")
+
+        with pytest.raises(SystemExit) as exc:
+            orchestrator.cmd_diff("T-701", 1, 2, artifact="work_report")
+
+        assert exc.value.code == orchestrator.EXIT_VALIDATION_ERROR
+        assert "Missing archived artifact for task_id=T-701 round=1: r1_work_report.json" in capsys.readouterr().err
+
+
+class TestCmdReport:
+    def test_markdown_render_is_deterministic(self, tmp_path: Path, monkeypatch, capsys) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        orchestrator.TASK_CARD.write_text(
+            json.dumps({"task_id": "T-702", "goal": "Produce markdown report"}, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        orchestrator.STATE_FILE.write_text(
+            json.dumps(
+                {
+                    "state": "awaiting_work",
+                    "round": 3,
+                    "task_id": "T-702",
+                    "base_sha": "base-sha",
+                    "outcome": "changes_required",
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        archive_dir = orchestrator.LOOP_DIR / "archive" / "T-702"
+        archive_dir.mkdir(parents=True)
+        (archive_dir / "r1_work_report.json").write_text(
+            json.dumps({"task_id": "T-702", "round": 1, "files_changed": ["b.py", "a.py"]}, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        (archive_dir / "r1_review_report.json").write_text(
+            json.dumps({"task_id": "T-702", "round": 1, "decision": "changes_required"}, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        (archive_dir / "r2_review_report.json").write_text(
+            json.dumps({"task_id": "T-702", "round": 2, "decision": "approve"}, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+
+        orchestrator.cmd_report("T-702", output_format="markdown")
+        out = capsys.readouterr().out
+
+        assert "# Task Report: T-702" in out
+        assert "- Goal: Produce markdown report" in out
+        assert "- Status: awaiting_work" in out
+        assert "- Outcome: changes_required" in out
+        assert "- Current round: 3" in out
+        assert "- Rounds: 1, 2, 3" in out
+        assert "## Decisions" in out
+        assert "- r1: changes_required" in out
+        assert "- r2: approve" in out
+        assert "## Changed Files" in out
+        assert "- r1: a.py, b.py" in out
+
+    def test_uses_state_task_id_when_argument_omitted(self, tmp_path: Path, monkeypatch, capsys) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        orchestrator.STATE_FILE.write_text(
+            json.dumps(
+                {"state": "awaiting_work", "round": 1, "task_id": "T-703", "base_sha": "base-sha"},
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        orchestrator.cmd_report(None, output_format="json")
+        out = capsys.readouterr().out
+        json_start = out.find("{")
+        payload = json.loads(out[json_start:] if json_start >= 0 else out)
+        assert payload["task_id"] == "T-703"
+
+    def test_requires_task_id_when_state_missing(self, tmp_path: Path, monkeypatch, capsys) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        orchestrator.STATE_FILE.write_text(
+            json.dumps({"state": "idle", "round": 0}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            orchestrator.cmd_report(None, output_format="markdown")
+
+        assert exc.value.code == orchestrator.EXIT_VALIDATION_ERROR
+        assert "task_id is required" in capsys.readouterr().err
+
+
+class TestMainDiffAndReportCommands:
+    def test_main_dispatches_diff_command(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        captured: dict[str, object] = {}
+
+        def _fake_cmd_diff(
+            task_id: str,
+            base_round: int,
+            head_round: int,
+            *,
+            artifact: str = "all",
+            paths=None,
+        ) -> None:
+            _ = paths
+            captured["task_id"] = task_id
+            captured["base_round"] = base_round
+            captured["head_round"] = head_round
+            captured["artifact"] = artifact
+
+        monkeypatch.setattr(orchestrator, "cmd_diff", _fake_cmd_diff)
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "orchestrator.py",
+                "diff",
+                "--loop-dir",
+                ".loop",
+                "--task-id",
+                "T-704",
+                "--base-round",
+                "1",
+                "--head-round",
+                "2",
+                "--artifact",
+                "state",
+            ],
+        )
+
+        orchestrator.main()
+
+        assert captured == {"task_id": "T-704", "base_round": 1, "head_round": 2, "artifact": "state"}
+
+    def test_main_dispatches_report_command(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        captured: dict[str, object] = {}
+
+        def _fake_cmd_report(task_id: str | None, *, output_format: str = "json", paths=None) -> None:
+            _ = paths
+            captured["task_id"] = task_id
+            captured["output_format"] = output_format
+
+        monkeypatch.setattr(orchestrator, "cmd_report", _fake_cmd_report)
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["orchestrator.py", "report", "--loop-dir", ".loop", "--task-id", "T-705", "--format", "markdown"],
+        )
+
+        orchestrator.main()
+
+        assert captured == {"task_id": "T-705", "output_format": "markdown"}
+
+
 class TestRestoreTargetNameFromArchive:
     def test_round_prefixed(self) -> None:
         assert orchestrator._restore_target_name_from_archive("r1_state") == "state.json"
@@ -5655,6 +5854,41 @@ class TestAtomicWriteJson:
         orchestrator._atomic_write_json(target, {"new": True})
         data = json.loads(target.read_text(encoding="utf-8"))
         assert data == {"new": True}
+
+
+class TestWritePatternsJsonl:
+    def test_write_is_atomic_and_drops_source_version(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        target = orchestrator._PATTERNS_FILE
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text('{"pattern":"old","category":"legacy","confidence":0.1}\n', encoding="utf-8")
+
+        replace_calls: list[tuple[str, str]] = []
+        original_replace = orchestrator.Path.replace
+
+        def _spy_replace(self_path, other_path):
+            other = other_path if isinstance(other_path, Path) else Path(other_path)
+            replace_calls.append((self_path.name, other.name))
+            return original_replace(self_path, other_path)
+
+        monkeypatch.setattr(orchestrator.Path, "replace", _spy_replace)
+        orchestrator._write_patterns_jsonl(
+            [
+                {
+                    "pattern": "new",
+                    "category": "workflow",
+                    "confidence": 0.9,
+                    "source_version": "v1",
+                }
+            ]
+        )
+
+        payload = target.read_text(encoding="utf-8").strip().splitlines()
+        assert len(payload) == 1
+        row = json.loads(payload[0])
+        assert row == {"pattern": "new", "category": "workflow", "confidence": 0.9}
+        assert ("patterns.tmp", "patterns.jsonl") in replace_calls
+        assert not target.with_suffix(".tmp").exists()
 
 
 class TestCmdExtractDiffValidation:
@@ -5937,6 +6171,43 @@ class TestPathTraversalRejection:
             orchestrator.cmd_archive("T-001\\sub")
         assert exc.value.code == 1
         assert "path traversal" in capsys.readouterr().err
+
+
+class TestRegressionGuards:
+    def test_no_duplicate_exception_declarations(self) -> None:
+        source = Path(orchestrator.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+
+        duplicates: list[tuple[int, str]] = []
+
+        def _names(exc_type: ast.expr | None) -> list[str]:
+            if exc_type is None:
+                return []
+            if isinstance(exc_type, ast.Tuple):
+                return [ast.unparse(node) for node in exc_type.elts]
+            return [ast.unparse(exc_type)]
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Try):
+                continue
+            seen: set[str] = set()
+            for handler in node.handlers:
+                for name in _names(handler.type):
+                    if name in seen:
+                        duplicates.append((handler.lineno, name))
+                    seen.add(name)
+
+        assert duplicates == []
+
+    def test_stdout_callback_in_outer_round_loop_does_not_capture_round_num(self) -> None:
+        nested_lambdas = [
+            code
+            for code in orchestrator._run_multi_round_via_subprocess.__code__.co_consts
+            if isinstance(code, types.CodeType) and code.co_name == "<lambda>"
+        ]
+
+        assert nested_lambdas, "Expected lambda callback in _run_multi_round_via_subprocess"
+        assert all("round_num" not in code.co_freevars for code in nested_lambdas)
 
 
 class TestFlattenDepthLimit:
@@ -6222,6 +6493,35 @@ class TestConfigLoadingPrecedence:
 
         assert exc.value.code == orchestrator.EXIT_VALIDATION_ERROR
         assert "dispatch_timeout must be >= 0" in capsys.readouterr().err
+
+    def test_main_run_rejects_invalid_backend_preference_from_config(
+        self, tmp_path: Path, monkeypatch, capsys
+    ) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        config_path = tmp_path / ".loop" / "config.json"
+        config_path.write_text('{"backend_preference": 9}', encoding="utf-8")
+        monkeypatch.setattr(sys, "argv", ["orchestrator.py", "run", "--loop-dir", ".loop"])
+
+        with pytest.raises(SystemExit) as exc:
+            orchestrator.main()
+
+        assert exc.value.code == orchestrator.EXIT_VALIDATION_ERROR
+        assert (
+            "backend_preference must be a comma-separated string or list of non-empty strings"
+            in capsys.readouterr().err
+        )
+
+    def test_main_run_rejects_unknown_worker_backend_from_config(self, tmp_path: Path, monkeypatch, capsys) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        config_path = tmp_path / ".loop" / "config.json"
+        config_path.write_text('{"worker_backend": "ghost"}', encoding="utf-8")
+        monkeypatch.setattr(sys, "argv", ["orchestrator.py", "run", "--loop-dir", ".loop"])
+
+        with pytest.raises(SystemExit) as exc:
+            orchestrator.main()
+
+        assert exc.value.code == orchestrator.EXIT_VALIDATION_ERROR
+        assert "worker_backend must be one of" in capsys.readouterr().err
 
 
 class TestResetDefault:
