@@ -1,5 +1,7 @@
 # agent-task-runner
 
+[![ci](../../actions/workflows/loop-ci.yml/badge.svg)](../../actions/workflows/loop-ci.yml)
+
 PM-driven review-loop orchestrator for AI coding agents.
 
 agent-task-runner runs a multi-round review loop: a **Worker** writes code, a **Reviewer** checks it, and the loop repeats until approval or max rounds. It ships with built-in support for **OpenAI Codex**, **Anthropic Claude**, and **OpenCode** as worker/reviewer backends, with automatic dispatch and real-time streaming output. Need something different? Use `register_backend()` to plug in your own — no core modifications required.
@@ -27,6 +29,18 @@ loop run --task .loop/task_card.json --auto-dispatch --worker-backend codex --re
 - Python >= 3.11
 - Git repository (the orchestrator uses git commits as the source of truth)
 - At least one AI backend installed: [codex](https://github.com/openai/codex), [claude](https://docs.anthropic.com/en/docs/claude-code), or [opencode](https://opencode.ai)
+
+## CI
+
+GitHub Actions workflow [`loop-ci.yml`](.github/workflows/loop-ci.yml) runs on `push` to `main`/`master` and on `pull_request`.
+
+- `uv sync --frozen --group dev`
+- `uv run --group dev --with pytest-cov pytest --cov=src/loop_kit --cov-report=xml`
+- `uv run --group dev pytest -m integration` when integration-marked tests exist
+- `uv run --group dev ruff check src/loop_kit tests`
+- `uv run --group dev --with mypy mypy src/loop_kit` (optional, non-blocking)
+
+The workflow uploads `coverage.xml` to Codecov and stores JUnit XML test results as workflow artifacts.
 
 ## CLI Reference
 

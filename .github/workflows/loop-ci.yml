@@ -1,0 +1,79 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: ci
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            uv.lock
+            pyproject.toml
+
+      - name: Install dependencies
+        run: uv sync --frozen --group dev
+
+      - name: Run tests with coverage
+        run: uv run --group dev --with pytest-cov pytest --cov=src/loop_kit --cov-report=xml --junitxml=pytest-results.xml
+
+      - name: Run integration tests (if present)
+        shell: bash
+        run: |
+          if uv run python - <<'PY'
+          from pathlib import Path
+          import re
+          pattern = re.compile(r"pytest\.mark\.integration")
+          has_integration = any(
+              pattern.search(path.read_text(encoding="utf-8"))
+              for path in Path("tests").rglob("test_*.py")
+          )
+          raise SystemExit(0 if has_integration else 1)
+          PY
+          then
+            uv run --group dev pytest -m integration --junitxml=pytest-integration-results.xml
+          else
+            echo "No integration-marked tests found; skipping."
+          fi
+
+      - name: Run Ruff
+        run: uv run --group dev ruff check src/loop_kit tests
+
+      - name: Run mypy (optional)
+        continue-on-error: true
+        run: uv run --group dev --with mypy mypy src/loop_kit
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage.xml
+          fail_ci_if_error: false
+
+      - name: Upload pytest results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-results
+          path: |
+            pytest-results.xml
+            pytest-integration-results.xml
+          if-no-files-found: warn
