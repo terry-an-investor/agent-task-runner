@@ -1092,7 +1092,7 @@ def test_worker_prompt_round1_includes_task_card_section(monkeypatch) -> None:
         if path.name == "code-writer.md":
             return "CODE_WRITER_CONTENT"
         if path == orchestrator._worker_prompt_template_path():
-            return orchestrator.DEFAULT_WORKER_PROMPT_TEMPLATE
+            return None
         return None
 
     def fake_read_json(path: Path) -> dict | None:
@@ -1210,7 +1210,7 @@ def test_worker_prompt_round1_unchanged_includes_agents_and_function_index(monke
         if "code-writer.md" in str(path):
             return "CODE_WRITER_CONTENT"
         if path == orchestrator._worker_prompt_template_path():
-            return orchestrator.DEFAULT_WORKER_PROMPT_TEMPLATE
+            return None
         return None
 
     def fake_read_json(path: Path) -> dict | None:
@@ -1287,7 +1287,7 @@ def test_worker_prompt_round2_no_fix_list(monkeypatch) -> None:
     assert "fixes:\n- <none>" in prompt
 
 
-def test_worker_prompt_loads_template_when_file_exists(tmp_path: Path, monkeypatch) -> None:
+def test_worker_prompt_round1_ignores_template_file(tmp_path: Path, monkeypatch) -> None:
     _configure_loop_paths(monkeypatch, tmp_path)
     (tmp_path / "AGENTS.md").write_text("AGENTS_CONTENT", encoding="utf-8")
     role_path = tmp_path / "docs" / "roles" / "code-writer.md"
@@ -1297,7 +1297,7 @@ def test_worker_prompt_loads_template_when_file_exists(tmp_path: Path, monkeypat
         json.dumps(
             {
                 "task_id": "T-611",
-                "goal": "Use custom template",
+                "goal": "Build via sections",
                 "in_scope": [],
                 "out_of_scope": [],
                 "acceptance_criteria": [],
@@ -1316,15 +1316,13 @@ def test_worker_prompt_loads_template_when_file_exists(tmp_path: Path, monkeypat
 
     prompt = orchestrator._worker_prompt("T-611", 1)
 
-    assert prompt.startswith("CUSTOM T-611 1")
+    assert "CUSTOM" not in prompt
     assert "AGENTS_CONTENT" in prompt
     assert "CODE_WRITER_CONTENT" in prompt
-    assert "goal: Use custom template" in prompt
-    assert "AGENTS.md (Default)" not in prompt
-    assert "code-writer.md (Default)" not in prompt
+    assert "goal: Build via sections" in prompt
 
 
-def test_worker_prompt_raises_when_template_missing(tmp_path: Path, monkeypatch) -> None:
+def test_worker_prompt_round1_succeeds_without_template_file(tmp_path: Path, monkeypatch) -> None:
     _configure_loop_paths(monkeypatch, tmp_path)
     (tmp_path / "AGENTS.md").write_text("AGENTS_CONTENT", encoding="utf-8")
     role_path = tmp_path / "docs" / "roles" / "code-writer.md"
@@ -1334,7 +1332,7 @@ def test_worker_prompt_raises_when_template_missing(tmp_path: Path, monkeypatch)
         json.dumps(
             {
                 "task_id": "T-611",
-                "goal": "Fallback template",
+                "goal": "No template needed",
                 "in_scope": [],
                 "out_of_scope": [],
                 "acceptance_criteria": [],
@@ -1347,12 +1345,11 @@ def test_worker_prompt_raises_when_template_missing(tmp_path: Path, monkeypatch)
     template_path = orchestrator._worker_prompt_template_path()
     template_path.unlink(missing_ok=True)
 
-    with pytest.raises(RuntimeError) as exc:
-        orchestrator._worker_prompt("T-611", 1)
+    prompt = orchestrator._worker_prompt("T-611", 1)
 
-    message = str(exc.value)
-    assert "Missing required prompt template" in message
-    assert "Run 'loop init' to create it" in message
+    assert "AGENTS_CONTENT" in prompt
+    assert "CODE_WRITER_CONTENT" in prompt
+    assert "No template needed" in prompt
 
 
 def test_reviewer_prompt_includes_role_doc(monkeypatch) -> None:
@@ -1615,7 +1612,21 @@ def _configure_loop_paths(monkeypatch, tmp_path: Path) -> None:
     templates_dir = loop_dir / "templates"
     templates_dir.mkdir(parents=True, exist_ok=True)
     (templates_dir / "worker_prompt.txt").write_text(
-        orchestrator.DEFAULT_WORKER_PROMPT_TEMPLATE,
+        "Role: code-writer worker for PM loop.\n"
+        "Current task_id: {task_id}, round: {round_num}.\n"
+        "Execute the contract below and only finish after writing {work_report_path}.\n\n"
+        "=== BEGIN AGENTS.md ===\n"
+        "{agents_md}\n"
+        "=== END AGENTS.md ===\n\n"
+        "=== BEGIN docs/roles/code-writer.md ===\n"
+        "{role_md}\n"
+        "=== END docs/roles/code-writer.md ===\n\n"
+        "=== BEGIN FUNCTION INDEX: {orchestrator_path} ===\n"
+        "{function_index}\n"
+        "=== END FUNCTION INDEX ===\n\n"
+        "=== KNOWLEDGE ===\n{knowledge_section}\n\n"
+        "=== TASK PACKET ===\n{task_packet_section}\n\n"
+        "{task_card_section}{prior_context_section}",
         encoding="utf-8",
     )
     (templates_dir / "reviewer_prompt.txt").write_text(
@@ -4559,7 +4570,7 @@ class TestBuildTaskPacket:
             if path.name == "code-writer.md":
                 return "CODE_WRITER_CONTENT"
             if path == orchestrator._worker_prompt_template_path():
-                return orchestrator.DEFAULT_WORKER_PROMPT_TEMPLATE
+                return None
             return None
 
         def fake_read_json(path: Path) -> dict | None:
