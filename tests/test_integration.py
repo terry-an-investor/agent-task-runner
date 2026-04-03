@@ -224,6 +224,9 @@ def _subprocess_env(tmp_path: Path, *, mode: str = "ok", reviewer_decision: str 
     env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", "")
     env["FAKE_OPENCODE_MODE"] = mode
     env["FAKE_OPENCODE_REVIEW_DECISION"] = reviewer_decision
+    # Force UTF-8 encoding for Python subprocesses on Windows
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
 
     src_dir = Path(__file__).resolve().parents[1] / "src"
     current_py_path = env.get("PYTHONPATH", "")
