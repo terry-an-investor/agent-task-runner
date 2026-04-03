@@ -52,7 +52,7 @@ loop extract-diff BASE HEAD  Print git diff between two commits
 | `--dispatch-backend native` | native | Subprocess transport |
 | `--worker-backend codex\|claude\|opencode` | codex | Backend for worker dispatch |
 | `--reviewer-backend codex\|claude\|opencode` | codex | Backend for reviewer dispatch |
-| `--dispatch-timeout N` | 600 | Per-dispatch timeout in seconds |
+| `--dispatch-timeout N` | 0 | Per-dispatch timeout in seconds (0=unlimited) |
 | `--dispatch-retries N` | 2 | Retries on non-zero dispatch exit |
 | `--dispatch-retry-base-sec N` | 5 | Base backoff seconds between dispatch retries (max delay 60s) |
 | `--max-session-rounds N` | 0 | Max rounds to reuse one backend session before rotating (0 disables rotation) |

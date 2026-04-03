@@ -490,6 +490,32 @@ def test_run_auto_dispatch_passes_stdin_text_to_subprocess(monkeypatch) -> None:
     assert proc.stdin.closed is True
 
 
+def test_run_auto_dispatch_zero_timeout_is_unlimited(monkeypatch) -> None:
+    monkeypatch.setattr(
+        orchestrator,
+        "_agent_command",
+        lambda backend, prompt: (["codex.exe", "exec", "short instruction"], None, "STDIN_PAYLOAD"),
+    )
+    monkeypatch.setattr(orchestrator, "_log", lambda msg: None)
+    monkeypatch.setattr(orchestrator, "_feed_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(orchestrator, "_write_dispatch_log", lambda *args, **kwargs: None)
+
+    proc = _FakeProc(stdout_lines=[], poll_ready_after=2)
+    monotonic_values = iter([0.0, 10_000.0, 20_000.0])
+
+    def fake_monotonic() -> float:
+        return next(monotonic_values, 20_000.0)
+
+    monkeypatch.setattr(orchestrator.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(orchestrator.time, "sleep", lambda _: None)
+    monkeypatch.setattr(orchestrator.subprocess, "Popen", lambda cmd, **kwargs: proc)
+
+    orchestrator._run_auto_dispatch("worker", "codex", "ignored", 0)
+
+    assert proc.terminate_called is False
+    assert proc.wait_called is True
+
+
 def test_run_auto_dispatch_timeout_kills_and_waits_process(monkeypatch) -> None:
     monkeypatch.setattr(
         orchestrator,
@@ -2188,6 +2214,59 @@ def test_main_run_parses_artifact_timeout(monkeypatch) -> None:
     assert captured["round_num"] == 7
     assert captured["resume"] is False
     assert captured["verbose"] is True
+
+
+def test_main_run_dispatch_timeout_defaults_to_unlimited(monkeypatch) -> None:
+    captured: dict[str, int] = {}
+
+    def fake_cmd_run(
+        config: orchestrator.RunConfig,
+        single_round: bool,
+        round_num: int | None,
+        resume: bool = False,
+        reset: bool = False,
+    ) -> None:
+        _ = (single_round, round_num, resume, reset)
+        captured["dispatch_timeout"] = config.dispatch_timeout
+
+    monkeypatch.setattr(orchestrator, "_load_config", lambda: {})
+    monkeypatch.setattr(orchestrator, "cmd_run", fake_cmd_run)
+    monkeypatch.setattr(sys, "argv", ["orchestrator.py", "run"])
+
+    orchestrator.main()
+
+    assert orchestrator.DEFAULT_DISPATCH_TIMEOUT_SEC == 0
+    assert captured["dispatch_timeout"] == 0
+
+
+def test_main_run_parses_dispatch_timeout(monkeypatch) -> None:
+    captured: dict[str, int] = {}
+
+    def fake_cmd_run(
+        config: orchestrator.RunConfig,
+        single_round: bool,
+        round_num: int | None,
+        resume: bool = False,
+        reset: bool = False,
+    ) -> None:
+        _ = (single_round, round_num, resume, reset)
+        captured["dispatch_timeout"] = config.dispatch_timeout
+
+    monkeypatch.setattr(orchestrator, "cmd_run", fake_cmd_run)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "orchestrator.py",
+            "run",
+            "--dispatch-timeout",
+            "47",
+        ],
+    )
+
+    orchestrator.main()
+
+    assert captured["dispatch_timeout"] == 47
 
 
 def test_main_run_parses_dispatch_retry_flags(monkeypatch) -> None:

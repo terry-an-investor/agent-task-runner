@@ -192,7 +192,7 @@ _STATE_BACKUP = LOOP_DIR / ".state.json.bak"
 DEFAULT_MAX_ROUNDS = 3
 POLL_INTERVAL_SEC = 1
 DEFAULT_HEARTBEAT_TTL_SEC = 30
-DEFAULT_DISPATCH_TIMEOUT_SEC = 600
+DEFAULT_DISPATCH_TIMEOUT_SEC = 0
 DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC = 90
 DEFAULT_DISPATCH_RETRIES = 2
 DEFAULT_DISPATCH_RETRY_BASE_SEC = 5
@@ -5207,7 +5207,7 @@ def main() -> None:
         "--dispatch-timeout",
         type=int,
         default=None,
-        help="Per-dispatch timeout in seconds (default: 600, 0=unlimited)",
+        help="Per-dispatch timeout in seconds (default: 0, 0=unlimited)",
     )
     run_p.add_argument(
         "--dispatch-retries",
