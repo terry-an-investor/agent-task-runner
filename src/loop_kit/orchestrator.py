@@ -2090,6 +2090,23 @@ def _dispatch_failure_hint(
     return " Remediation: " + " ".join(hints)
 
 
+def _retry_budget_fields(
+    *,
+    attempt: int,
+    max_attempts: int,
+    phase: Literal["before_attempt", "after_attempt"] = "after_attempt",
+) -> dict[str, int]:
+    total = max(1, int(max_attempts))
+    bounded_attempt = max(1, int(attempt))
+    consumed_raw = bounded_attempt if phase == "after_attempt" else bounded_attempt - 1
+    consumed = min(total, max(0, consumed_raw))
+    return {
+        "retry_budget_total": total,
+        "retry_budget_consumed": consumed,
+        "retry_budget_remaining": max(0, total - consumed),
+    }
+
+
 def _report_dispatch_result(
     *,
     role: str,
@@ -2123,6 +2140,7 @@ def _report_dispatch_result(
         attempt=attempt,
         max_attempts=max_attempts,
     )
+    data.update(_retry_budget_fields(attempt=attempt, max_attempts=max_attempts, phase="after_attempt"))
     if timeout_sec is not None:
         data["timeout_sec"] = timeout_sec
     if session_id is not None:
@@ -2464,6 +2482,11 @@ def _run_auto_dispatch(
             attempt += 1
             current_attempt = attempt
             current_max_attempts = max_attempts
+            attempt_budget_before = _retry_budget_fields(
+                attempt=current_attempt,
+                max_attempts=current_max_attempts,
+                phase="before_attempt",
+            )
 
             def _elapsed_ms_now() -> int:
                 nonlocal dispatch_anchor_perf
@@ -2589,6 +2612,7 @@ def _run_auto_dispatch(
                     max_attempts=max_attempts,
                     timeout_sec=timeout_sec,
                     resume_requested=active_resume_session_id is not None,
+                    **attempt_budget_before,
                 ),
             )
             proc = subprocess.Popen(
@@ -2764,7 +2788,18 @@ def _run_auto_dispatch(
             if active_resume_session_id and (
                 _is_invalid_resume_session_error(stderr_text) or _is_invalid_resume_session_error(stdout_text)
             ):
-                _log(f"{role} resume session is invalid for backend={backend}; falling back to a new session.")
+                budget_after_attempt = _retry_budget_fields(
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    phase="after_attempt",
+                )
+                _log(
+                    f"{role} resume session is invalid for backend={backend}; "
+                    "falling back to a new session. "
+                    f"retry_budget_consumed={budget_after_attempt['retry_budget_consumed']}/"
+                    f"{budget_after_attempt['retry_budget_total']} "
+                    f"retry_budget_remaining={budget_after_attempt['retry_budget_remaining']}"
+                )
                 _feed_event(
                     FEED_DISPATCH_RESUME,
                     level="warning",
@@ -2776,11 +2811,22 @@ def _run_auto_dispatch(
                         backend=backend,
                         status="fallback_invalid_resume",
                         attempt=attempt,
+                        max_attempts=max_attempts,
                         session_id=active_resume_session_id,
+                        **budget_after_attempt,
                     ),
                 )
                 active_resume_session_id = None
-                max_attempts += 1
+                if budget_after_attempt["retry_budget_remaining"] <= 0:
+                    raise RuntimeError(
+                        f"{role} dispatch failed (backend={backend}, rc={result.returncode}) "
+                        f"after {attempt} attempts: {stderr_text}"
+                        + _dispatch_failure_hint(
+                            backend=backend,
+                            stderr=stderr_text,
+                            timeout_sec=timeout_sec,
+                        )
+                    )
                 continue
             if _is_permanent_dispatch_error(stderr_text):
                 raise PermanentDispatchError(
@@ -2803,9 +2849,15 @@ def _run_auto_dispatch(
                     )
                 )
             retry_delay = min(MAX_DISPATCH_RETRY_DELAY_SEC, retry_base_sec * (2 ** (attempt - 1)))
+            budget_after_attempt = _retry_budget_fields(
+                attempt=attempt,
+                max_attempts=max_attempts,
+                phase="after_attempt",
+            )
             _log(
                 f"{role} dispatch failed (backend={backend}, rc={result.returncode}) on attempt "
-                f"{attempt}/{max_attempts}; retrying in {retry_delay}s"
+                f"{attempt}/{max_attempts}; retrying in {retry_delay}s "
+                f"(retry_budget_remaining={budget_after_attempt['retry_budget_remaining']})"
             )
             time.sleep(retry_delay)
     finally:
@@ -7840,7 +7892,9 @@ class SessionManager:
         if isinstance(existing, dict):
             existing_session_id = SessionManager.normalize_session_id(existing.get("session_id"))
             if existing_session_id == normalized_session_id:
-                started_round = _session_started_round(existing, round_num=round_num)
+                existing_started_round = _session_started_round(existing)
+                if existing_started_round is not None:
+                    started_round = existing_started_round
         next_entry: dict[str, str | int] = {
             "session_id": normalized_session_id,
             "backend": SessionManager._normalize_backend(backend),
@@ -7888,11 +7942,11 @@ def _session_entry(state: dict, *, role: str, backend: str) -> dict[str, str | i
     return _session_manager(role)._entry_for_backend(state, backend)
 
 
-def _session_started_round(entry: dict[str, str | int], *, round_num: int) -> int:
+def _session_started_round(entry: dict[str, str | int]) -> int | None:
     started_round_raw = entry.get("started_round")
     if isinstance(started_round_raw, int) and started_round_raw >= 1:
         return started_round_raw
-    return max(1, round_num - 1)
+    return None
 
 
 def _store_session(state: dict, *, role: str, backend: str, session_id: str | None, round_num: int) -> bool:
@@ -7988,9 +8042,16 @@ def _auto_dispatch_role(
     if resume_session_id:
         entry = _session_entry(current_state, role=role, backend=backend)
         if isinstance(entry, dict):
-            session_started_round = _session_started_round(entry, round_num=round_num)
-        if config.max_session_rounds > 0 and session_started_round is not None:
-            if round_num - session_started_round >= config.max_session_rounds:
+            session_started_round = _session_started_round(entry)
+        if config.max_session_rounds > 0:
+            if session_started_round is None:
+                resume_status = "resume_rotated_missing_started_round"
+                _log(
+                    f"{role} session rotation triggered: missing/invalid started_round, "
+                    f"round={round_num}, max_session_rounds={config.max_session_rounds}"
+                )
+                resume_session_id = None
+            elif round_num - session_started_round >= config.max_session_rounds:
                 resume_status = "resume_rotated"
                 _log(
                     f"{role} session rotation triggered: started_round={session_started_round}, "

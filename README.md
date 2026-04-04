@@ -136,6 +136,8 @@ Reviewer → PM: review_report.json
 - **Handoff**: Structured bridge every round for both roles
 - **Warm resume**: Reuse backend sessions for low-latency continuation
 - **Session rotation**: Set `--max-session-rounds` to intentionally rotate
+- **Strict rotation contract**: when `--max-session-rounds > 0`, only sessions with valid `started_round` are resumable; legacy/invalid entries are rotated before dispatch
+- **Deterministic retry budget**: dispatch attempts are always bounded to `--dispatch-retries + 1` (invalid resume fallback consumes that same budget)
 
 ### Integration Lane (Deterministic Merge V1)
 

@@ -904,14 +904,19 @@ def test_run_auto_dispatch_retries_and_succeeds_on_second_attempt(monkeypatch) -
 
 
 def test_run_auto_dispatch_retry_exhaustion_raises_final_failure(monkeypatch) -> None:
+    events: list[tuple[str, dict[str, object]]] = []
     monkeypatch.setattr(
         orchestrator,
         "_agent_command",
         lambda backend, prompt: (["codex.exe", "exec", "short instruction"], None, "STDIN_PAYLOAD"),
     )
     monkeypatch.setattr(orchestrator, "_log", lambda msg: None)
-    monkeypatch.setattr(orchestrator, "_feed_event", lambda *args, **kwargs: None)
     monkeypatch.setattr(orchestrator, "_write_dispatch_log", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        orchestrator,
+        "_feed_event",
+        lambda event, *, level="info", data=None: events.append((event, dict(data or {}))),
+    )
 
     popen_calls: list[list[str]] = []
     sleep_calls: list[int] = []
@@ -938,6 +943,14 @@ def test_run_auto_dispatch_retry_exhaustion_raises_final_failure(monkeypatch) ->
     assert "(backend=codex, rc=3)" in str(exc.value)
     assert len(popen_calls) == 3
     assert sleep_calls == [5, 10]
+    fail_events = [payload for event, payload in events if event == orchestrator.FEED_DISPATCH_FAIL]
+    assert len(fail_events) == 3
+    assert fail_events[0]["retry_budget_total"] == 3
+    assert fail_events[0]["retry_budget_consumed"] == 1
+    assert fail_events[0]["retry_budget_remaining"] == 2
+    assert fail_events[2]["retry_budget_total"] == 3
+    assert fail_events[2]["retry_budget_consumed"] == 3
+    assert fail_events[2]["retry_budget_remaining"] == 0
 
 
 def test_run_auto_dispatch_permanent_error_fails_fast_without_retrying(monkeypatch) -> None:
@@ -1228,6 +1241,19 @@ class TestSessionManager:
             "worker": {"session_id": "sid-1", "backend": "codex", "started_round": 2}
         }
 
+    def test_store_session_sets_started_round_when_existing_entry_is_missing_it(self) -> None:
+        manager = orchestrator.SessionManager(role="worker")
+        state = {
+            "sessions": {"worker": {"session_id": "sid-1", "backend": "codex"}},
+        }
+
+        changed = manager.store_session(state, "codex", "sid-1", round_num=4)
+
+        assert changed is True
+        assert state["sessions"] == {
+            "worker": {"session_id": "sid-1", "backend": "codex", "started_round": 4}
+        }
+
     def test_get_session_returns_none_on_backend_mismatch(self) -> None:
         manager = orchestrator.SessionManager(role="worker")
         state = {"sessions": {"worker": {"session_id": "sid-1", "backend": "codex", "started_round": 2}}}
@@ -1476,6 +1502,131 @@ def test_auto_dispatch_role_rotates_session_and_emits_artifact_metric(tmp_path: 
     assert artifact_events
     assert artifact_events[0]["artifact_path"] == "work_report.json"
     assert isinstance(artifact_events[0]["latency_ms"], int)
+
+
+def test_auto_dispatch_role_keeps_session_before_rotation_boundary(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+    state = {
+        "state": orchestrator.STATE_AWAITING_WORK,
+        "round": 2,
+        "task_id": "T-627",
+        "base_sha": "base-sha",
+        "sessions": {"worker": {"session_id": "sid-old", "backend": "codex", "started_round": 1}},
+    }
+    orchestrator._save_state(state)
+
+    captured: dict[str, object] = {}
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def fake_run_auto_dispatch(*, resume_session_id: str | None = None, **kwargs) -> str | None:
+        _ = kwargs
+        captured["resume_session_id"] = resume_session_id
+        return "sid-old"
+
+    def fake_dispatch_with_artifact_fallback(
+        *,
+        role: str,
+        dispatch_call,
+        artifact_path: Path,
+        task_id: str,
+        round_num: int,
+        timeout_sec: int = orchestrator.DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC,
+    ) -> dict:
+        _ = (role, artifact_path, timeout_sec)
+        dispatch_call()
+        return {"task_id": task_id, "round": round_num}
+
+    def fake_feed_event(event: str, *, level: str = "info", data: dict | None = None) -> None:
+        _ = level
+        events.append((event, dict(data or {})))
+
+    monkeypatch.setattr(orchestrator, "_run_auto_dispatch", fake_run_auto_dispatch)
+    monkeypatch.setattr(orchestrator, "_dispatch_with_artifact_fallback", fake_dispatch_with_artifact_fallback)
+    monkeypatch.setattr(orchestrator, "_feed_event", fake_feed_event)
+    monkeypatch.setattr(orchestrator, "_log", lambda msg: None)
+    monkeypatch.setattr(orchestrator, "_current_sha", lambda: "base-sha")
+
+    result = orchestrator._auto_dispatch_role(
+        role="worker",
+        prompt="prompt",
+        config=orchestrator.RunConfig(auto_dispatch=True, worker_backend="codex", max_session_rounds=2),
+        task_id="T-627",
+        round_num=2,
+        artifact_path=orchestrator.WORK_REPORT,
+        state=state,
+    )
+
+    assert result is not None
+    assert result["task_id"] == "T-627"
+    assert result["round"] == 2
+    assert captured["resume_session_id"] == "sid-old"
+    resume_events = [payload for event, payload in events if event == orchestrator.FEED_DISPATCH_RESUME]
+    assert resume_events
+    assert resume_events[0]["status"] == "resume_hit"
+
+
+def test_auto_dispatch_role_rotates_missing_started_round_when_rotation_enabled(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+    state = {
+        "state": orchestrator.STATE_AWAITING_WORK,
+        "round": 4,
+        "task_id": "T-627",
+        "base_sha": "base-sha",
+        "sessions": {"worker": {"session_id": "sid-old", "backend": "codex", "started_round": "legacy"}},
+    }
+    orchestrator._save_state(state)
+
+    captured: dict[str, object] = {}
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def fake_run_auto_dispatch(*, resume_session_id: str | None = None, **kwargs) -> str | None:
+        _ = kwargs
+        captured["resume_session_id"] = resume_session_id
+        return "sid-new"
+
+    def fake_dispatch_with_artifact_fallback(
+        *,
+        role: str,
+        dispatch_call,
+        artifact_path: Path,
+        task_id: str,
+        round_num: int,
+        timeout_sec: int = orchestrator.DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC,
+    ) -> dict:
+        _ = (role, artifact_path, timeout_sec)
+        dispatch_call()
+        return {"task_id": task_id, "round": round_num}
+
+    def fake_feed_event(event: str, *, level: str = "info", data: dict | None = None) -> None:
+        _ = level
+        events.append((event, dict(data or {})))
+
+    monkeypatch.setattr(orchestrator, "_run_auto_dispatch", fake_run_auto_dispatch)
+    monkeypatch.setattr(orchestrator, "_dispatch_with_artifact_fallback", fake_dispatch_with_artifact_fallback)
+    monkeypatch.setattr(orchestrator, "_feed_event", fake_feed_event)
+    monkeypatch.setattr(orchestrator, "_log", lambda msg: None)
+    monkeypatch.setattr(orchestrator, "_current_sha", lambda: "base-sha")
+
+    result = orchestrator._auto_dispatch_role(
+        role="worker",
+        prompt="prompt",
+        config=orchestrator.RunConfig(auto_dispatch=True, worker_backend="codex", max_session_rounds=2),
+        task_id="T-627",
+        round_num=4,
+        artifact_path=orchestrator.WORK_REPORT,
+        state=state,
+    )
+
+    assert result is not None
+    assert result["task_id"] == "T-627"
+    assert result["round"] == 4
+    assert captured["resume_session_id"] is None
+    resume_events = [payload for event, payload in events if event == orchestrator.FEED_DISPATCH_RESUME]
+    assert resume_events
+    assert resume_events[0]["status"] == "resume_rotated_missing_started_round"
+    assert resume_events[0]["session_started_round"] is None
 
 
 def test_auto_dispatch_role_emits_dispatch_phase_metrics_with_complete_boundaries(monkeypatch) -> None:
@@ -2645,7 +2796,7 @@ def test_run_auto_dispatch_emits_resume_fallback_event(monkeypatch) -> None:
         "codex",
         "ignored",
         30,
-        dispatch_retries=0,
+        dispatch_retries=1,
         task_id="T-626",
         round_num=1,
         resume_session_id="stale-session",
@@ -2658,7 +2809,51 @@ def test_run_auto_dispatch_emits_resume_fallback_event(monkeypatch) -> None:
     ]
     assert fallback_events
     assert fallback_events[0]["session_id"] == "stale-session"
+    assert fallback_events[0]["retry_budget_total"] == 2
+    assert fallback_events[0]["retry_budget_consumed"] == 1
+    assert fallback_events[0]["retry_budget_remaining"] == 1
     assert calls["count"] == 2
+
+
+def test_run_auto_dispatch_invalid_resume_does_not_extend_retry_budget(monkeypatch) -> None:
+    monkeypatch.setattr(orchestrator, "_log", lambda msg: None)
+    monkeypatch.setattr(orchestrator, "_write_dispatch_log", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        orchestrator,
+        "_agent_command",
+        lambda backend, prompt, resume_session_id=None: (
+            ["codex.exe", "exec", "short instruction"],
+            resume_session_id,
+            "STDIN_PAYLOAD",
+        ),
+    )
+    calls = {"count": 0}
+
+    def fake_popen(cmd, **kwargs):
+        _ = (cmd, kwargs)
+        calls["count"] += 1
+        return _FakeProc(
+            stdout_lines=[],
+            stderr_lines=["no rollout found for thread id stale-session\n"],
+            returncode=1,
+        )
+
+    monkeypatch.setattr(orchestrator.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(orchestrator, "_feed_event", lambda *args, **kwargs: None)
+
+    with pytest.raises(RuntimeError, match="after 1 attempts"):
+        orchestrator._run_auto_dispatch(
+            "worker",
+            "codex",
+            "ignored",
+            30,
+            dispatch_retries=0,
+            task_id="T-626",
+            round_num=1,
+            resume_session_id="stale-session",
+        )
+
+    assert calls["count"] == 1
 
 
 def test_state_machine_successful_work_review_done_flow(tmp_path: Path, monkeypatch) -> None:
