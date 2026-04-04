@@ -5,6 +5,8 @@ import os
 import stat
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -132,6 +134,17 @@ def _write_fake_opencode_backend(bin_dir: Path) -> Path:
             '    lane_conflict = os.environ.get("FAKE_OPENCODE_LANE_CONFLICT", "").strip().lower() '
             'in {"1", "true", "yes", "on"}\n'
             '    trace_file = os.environ.get("FAKE_OPENCODE_TRACE_FILE", "").strip()\n'
+            '    timeout_race_role = os.environ.get("FAKE_OPENCODE_TIMEOUT_RACE_ROLE", "").strip().lower()\n'
+            '    timeout_race_delay_raw = os.environ.get("FAKE_OPENCODE_TIMEOUT_RACE_DELAY_SEC", "").strip()\n'
+            '    timeout_race_hold_raw = os.environ.get("FAKE_OPENCODE_TIMEOUT_RACE_HOLD_SEC", "").strip()\n'
+            "    try:\n"
+            "        timeout_race_delay_sec = float(timeout_race_delay_raw) if timeout_race_delay_raw else 0.0\n"
+            "    except ValueError:\n"
+            "        timeout_race_delay_sec = 0.0\n"
+            "    try:\n"
+            "        timeout_race_hold_sec = float(timeout_race_hold_raw) if timeout_race_hold_raw else 3.0\n"
+            "    except ValueError:\n"
+            "        timeout_race_hold_sec = 3.0\n"
             '    session_id = _arg_value("-s", argv) or "fake-session"\n'
             "\n"
             "    sys.stdout.write(\n"
@@ -173,8 +186,20 @@ def _write_fake_opencode_backend(bin_dir: Path) -> Path:
             "    if not round_text.isdigit():\n"
             '        round_text = "1"\n'
             "    round_num = int(round_text)\n"
+            '    run_id = _prompt_value(r"run_id:\\s*([^,\\n]+)", prompt, "").strip().rstrip(".,;")\n'
+            "    if not run_id:\n"
+            '        state_path = loop_dir / "state.json"\n'
+            "        if state_path.exists():\n"
+            "            try:\n"
+            '                state_data = json.loads(state_path.read_text(encoding="utf-8"))\n'
+            "            except json.JSONDecodeError:\n"
+            "                state_data = {}\n"
+            '            state_run_id = state_data.get("run_id") if isinstance(state_data, dict) else None\n'
+            "            if isinstance(state_run_id, str) and state_run_id.strip():\n"
+            "                run_id = state_run_id.strip()\n"
             '    lane_id = _prompt_value(r"lane_id:\\s*([^\\n]+)", prompt, "").strip()\n'
             '    review_report_path = _prompt_value(r"after writing\\s+([^\\s]+)", prompt, "").strip().rstrip(".,;")\n'
+            '    is_worker = "Role: code-writer worker for PM loop." in prompt\n'
             "    _emit_trace(\n"
             "        trace_file,\n"
             "        {\n"
@@ -182,13 +207,13 @@ def _write_fake_opencode_backend(bin_dir: Path) -> Path:
             '            "ts": time.time(),\n'
             '            "cwd": str(Path.cwd()),\n'
             '            "lane_id": lane_id,\n'
-            '            "role": "worker" if "Role: code-writer worker for PM loop." in prompt else "reviewer",\n'
+            '            "role": "worker" if is_worker else "reviewer",\n'
             "        },\n"
             "    )\n"
             "    if sleep_sec > 0:\n"
             "        time.sleep(sleep_sec)\n"
             "\n"
-            '    if "Role: code-writer worker for PM loop." in prompt:\n'
+            "    if is_worker:\n"
             "        if lane_conflict and lane_id:\n"
             '            changed_file = Path.cwd() / "lane_conflict.txt"\n'
             '            changed_file.write_text(f"lane {lane_id} round {round_num}\\n", encoding="utf-8")\n'
@@ -204,6 +229,7 @@ def _write_fake_opencode_backend(bin_dir: Path) -> Path:
             '        head_sha = _git("rev-parse", "HEAD")\n'
             "        payload = {\n"
             '            "task_id": task_id,\n'
+            '            "run_id": run_id,\n'
             '            "head_sha": head_sha,\n'
             '            "files_changed": [changed_file.name],\n'
             '            "tests": [{"name": "fake-opencode", "result": "pass", "output": "ok"}],\n'
@@ -223,6 +249,7 @@ def _write_fake_opencode_backend(bin_dir: Path) -> Path:
             "        )\n"
             "        payload = {\n"
             '            "task_id": task_id,\n'
+            '            "run_id": run_id,\n'
             '            "decision": effective_reviewer_decision,\n'
             '            "blocking_issues": [],\n'
             '            "non_blocking_suggestions": [],\n'
@@ -241,7 +268,34 @@ def _write_fake_opencode_backend(bin_dir: Path) -> Path:
             "    sys.stdout.flush()\n"
             "\n"
             "    target.parent.mkdir(parents=True, exist_ok=True)\n"
-            '    target.write_text(json.dumps(payload, indent=2) + "\\n", encoding="utf-8")\n'
+            '    race_roles = {"both", "worker", "reviewer"}\n'
+            "    race_enabled = (\n"
+            "        timeout_race_delay_sec > 0\n"
+            "        and timeout_race_role in race_roles\n"
+            '        and (timeout_race_role == "both" or (timeout_race_role == "worker" and is_worker) or (timeout_race_role == "reviewer" and not is_worker))\n'
+            "    )\n"
+            "    if race_enabled:\n"
+            "        payload_path = target.parent / (target.name + '.race_payload.json')\n"
+            "        payload_path.write_text(json.dumps(payload, ensure_ascii=False), encoding='utf-8')\n"
+            "        race_code = (\n"
+            '            "import json,time,sys\\n"\n'
+            '            "from pathlib import Path\\n"\n'
+            "            \"payload_path = Path(sys.argv[1])\\n\"\n"
+            "            \"target = Path(sys.argv[2])\\n\"\n"
+            "            \"delay = float(sys.argv[3])\\n\"\n"
+            "            \"time.sleep(delay)\\n\"\n"
+            "            \"payload = json.loads(payload_path.read_text(encoding='utf-8'))\\n\"\n"
+            "            \"target.parent.mkdir(parents=True, exist_ok=True)\\n\"\n"
+            "            \"target.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + '\\\\n', encoding='utf-8')\\n\"\n"
+            "            \"payload_path.unlink(missing_ok=True)\\n\"\n"
+            "        )\n"
+            "        subprocess.Popen(\n"
+            "            [sys.executable, '-c', race_code, str(payload_path), str(target), str(timeout_race_delay_sec)],\n"
+            "            cwd=Path.cwd(),\n"
+            "        )\n"
+            "        time.sleep(max(timeout_race_hold_sec, timeout_race_delay_sec + 0.1))\n"
+            "        return 0\n"
+            '    target.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\\n", encoding="utf-8")\n'
             "\n"
             "    sys.stdout.write(\n"
             '        json.dumps({"type": "done", "part": {"artifact": str(target)}}) + "\\n"\n'
@@ -254,7 +308,7 @@ def _write_fake_opencode_backend(bin_dir: Path) -> Path:
             '            "ts": time.time(),\n'
             '            "cwd": str(Path.cwd()),\n'
             '            "lane_id": lane_id,\n'
-            '            "role": "worker" if "Role: code-writer worker for PM loop." in prompt else "reviewer",\n'
+            '            "role": "worker" if is_worker else "reviewer",\n'
             "        },\n"
             "    )\n"
             "\n"
@@ -297,6 +351,9 @@ def _subprocess_env(
     sleep_sec: float = 0.0,
     lane_conflict: bool = False,
     trace_file: Path | None = None,
+    timeout_race_role: str | None = None,
+    timeout_race_delay_sec: float = 0.0,
+    timeout_race_hold_sec: float = 3.0,
 ) -> dict[str, str]:
     env = os.environ.copy()
     bin_dir = tmp_path / "bin"
@@ -313,6 +370,14 @@ def _subprocess_env(
         env["FAKE_OPENCODE_TRACE_FILE"] = str(trace_file)
     else:
         env.pop("FAKE_OPENCODE_TRACE_FILE", None)
+    if isinstance(timeout_race_role, str) and timeout_race_role.strip():
+        env["FAKE_OPENCODE_TIMEOUT_RACE_ROLE"] = timeout_race_role.strip().lower()
+        env["FAKE_OPENCODE_TIMEOUT_RACE_DELAY_SEC"] = str(timeout_race_delay_sec)
+        env["FAKE_OPENCODE_TIMEOUT_RACE_HOLD_SEC"] = str(timeout_race_hold_sec)
+    else:
+        env.pop("FAKE_OPENCODE_TIMEOUT_RACE_ROLE", None)
+        env.pop("FAKE_OPENCODE_TIMEOUT_RACE_DELAY_SEC", None)
+        env.pop("FAKE_OPENCODE_TIMEOUT_RACE_HOLD_SEC", None)
     # Force UTF-8 encoding for Python subprocesses on Windows
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
@@ -365,6 +430,9 @@ def _run_loop(
     sleep_sec: float = 0.0,
     lane_conflict: bool = False,
     trace_file: Path | None = None,
+    timeout_race_role: str | None = None,
+    timeout_race_delay_sec: float = 0.0,
+    timeout_race_hold_sec: float = 3.0,
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, "-m", "loop_kit", *args],
@@ -377,6 +445,9 @@ def _run_loop(
             sleep_sec=sleep_sec,
             lane_conflict=lane_conflict,
             trace_file=trace_file,
+            timeout_race_role=timeout_race_role,
+            timeout_race_delay_sec=timeout_race_delay_sec,
+            timeout_race_hold_sec=timeout_race_hold_sec,
         ),
         capture_output=True,
         text=True,
@@ -1100,3 +1171,116 @@ def test_report_rejects_cross_task_archived_review_artifact(tmp_path: Path) -> N
 
     assert result.returncode == orchestrator.EXIT_VALIDATION_ERROR
     assert "field 'task_id' mismatch" in result.stderr
+
+
+@pytest.mark.timeout(15)
+def test_auto_dispatch_worker_timeout_race_accepts_matching_artifact(tmp_path: Path) -> None:
+    base_sha = _init_git_repo(tmp_path)
+    _install_fake_opencode(tmp_path / "bin")
+    loop_dir = _prepare_loop_contract(
+        tmp_path,
+        task_id="T-737-race",
+        base_sha=base_sha,
+        state_name="task_ready",
+        round_num=1,
+    )
+
+    result = _run_loop(
+        tmp_path,
+        [
+            "run",
+            "--loop-dir",
+            ".loop",
+            "--task",
+            ".loop/task_card.json",
+            "--single-round",
+            "--round",
+            "1",
+            "--auto-dispatch",
+            "--worker-backend",
+            "opencode",
+            "--reviewer-backend",
+            "opencode",
+            "--dispatch-timeout",
+            "1",
+            "--dispatch-retries",
+            "0",
+            "--artifact-timeout",
+            "4",
+        ],
+        reviewer_decision="approve",
+        timeout_race_role="worker",
+        timeout_race_delay_sec=1.1,
+        timeout_race_hold_sec=3.0,
+    )
+
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    work = json.loads((loop_dir / "work_report.json").read_text(encoding="utf-8"))
+    state = json.loads((loop_dir / "state.json").read_text(encoding="utf-8"))
+    assert state["state"] == "done"
+    assert state["outcome"] == "approved"
+    assert work["run_id"] == state["run_id"]
+
+
+@pytest.mark.timeout(15)
+def test_auto_dispatch_ignores_stale_cross_run_work_report(tmp_path: Path) -> None:
+    base_sha = _init_git_repo(tmp_path)
+    _install_fake_opencode(tmp_path / "bin")
+    loop_dir = _prepare_loop_contract(
+        tmp_path,
+        task_id="T-737-stale",
+        base_sha=base_sha,
+        state_name="task_ready",
+        round_num=1,
+    )
+
+    def _inject_stale_work_report() -> None:
+        time.sleep(0.2)
+        _write_json(
+            loop_dir / "work_report.json",
+            {
+                "task_id": "T-737-stale",
+                "run_id": "run-stale",
+                "round": 1,
+                "head_sha": base_sha,
+                "files_changed": [],
+                "tests": [],
+                "notes": "stale injected artifact",
+            },
+        )
+
+    injector = threading.Thread(target=_inject_stale_work_report, daemon=True)
+    injector.start()
+    result = _run_loop(
+        tmp_path,
+        [
+            "run",
+            "--loop-dir",
+            ".loop",
+            "--task",
+            ".loop/task_card.json",
+            "--single-round",
+            "--round",
+            "1",
+            "--auto-dispatch",
+            "--worker-backend",
+            "opencode",
+            "--reviewer-backend",
+            "opencode",
+            "--dispatch-retries",
+            "0",
+            "--artifact-timeout",
+            "4",
+        ],
+        reviewer_decision="approve",
+        sleep_sec=1.0,
+    )
+    injector.join(timeout=1)
+
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    work = json.loads((loop_dir / "work_report.json").read_text(encoding="utf-8"))
+    state = json.loads((loop_dir / "state.json").read_text(encoding="utf-8"))
+    assert state["state"] == "done"
+    assert state["outcome"] == "approved"
+    assert work["run_id"] == state["run_id"]
+    assert work["run_id"] != "run-stale"

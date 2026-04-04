@@ -86,7 +86,7 @@ All state is tracked in `.loop/`:
 
 | File | What it tells you |
 |------|-------------------|
-| `state.json` | Current round, status, decisions |
+| `state.json` | Current round, status, decisions, and active `run_id` |
 | `logs/feed.jsonl` | Full event log |
 | `archive/{task_id}/` | Artifacts from every round |
 
@@ -120,6 +120,9 @@ Worker → PM:   work_report.json
 PM → Reviewer: review_request.json
 Reviewer → PM: review_report.json
 ```
+
+`work_report.json` and `review_report.json` are identity-bound by `task_id` + `round` + `run_id`.  
+`run_id` is generated once per loop run and persisted in `state.json`.
 
 ### State Machine
 

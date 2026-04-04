@@ -2025,7 +2025,8 @@ def test_worker_prompt_round1_includes_task_card_section(monkeypatch) -> None:
 
     assert "AGENTS_CONTENT" in prompt
     assert "CODE_WRITER_CONTENT" in prompt
-    assert "Current task_id: T-603, round: 1." in prompt
+    assert "Current task_id: T-603, round: 1" in prompt
+    assert "run_id:" in prompt
     assert "=== TASK CARD ===" in prompt
     assert "goal: Improve prompt payload" in prompt
     assert "in_scope:" in prompt
@@ -2169,7 +2170,8 @@ def test_worker_prompt_round2_skips_agents_md_and_function_index(monkeypatch) ->
     assert "AGENTS_CONTENT" not in prompt
     assert "FUNCTION INDEX" not in prompt
     assert "CODE_WRITER_CONTENT" in prompt
-    assert "Current task_id: T-603, round: 2." in prompt
+    assert "Current task_id: T-603, round: 2" in prompt
+    assert "run_id:" in prompt
     assert "=== FIX LIST (round 2) ===" in prompt
     assert "[high] file.py: fix it" in prompt
     assert "work_report.json" in prompt
@@ -2341,7 +2343,8 @@ def test_reviewer_prompt_includes_role_doc(monkeypatch) -> None:
     prompt = orchestrator._reviewer_prompt("T-603", 2)
 
     assert "REVIEWER_CONTENT" in prompt
-    assert "Current task_id: T-603, round: 2." in prompt
+    assert "Current task_id: T-603, round: 2" in prompt
+    assert "run_id:" in prompt
 
 
 def test_worker_prompt_uses_default_code_writer_doc_when_project_file_missing(tmp_path: Path, monkeypatch) -> None:
@@ -3574,6 +3577,53 @@ def test_archive_bus_file_rejects_cross_task_round_artifact(tmp_path: Path, monk
         )
 
     assert "field 'task_id' mismatch" in str(exc.value)
+
+
+def test_archive_bus_file_rejects_cross_run_round_artifact(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+    orchestrator.WORK_REPORT.write_text(
+        '{"task_id":"T-604","run_id":"run-stale","round":1,"head_sha":"abc"}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(orchestrator.ValidationError) as exc:
+        orchestrator._archive_bus_file(
+            orchestrator.WORK_REPORT,
+            "T-604",
+            1,
+            "work_report",
+            run_id="run-active",
+        )
+
+    assert "field 'run_id' mismatch" in str(exc.value)
+
+
+def test_wait_for_file_ignores_stale_run_id_until_matching_artifact(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+    artifact = orchestrator.WORK_REPORT
+    monkeypatch.setattr(orchestrator, "POLL_INTERVAL_SEC", 0.01)
+
+    def _writer() -> None:
+        stale = {"task_id": "T-604", "round": 1, "run_id": "run-stale", "head_sha": "stale"}
+        fresh = {"task_id": "T-604", "round": 1, "run_id": "run-active", "head_sha": "fresh"}
+        artifact.write_text(json.dumps(stale, ensure_ascii=False) + "\n", encoding="utf-8")
+        threading.Event().wait(0.05)
+        artifact.write_text(json.dumps(fresh, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    thread = threading.Thread(target=_writer, daemon=True)
+    thread.start()
+    data = orchestrator._wait_for_file(
+        artifact,
+        "run-id identity test",
+        timeout_sec=1,
+        expected_task_id="T-604",
+        expected_round=1,
+        expected_run_id="run-active",
+        show_manual_hint=False,
+    )
+    thread.join(timeout=1)
+    assert isinstance(data, dict)
+    assert data["run_id"] == "run-active"
 
 
 def test_archive_subcommand_lists_files(tmp_path: Path, monkeypatch, capsys) -> None:
@@ -7120,6 +7170,19 @@ class TestValidateReport:
             or ""
         )
 
+    def test_work_report_run_id_mismatch_when_provided(self) -> None:
+        work = {"task_id": "T-1", "run_id": "run-other", "head_sha": "abc", "round": 1}
+        assert "run_id" in (
+            orchestrator._validate_report(
+                work,
+                expected_task_id="T-1",
+                expected_round=1,
+                expected_run_id="run-active",
+                schema="work_report",
+            )
+            or ""
+        )
+
     def test_review_report_invalid_decision(self) -> None:
         review = {"task_id": "T-1", "round": 1, "decision": "maybe"}
         assert "must be one of" in (
@@ -10206,7 +10269,9 @@ class TestKnowledgeLayer:
         monkeypatch.setattr(orchestrator, "_diff", lambda base, head: f"diff {base}->{head}")
         monkeypatch.setattr(orchestrator, "_log_oneline", lambda base, head: f"log {base}->{head}")
         monkeypatch.setattr(
-            orchestrator, "_update_knowledge_on_approval", lambda task_id, round_num: calls.append((task_id, round_num))
+            orchestrator,
+            "_update_knowledge_on_approval",
+            lambda task_id, round_num, *, run_id=None: calls.append((task_id, round_num)),
         )
 
         orchestrator.cmd_run(
@@ -10274,7 +10339,9 @@ class TestKnowledgeLayer:
         monkeypatch.setattr(orchestrator, "_diff", lambda base, head: f"diff {base}->{head}")
         monkeypatch.setattr(orchestrator, "_log_oneline", lambda base, head: f"log {base}->{head}")
         monkeypatch.setattr(
-            orchestrator, "_update_knowledge_on_approval", lambda task_id, round_num: calls.append((task_id, round_num))
+            orchestrator,
+            "_update_knowledge_on_approval",
+            lambda task_id, round_num, *, run_id=None: calls.append((task_id, round_num)),
         )
 
         orchestrator.cmd_run(

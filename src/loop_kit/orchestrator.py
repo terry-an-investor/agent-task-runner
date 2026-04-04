@@ -126,6 +126,7 @@ class LaneRuntimeMetrics(TypedDict, total=False):
 
 class WorkReport(TypedDict):
     task_id: str
+    run_id: str
     head_sha: str
     round: int
     files_changed: NotRequired[list[str]]
@@ -145,6 +146,7 @@ class WorkReport(TypedDict):
 
 class ReviewReport(TypedDict):
     task_id: str
+    run_id: str
     decision: str
     round: int
     blocking_issues: NotRequired[list[ReviewIssue]]
@@ -153,6 +155,7 @@ class ReviewReport(TypedDict):
 
 class ReviewRequest(TypedDict):
     task_id: str
+    run_id: str
     base_sha: str
     head_sha: str
     commits: str
@@ -175,6 +178,7 @@ class TaskPacket(TypedDict):
 
 class FixList(TypedDict, total=False):
     task_id: Required[str]
+    run_id: Required[str]
     round: Required[int]
     base_sha: Required[str]
     head_sha: Required[str]
@@ -365,6 +369,7 @@ _KNOWLEDGE_STOPWORDS = {
 }
 _FEED_TASK_ID: str | None = None
 _FEED_ROUND: int | None = None
+_FEED_RUN_ID: str | None = None
 _LOGS_DIR_ENSURED = False
 _LOGS_DIR_ENSURED_PATH: str | None = None
 _stream_local = threading.local()
@@ -588,6 +593,7 @@ def _apply_loop_paths(paths: LoopPaths) -> None:
     global _PITFALLS_FILE
     global _PATTERNS_FILE
     global _FEED_ROUND
+    global _FEED_RUN_ID
 
     LOOP_DIR = paths.dir
     LOGS_DIR = paths.logs
@@ -614,6 +620,7 @@ def _apply_loop_paths(paths: LoopPaths) -> None:
     _LOGS_DIR_ENSURED = False
     _LOGS_DIR_ENSURED_PATH = None
     _FEED_ROUND = None
+    _FEED_RUN_ID = None
 
 
 def _configure_loop_paths(loop_dir: str | Path = ".loop") -> LoopPaths:
@@ -655,7 +662,33 @@ def _task_handoff_dir(task_id: str, paths: LoopPaths | None = None) -> Path:
     return _HANDOFF_DIR / task_id
 
 
-def _parse_artifact_identity(payload: object, *, artifact_label: str) -> tuple[str, int]:
+def _normalize_run_id(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+def _new_run_id() -> str:
+    return f"run-{uuid.uuid4().hex}"
+
+
+def _ensure_state_run_id(state: dict) -> str:
+    run_id = _normalize_run_id(state.get("run_id"))
+    if run_id is not None:
+        state["run_id"] = run_id
+        return run_id
+    generated = _new_run_id()
+    state["run_id"] = generated
+    return generated
+
+
+def _parse_artifact_identity(
+    payload: object,
+    *,
+    artifact_label: str,
+    require_run_id: bool = False,
+) -> tuple[str, int, str | None]:
     if not isinstance(payload, dict):
         raise ValidationError(f"{artifact_label} must be a JSON object")
     raw_task_id = payload.get("task_id")
@@ -664,7 +697,10 @@ def _parse_artifact_identity(payload: object, *, artifact_label: str) -> tuple[s
     raw_round = payload.get("round")
     if type(raw_round) is not int:
         raise ValidationError(f"{artifact_label} field 'round' must be int, got {type(raw_round).__name__}")
-    return raw_task_id, raw_round
+    run_id = _normalize_run_id(payload.get("run_id"))
+    if require_run_id and run_id is None:
+        raise ValidationError(f"{artifact_label} missing required non-empty field 'run_id'")
+    return raw_task_id, raw_round, run_id
 
 
 def _enforce_artifact_identity(
@@ -673,8 +709,13 @@ def _enforce_artifact_identity(
     artifact_label: str,
     expected_task_id: str,
     expected_round: int,
+    expected_run_id: str | None = None,
 ) -> dict[str, object]:
-    actual_task_id, actual_round = _parse_artifact_identity(payload, artifact_label=artifact_label)
+    actual_task_id, actual_round, actual_run_id = _parse_artifact_identity(
+        payload,
+        artifact_label=artifact_label,
+        require_run_id=expected_run_id is not None,
+    )
     if actual_task_id != expected_task_id:
         raise ValidationError(
             f"{artifact_label} field 'task_id' mismatch: expected {expected_task_id!r}, got {actual_task_id!r}"
@@ -683,10 +724,21 @@ def _enforce_artifact_identity(
         raise ValidationError(
             f"{artifact_label} field 'round' mismatch: expected {expected_round}, got {actual_round!r}"
         )
+    if expected_run_id is not None and actual_run_id != expected_run_id:
+        raise ValidationError(
+            f"{artifact_label} field 'run_id' mismatch: expected {expected_run_id!r}, got {actual_run_id!r}"
+        )
     return cast(dict[str, object], payload)
 
 
-def _archive_bus_file(path: Path, task_id: str, round_num: int, suffix: str) -> Path | None:
+def _archive_bus_file(
+    path: Path,
+    task_id: str,
+    round_num: int,
+    suffix: str,
+    *,
+    run_id: str | None = None,
+) -> Path | None:
     if not path.exists():
         return None
     archive_round = round_num
@@ -696,10 +748,18 @@ def _archive_bus_file(path: Path, task_id: str, round_num: int, suffix: str) -> 
         except (ConfigError, json.JSONDecodeError, OSError) as e:
             raise ValidationError(f"Unable to archive {path.name}: {e}") from e
         artifact_label = f"{path.name} for archive suffix={suffix!r}"
-        artifact_task_id, artifact_round = _parse_artifact_identity(payload, artifact_label=artifact_label)
+        artifact_task_id, artifact_round, artifact_run_id = _parse_artifact_identity(
+            payload,
+            artifact_label=artifact_label,
+            require_run_id=False,
+        )
         if artifact_task_id != task_id:
             raise ValidationError(
                 f"{artifact_label} field 'task_id' mismatch: expected {task_id!r}, got {artifact_task_id!r}"
+            )
+        if run_id is not None and artifact_run_id is not None and artifact_run_id != run_id:
+            raise ValidationError(
+                f"{artifact_label} field 'run_id' mismatch: expected {run_id!r}, got {artifact_run_id!r}"
             )
         if suffix in {"work_report", "review_report"}:
             if artifact_round > round_num:
@@ -718,8 +778,8 @@ def _archive_bus_file(path: Path, task_id: str, round_num: int, suffix: str) -> 
     return dest
 
 
-def _prepare_bus_file(path: Path, task_id: str, round_num: int, suffix: str) -> None:
-    _archive_bus_file(path, task_id, round_num, suffix)
+def _prepare_bus_file(path: Path, task_id: str, round_num: int, suffix: str, *, run_id: str | None = None) -> None:
+    _archive_bus_file(path, task_id, round_num, suffix, run_id=run_id)
     path.unlink(missing_ok=True)
 
 
@@ -765,13 +825,18 @@ def _archive_task_summary(task_id: str, paths: LoopPaths | None = None) -> Path 
     return dest
 
 
-def _archive_state_for_round(task_id: str, round_num: int, paths: LoopPaths | None = None) -> Path | None:
+def _archive_state_for_round(
+    task_id: str,
+    round_num: int,
+    run_id: str | None = None,
+    paths: LoopPaths | None = None,
+) -> Path | None:
     """Capture the pre-round state snapshot once for this round."""
     resolved_paths = _resolve_paths(paths)
     dest = _task_archive_dir(task_id, paths=resolved_paths) / f"r{round_num}_state.json"
     if dest.exists():
         return dest
-    return _archive_bus_file(resolved_paths.state, task_id, round_num, "state")
+    return _archive_bus_file(resolved_paths.state, task_id, round_num, "state", run_id=run_id)
 
 
 def _lock_file(handle) -> None:
@@ -894,11 +959,21 @@ def _set_feed_task_id(task_id: str | None) -> None:
     _FEED_TASK_ID = task_id
     if task_id is None:
         _set_feed_round(None)
+        _set_feed_run_id(None)
 
 
 def _set_feed_round(round_num: int | None) -> None:
     global _FEED_ROUND
     _FEED_ROUND = round_num
+
+
+def _set_feed_run_id(run_id: str | None) -> None:
+    global _FEED_RUN_ID
+    _FEED_RUN_ID = _normalize_run_id(run_id)
+
+
+def _current_feed_run_id() -> str | None:
+    return _FEED_RUN_ID
 
 
 def _feed_data(
@@ -2890,6 +2965,7 @@ def _require_dispatch_artifact(
     task_id: str,
     round_num: int,
     timeout_sec: int = DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC,
+    run_id: str | None = None,
 ) -> dict:
     data = _wait_for_file(
         path=path,
@@ -2897,6 +2973,7 @@ def _require_dispatch_artifact(
         timeout_sec=timeout_sec,
         expected_task_id=task_id,
         expected_round=round_num,
+        expected_run_id=run_id,
         show_manual_hint=False,
     )
     if data is None:
@@ -2915,7 +2992,9 @@ def _dispatch_with_artifact_fallback(
     task_id: str,
     round_num: int,
     timeout_sec: int = DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC,
+    run_id: str | None = None,
 ) -> dict:
+    expected_run_id = run_id if run_id is not None else _current_feed_run_id()
     try:
         dispatch_call()
     except DispatchTimeoutError as e:
@@ -2926,6 +3005,7 @@ def _dispatch_with_artifact_fallback(
             timeout_sec=timeout_sec,
             expected_task_id=task_id,
             expected_round=round_num,
+            expected_run_id=expected_run_id,
             show_manual_hint=False,
         )
         if data is not None:
@@ -2934,15 +3014,28 @@ def _dispatch_with_artifact_fallback(
         raise RuntimeError(str(e)) from e
     if artifact_path.exists():
         data = _read_json_if_exists(artifact_path)
-        if isinstance(data, dict) and data.get("task_id") == task_id and data.get("round") == round_num:
-            _log(f"{role} dispatch produced {artifact_path.name} directly; skipping wait")
-            return data
+        if isinstance(data, dict):
+            artifact_label = f"{artifact_path.name} direct dispatch artifact"
+            try:
+                _enforce_artifact_identity(
+                    data,
+                    artifact_label=artifact_label,
+                    expected_task_id=task_id,
+                    expected_round=round_num,
+                    expected_run_id=expected_run_id,
+                )
+            except ValidationError as e:
+                _log(f"{role} ignoring direct artifact with mismatched identity: {e}")
+            else:
+                _log(f"{role} dispatch produced {artifact_path.name} directly; skipping wait")
+                return data
     return _require_dispatch_artifact(
         role=role,
         path=artifact_path,
         task_id=task_id,
         round_num=round_num,
         timeout_sec=timeout_sec,
+        run_id=expected_run_id,
     )
 
 
@@ -4335,7 +4428,7 @@ def _render_prior_round_context_section(round_num: int) -> str | None:
 
 DEFAULT_WORKER_PROMPT_TEMPLATE = (
     "Role: code-writer worker for PM loop.\n"
-    "Current task_id: {task_id}, round: {round_num}.\n"
+    "Current task_id: {task_id}, round: {round_num}, run_id: {run_id}.\n"
     "Execute the contract below and only finish after writing {work_report_path}.\n\n"
     "=== BEGIN AGENTS.md ===\n"
     "{agents_md}\n"
@@ -4356,7 +4449,7 @@ DEFAULT_WORKER_PROMPT_TEMPLATE = (
 
 DEFAULT_REVIEWER_PROMPT_TEMPLATE = (
     "Role: reviewer for PM loop.\n"
-    "Current task_id: {task_id}, round: {round_num}.\n"
+    "Current task_id: {task_id}, round: {round_num}, run_id: {run_id}.\n"
     "Execute the contract below and only finish after writing {review_report_path}.\n\n"
     "=== HANDOFF CONTEXT ===\n{handoff_section}\n\n"
     "=== BEGIN docs/roles/reviewer.md ===\n"
@@ -4527,8 +4620,14 @@ def _build_prompt_sections(task_id: str, round_num: int) -> list[tuple[str, str]
     return sections
 
 
-def _worker_prompt(task_id: str, round_num: int, paths: LoopPaths | None = None) -> str:
+def _worker_prompt(
+    task_id: str,
+    round_num: int,
+    run_id: str | None = None,
+    paths: LoopPaths | None = None,
+) -> str:
     resolved_paths = _resolve_paths(paths)
+    effective_run_id = _normalize_run_id(run_id) or _current_feed_run_id() or "<missing-run-id>"
     template_path = _worker_prompt_template_path(paths=resolved_paths)
     template_text = _read_text_optional(template_path)
     if template_text is not None:
@@ -4561,6 +4660,7 @@ def _worker_prompt(task_id: str, round_num: int, paths: LoopPaths | None = None)
         context = {
             "task_id": task_id,
             "round_num": str(round_num),
+            "run_id": effective_run_id,
             "work_report_path": _display_path(resolved_paths.work_report),
             "agents_md": agents_text,
             "role_md": role_text,
@@ -4577,11 +4677,14 @@ def _worker_prompt(task_id: str, round_num: int, paths: LoopPaths | None = None)
             "task_card_section": task_card_section,
             "prior_context_section": prior_context_section or "",
         }
-        return _render_prompt_template(template_path=template_path, context=context)
+        rendered = _render_prompt_template(template_path=template_path, context=context)
+        if f"run_id: {effective_run_id}" in rendered:
+            return rendered
+        return rendered.rstrip() + f"\n\n=== RUN CONTEXT ===\nrun_id: {effective_run_id}\n"
 
     header = (
         f"Role: code-writer worker for PM loop.\n"
-        f"Current task_id: {task_id}, round: {round_num}.\n"
+        f"Current task_id: {task_id}, round: {round_num}, run_id: {effective_run_id}.\n"
         f"Execute the contract below and only finish after writing {_display_path(resolved_paths.work_report)}."
     )
     sections = _build_prompt_sections(task_id, round_num)
@@ -4595,10 +4698,12 @@ def _reviewer_prompt_with_report_path(
     task_id: str,
     round_num: int,
     *,
+    run_id: str | None = None,
     review_report_path: Path,
     paths: LoopPaths | None = None,
 ) -> str:
     resolved_paths = _resolve_paths(paths)
+    effective_run_id = _normalize_run_id(run_id) or _current_feed_run_id() or "<missing-run-id>"
     role_text = _read_text_with_default(
         ROOT / "docs" / "roles" / "reviewer.md",
         "reviewer_md_default.txt",
@@ -4606,6 +4711,7 @@ def _reviewer_prompt_with_report_path(
     context = {
         "task_id": task_id,
         "round_num": str(round_num),
+        "run_id": effective_run_id,
         "agents_md": "",
         "role_md": role_text,
         "task_card_section": "",
@@ -4613,17 +4719,26 @@ def _reviewer_prompt_with_report_path(
         "handoff_section": _render_handoff_context_section(task_id, round_num, paths=resolved_paths),
         "review_report_path": _display_path(review_report_path),
     }
-    return _render_prompt_template(
+    rendered = _render_prompt_template(
         template_path=_reviewer_prompt_template_path(paths=resolved_paths),
         context=context,
     )
+    if f"run_id: {effective_run_id}" in rendered:
+        return rendered
+    return rendered.rstrip() + f"\n\n=== RUN CONTEXT ===\nrun_id: {effective_run_id}\n"
 
 
-def _reviewer_prompt(task_id: str, round_num: int, paths: LoopPaths | None = None) -> str:
+def _reviewer_prompt(
+    task_id: str,
+    round_num: int,
+    run_id: str | None = None,
+    paths: LoopPaths | None = None,
+) -> str:
     resolved_paths = _resolve_paths(paths)
     return _reviewer_prompt_with_report_path(
         task_id,
         round_num,
+        run_id=run_id,
         review_report_path=resolved_paths.review_report,
         paths=resolved_paths,
     )
@@ -4638,6 +4753,7 @@ def _lane_reviewer_prompt(
     *,
     task_id: str,
     round_num: int,
+    run_id: str,
     lane_id: str,
     lane_cwd: Path,
     lane_review_request_path: Path,
@@ -4648,6 +4764,7 @@ def _lane_reviewer_prompt(
     base_prompt = _reviewer_prompt_with_report_path(
         task_id,
         round_num,
+        run_id=run_id,
         review_report_path=lane_review_report_path,
         paths=resolved_paths,
     )
@@ -4849,6 +4966,8 @@ def _migrate_state_schema(state: dict) -> dict:
         migrated.setdefault("round", 0)
         migrated.setdefault("task_id", None)
         return migrated
+    if "run_id" in migrated:
+        migrated["run_id"] = _normalize_run_id(migrated.get("run_id"))
     return migrated
 
 
@@ -5420,6 +5539,7 @@ def _lane_review_verdict_from_report(lane_id: str, review: ReviewReport) -> Lane
 def _merge_lane_work_reports(
     *,
     task_id: str,
+    run_id: str,
     round_num: int,
     lane_execution_order: list[str],
     lane_reports: dict[str, WorkReport],
@@ -5492,6 +5612,7 @@ def _merge_lane_work_reports(
         merged_tests.extend(integration_tests)
     merged: WorkReport = {
         "task_id": task_id,
+        "run_id": run_id,
         "head_sha": merged_head_sha,
         "round": round_num,
         "lane_metrics": lane_metrics,
@@ -6740,6 +6861,7 @@ def _validate_report(
     *,
     expected_task_id: str,
     expected_round: int,
+    expected_run_id: str | None = None,
     schema: Literal["work_report", "review_report"],
 ) -> str | None:
     if schema == "work_report":
@@ -6853,6 +6975,8 @@ def _validate_report(
         return f"{prefix} field 'task_id' mismatch: expected {expected_task_id!r}, got {report['task_id']!r}"
     if report["round"] != expected_round:
         return f"{prefix} field 'round' mismatch: expected {expected_round}, got {report['round']!r}"
+    if expected_run_id is not None and report.get("run_id") not in (None, expected_run_id):
+        return f"{prefix} field 'run_id' mismatch: expected {expected_run_id!r}, got {report.get('run_id')!r}"
     return None
 
 
@@ -6878,6 +7002,7 @@ def _wait_for_file(
     timeout_sec: int = 0,
     expected_task_id: str | None = None,
     expected_round: int | None = None,
+    expected_run_id: str | None = None,
     expected_role: str | None = None,
     heartbeat_ttl_sec: int = DEFAULT_HEARTBEAT_TTL_SEC,
     show_manual_hint: bool = True,
@@ -6887,6 +7012,36 @@ def _wait_for_file(
     if show_manual_hint:
         print(f"\n  >>> Tell the {'Worker' if 'work' in path.name else 'Reviewer'} to process their input file. <<<\n")
     start_time = time.monotonic()
+    last_identity_mismatch: str | None = None
+    last_logged_mismatch: str | None = None
+    effective_expected_run_id = expected_run_id if expected_run_id is not None else _current_feed_run_id()
+
+    def _candidate_if_matching_identity(data: dict, *, artifact_label: str) -> dict | None:
+        nonlocal last_identity_mismatch
+        require_run_id = effective_expected_run_id is not None
+        if expected_task_id is None and expected_round is None and not require_run_id:
+            return data
+        artifact_task_id, artifact_round, artifact_run_id = _parse_artifact_identity(
+            data,
+            artifact_label=artifact_label,
+            require_run_id=require_run_id,
+        )
+        expected_task = expected_task_id if expected_task_id is not None else artifact_task_id
+        expected_round_num = expected_round if expected_round is not None else artifact_round
+        expected_run = effective_expected_run_id if effective_expected_run_id is not None else artifact_run_id
+        mismatches: list[str] = []
+        if artifact_task_id != expected_task:
+            mismatches.append(f"task_id expected {expected_task!r}, got {artifact_task_id!r}")
+        if artifact_round != expected_round_num:
+            mismatches.append(f"round expected {expected_round_num}, got {artifact_round!r}")
+        if expected_run is not None and artifact_run_id != expected_run:
+            mismatches.append(f"run_id expected {expected_run!r}, got {artifact_run_id!r}")
+        if mismatches:
+            last_identity_mismatch = f"{artifact_label}: " + "; ".join(mismatches)
+            return None
+        last_identity_mismatch = None
+        return data
+
     while True:
         if expected_role is not None:
             alive, reason = _role_is_alive(expected_role, heartbeat_ttl_sec)
@@ -6896,25 +7051,34 @@ def _wait_for_file(
         if path.exists():
             data = _read_json_if_exists(path)
             if isinstance(data, dict):
-                if expected_task_id is not None or expected_round is not None:
-                    artifact_label = f"{path.name} while waiting for {description}"
-                    artifact_task_id, artifact_round = _parse_artifact_identity(
-                        data,
-                        artifact_label=artifact_label,
-                    )
-                    expected_task = expected_task_id if expected_task_id is not None else artifact_task_id
-                    expected_round_num = expected_round if expected_round is not None else artifact_round
-                    if artifact_task_id != expected_task or artifact_round != expected_round_num:
-                        mismatch_kind = "cross-task" if artifact_task_id != expected_task else "stale"
-                        raise ValidationError(
-                            f"Detected {mismatch_kind} artifact in {path.name}: "
-                            f"expected task_id={expected_task!r} round={expected_round_num}, "
-                            f"got task_id={artifact_task_id!r} round={artifact_round}"
-                        )
-                _log(f"Found {path.name}")
-                return data
+                artifact_label = f"{path.name} while waiting for {description}"
+                try:
+                    candidate = _candidate_if_matching_identity(data, artifact_label=artifact_label)
+                except ValidationError as e:
+                    mismatch_text = str(e)
+                    if mismatch_text != last_logged_mismatch:
+                        _log(f"Ignoring invalid artifact identity in {path.name}: {mismatch_text}")
+                        last_logged_mismatch = mismatch_text
+                    candidate = None
+                if candidate is not None:
+                    _log(f"Found {path.name}")
+                    return candidate
+                if last_identity_mismatch and last_identity_mismatch != last_logged_mismatch:
+                    _log(f"Ignoring stale artifact in {path.name}: {last_identity_mismatch}")
+                    last_logged_mismatch = last_identity_mismatch
         elapsed = time.monotonic() - start_time
         if timeout_sec and elapsed >= timeout_sec:
+            # Final probe to resolve write-vs-timeout races deterministically.
+            final_data = _read_json_if_exists(path) if path.exists() else None
+            if isinstance(final_data, dict):
+                artifact_label = f"{path.name} final timeout probe for {description}"
+                try:
+                    candidate = _candidate_if_matching_identity(final_data, artifact_label=artifact_label)
+                except ValidationError:
+                    candidate = None
+                if candidate is not None:
+                    _log(f"Found {path.name} during final timeout probe")
+                    return candidate
             _log(f"Timeout ({timeout_sec}s) waiting for {path.name}")
             return None
         if elapsed >= _WAIT_SAFETY_CAP_SEC:
@@ -7475,6 +7639,14 @@ def _archive_rounds_for_task(task_id: str, *, paths: LoopPaths | None = None) ->
     return sorted(rounds)
 
 
+def _task_run_id_from_state(task_id: str, *, paths: LoopPaths | None = None) -> str | None:
+    state = _load_state(paths=paths)
+    state_task_id = state.get("task_id")
+    if not isinstance(state_task_id, str) or state_task_id != task_id:
+        return None
+    return _normalize_run_id(state.get("run_id"))
+
+
 def _round_artifact_payload_for_report(
     task_id: str,
     round_num: int,
@@ -7483,6 +7655,7 @@ def _round_artifact_payload_for_report(
     paths: LoopPaths | None = None,
 ) -> dict[str, object] | None:
     resolved_paths = _resolve_paths(paths)
+    expected_run_id = _task_run_id_from_state(task_id, paths=resolved_paths)
     archive_path = _archive_round_artifact_path(task_id, round_num, artifact_name, paths=resolved_paths)
     if archive_path.exists():
         archive_data = _load_archived_round_artifact(
@@ -7507,6 +7680,9 @@ def _round_artifact_payload_for_report(
     live_task_id = live_data.get("task_id")
     live_round = live_data.get("round")
     if live_task_id != task_id or live_round != round_num:
+        return None
+    live_run_id = _normalize_run_id(live_data.get("run_id"))
+    if expected_run_id is not None and live_run_id not in (None, expected_run_id):
         return None
     return cast(dict[str, object], live_data)
 
@@ -8437,6 +8613,7 @@ def _wait_for_role_result(
     config: RunConfig,
     task_id: str,
     round_num: int,
+    run_id: str | None = None,
 ) -> WorkReport | ReviewReport | None:
     return _wait_for_file(
         artifact_path,
@@ -8444,6 +8621,7 @@ def _wait_for_role_result(
         timeout_sec=config.timeout,
         expected_task_id=task_id,
         expected_round=round_num,
+        expected_run_id=run_id,
         expected_role=role if config.require_heartbeat else None,
         heartbeat_ttl_sec=config.heartbeat_ttl,
         show_manual_hint=not config.auto_dispatch,
@@ -8498,21 +8676,27 @@ def _append_pitfalls(lines: list[str]) -> int:
     return len(to_append)
 
 
-def _update_knowledge_on_approval(task_id: str, round_num: int) -> None:
+def _update_knowledge_on_approval(task_id: str, round_num: int, *, run_id: str | None = None) -> None:
     sources: list[ReviewReport] = []
+    effective_run_id = _normalize_run_id(run_id)
 
     current_review_data = _read_json_if_exists(REVIEW_REPORT)
     if (
         isinstance(current_review_data, dict)
         and current_review_data.get("task_id") == task_id
         and current_review_data.get("round") == round_num
+        and (effective_run_id is None or current_review_data.get("run_id") == effective_run_id)
     ):
         current_review = cast(ReviewReport, current_review_data)
         sources.append(current_review)
 
     archived_review_path = _task_archive_dir(task_id) / f"r{round_num}_review_report.json"
     archived_review_data = _read_json_if_exists(archived_review_path)
-    if isinstance(archived_review_data, dict) and archived_review_data.get("task_id") == task_id:
+    if (
+        isinstance(archived_review_data, dict)
+        and archived_review_data.get("task_id") == task_id
+        and (effective_run_id is None or archived_review_data.get("run_id") == effective_run_id)
+    ):
         archived_review = cast(ReviewReport, archived_review_data)
         sources.append(archived_review)
 
@@ -8611,6 +8795,7 @@ def _run_single_round(
     task_card, task_id_from_card = _sync_task_card_to_bus(config.task_path, round_num=round_num, paths=resolved_paths)
 
     state = _load_state(paths=resolved_paths)
+    run_id = _ensure_state_run_id(state)
     if round_num == 1:
         if not isinstance(state.get("task_id"), str) or not cast(str, state.get("task_id")).strip():
             state["task_id"] = task_id_from_card
@@ -8623,6 +8808,7 @@ def _run_single_round(
     _write_task_card_status(config.task_path, TASK_STATUS_IN_PROGRESS, paths=resolved_paths)
     state_task_id = state.get("task_id")
     state_base_sha = state.get("base_sha")
+    state_run_id = _normalize_run_id(state.get("run_id"))
     lane_cleanup_task_id: str | None = None
     lane_cleanup_ids: list[str] = []
     lane_cleanup_done = False
@@ -8645,7 +8831,7 @@ def _run_single_round(
         )
 
     def _archive_single_round_state() -> None:
-        _archive_state_for_round(task_id_from_card, round_num, paths=resolved_paths)
+        _archive_state_for_round(task_id_from_card, round_num, run_id=run_id, paths=resolved_paths)
 
     def _fail_single_round(
         outcome: str,
@@ -8679,6 +8865,8 @@ def _run_single_round(
             return
         state_task_id = task_id_from_card
         state_base_sha = _current_sha()
+        state_run_id = _new_run_id()
+        run_id = state_run_id
         _apply_state_transition(
             state,
             trigger=STATE_TRIGGER_BOOTSTRAP,
@@ -8687,12 +8875,16 @@ def _run_single_round(
             updates={
                 "task_id": state_task_id,
                 "base_sha": state_base_sha,
+                "run_id": run_id,
                 "started_at": _ts(),
                 "round_details": [],
                 "sessions": {},
             },
             archive_before_save=_archive_single_round_state,
         )
+    else:
+        run_id = state_run_id if state_run_id is not None else run_id
+        state["run_id"] = run_id
 
     if state_task_id != task_id_from_card:
         _fail_single_round(
@@ -8706,13 +8898,16 @@ def _run_single_round(
 
     task_id = str(state_task_id)
     base_sha = str(state_base_sha)
+    run_id = _normalize_run_id(run_id) or _new_run_id()
+    state["run_id"] = run_id
     lane_stages = _task_lane_execution_stages(task_card, source=resolved_paths.task_card)
     _set_feed_task_id(task_id)
     _set_feed_round(round_num)
+    _set_feed_run_id(run_id)
 
     _log(f"Loaded task card: {task_id}")
     _log(f"Goal: {task_card.get('goal', '<no goal>')}")
-    _log(f"Single-round state contract: task_id={task_id} base_sha={base_sha}")
+    _log(f"Single-round state contract: task_id={task_id} base_sha={base_sha} run_id={run_id}")
     _emit_lane_execution_plan(
         task_id=task_id,
         round_num=round_num,
@@ -8754,6 +8949,7 @@ def _run_single_round(
         round_num=round_num,
         updates={
             "started_at": _ts(),
+            "run_id": run_id,
             "sessions": sessions,
         },
         archive_before_save=_archive_single_round_state,
@@ -8777,9 +8973,9 @@ def _run_single_round(
         encoding="utf-8",
     )
 
-    worker_prompt = _worker_prompt(task_id, round_num, paths=resolved_paths)
-    _prepare_bus_file(resolved_paths.work_report, task_id, round_num, "work_report")
-    _prepare_bus_file(resolved_paths.review_report, task_id, round_num, "review_report")
+    worker_prompt = _worker_prompt(task_id, round_num, run_id=run_id, paths=resolved_paths)
+    _prepare_bus_file(resolved_paths.work_report, task_id, round_num, "work_report", run_id=run_id)
+    _prepare_bus_file(resolved_paths.review_report, task_id, round_num, "review_report", run_id=run_id)
 
     _print_round_header(round_num, "worker")
 
@@ -8844,6 +9040,7 @@ def _run_single_round(
                 task_id=task_id,
                 round_num=round_num,
                 timeout_sec=config.artifact_timeout,
+                run_id=run_id,
             )
             lane_work = cast(WorkReport, artifact)
             artifact_written_latency_ms = max(0, int((time.monotonic() - dispatch_started_at) * 1000))
@@ -8906,6 +9103,7 @@ def _run_single_round(
                 lane_work,
                 expected_task_id=task_id,
                 expected_round=round_num,
+                expected_run_id=run_id,
                 schema="work_report",
             )
             if lane_error:
@@ -8946,6 +9144,7 @@ def _run_single_round(
             lane_acceptance_criteria.extend([f"[lane:{lane_id}] {item}" for item in lane_acceptance_checks])
             lane_review_request: ReviewRequest = {
                 "task_id": task_id,
+                "run_id": run_id,
                 "base_sha": base_sha,
                 "head_sha": lane_head_sha,
                 "commits": lane_commits,
@@ -8972,6 +9171,7 @@ def _run_single_round(
             lane_review_prompt = _lane_reviewer_prompt(
                 task_id=task_id,
                 round_num=round_num,
+                run_id=run_id,
                 lane_id=lane_id,
                 lane_cwd=lane_handle.path,
                 lane_review_request_path=Path(".loop/review_request.json"),
@@ -9011,12 +9211,14 @@ def _run_single_round(
                 task_id=task_id,
                 round_num=round_num,
                 timeout_sec=config.artifact_timeout,
+                run_id=run_id,
             )
             lane_review = cast(ReviewReport, artifact)
             lane_review_error = _validate_report(
                 lane_review,
                 expected_task_id=task_id,
                 expected_round=round_num,
+                expected_run_id=run_id,
                 schema="review_report",
             )
             if lane_review_error:
@@ -9304,6 +9506,7 @@ def _run_single_round(
 
         work = _merge_lane_work_reports(
             task_id=task_id,
+            run_id=run_id,
             round_num=round_num,
             lane_execution_order=lane_execution_order,
             lane_reports=lane_reports,
@@ -9386,6 +9589,7 @@ def _run_single_round(
         work,
         expected_task_id=task_id,
         expected_round=round_num,
+        expected_run_id=run_id,
         schema="work_report",
     )
     if report_error:
@@ -9430,6 +9634,7 @@ def _run_single_round(
 
     review_request: ReviewRequest = {
         "task_id": task_id,
+        "run_id": run_id,
         "base_sha": base_sha,
         "head_sha": head_sha,
         "commits": commits,
@@ -9445,7 +9650,7 @@ def _run_single_round(
         json.dumps(review_request, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
-    _prepare_bus_file(resolved_paths.review_report, task_id, round_num, "review_report")
+    _prepare_bus_file(resolved_paths.review_report, task_id, round_num, "review_report", run_id=run_id)
 
     _apply_state_transition(
         state,
@@ -9461,7 +9666,7 @@ def _run_single_round(
     try:
         review = _auto_dispatch_role(
             role="reviewer",
-            prompt=_reviewer_prompt(task_id, round_num, paths=resolved_paths),
+            prompt=_reviewer_prompt(task_id, round_num, run_id=run_id, paths=resolved_paths),
             config=config,
             task_id=task_id,
             round_num=round_num,
@@ -9503,6 +9708,7 @@ def _run_single_round(
         review,
         expected_task_id=task_id,
         expected_round=round_num,
+        expected_run_id=run_id,
         schema="review_report",
     )
     if review_error:
@@ -9549,7 +9755,7 @@ def _run_single_round(
 
     if decision == "approve":
         try:
-            _update_knowledge_on_approval(task_id, round_num)
+            _update_knowledge_on_approval(task_id, round_num, run_id=run_id)
         except OSError as e:
             _log(f"Warning: failed to update knowledge context on approval: {e}")
         _apply_state_transition(
@@ -9568,6 +9774,7 @@ def _run_single_round(
             json.dumps(
                 {
                     "task_id": task_id,
+                    "run_id": run_id,
                     "outcome": "approved",
                     "rounds": round_num,
                     "base_sha": base_sha,
@@ -9602,6 +9809,7 @@ def _run_single_round(
     blocking_items = cast(list[ReviewIssue], [item for item in blocking if isinstance(item, dict)])
     fix_list: FixList = {
         "task_id": task_id,
+        "run_id": run_id,
         "round": round_num + 1,
         "base_sha": base_sha,
         "head_sha": head_sha,
@@ -9614,7 +9822,7 @@ def _run_single_round(
         json.dumps(fix_list, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
-    _prepare_bus_file(resolved_paths.work_report, task_id, round_num, "work_report")
+    _prepare_bus_file(resolved_paths.work_report, task_id, round_num, "work_report", run_id=run_id)
 
     _print_blocking_issues(blocking_items)
     print(f"  Fix list written to {resolved_paths.fix_list}")
@@ -9654,6 +9862,7 @@ def _run_multi_round_via_subprocess(
     start_round = 1
     task_id = ""
     base_sha = ""
+    run_id = ""
     if resume_from_state is None:
         task_card, task_id = _sync_task_card_to_bus(config.task_path, round_num=1, paths=resolved_paths)
         preflight_state = _load_state(paths=resolved_paths)
@@ -9673,6 +9882,8 @@ def _run_multi_round_via_subprocess(
 
         base_sha = _current_sha()
         _log(f"Base SHA: {base_sha}")
+        run_id = _new_run_id()
+        _set_feed_run_id(run_id)
 
         state = _load_state(paths=resolved_paths)
         _apply_state_transition(
@@ -9683,6 +9894,7 @@ def _run_multi_round_via_subprocess(
             updates={
                 "task_id": task_id,
                 "base_sha": base_sha,
+                "run_id": run_id,
                 "started_at": _ts(),
                 "sessions": {},
             },
@@ -9725,11 +9937,13 @@ def _run_multi_round_via_subprocess(
             return
         task_id = state_task_id
         base_sha = state_base_sha
+        run_id = _ensure_state_run_id(state)
         start_round = state_round
         _set_feed_task_id(task_id)
         _set_feed_round(start_round)
+        _set_feed_run_id(run_id)
         _log(f"Resuming task: {task_id}")
-        _log(f"Resume contract: base_sha={base_sha} round={start_round}")
+        _log(f"Resume contract: base_sha={base_sha} round={start_round} run_id={run_id}")
         if not isinstance(state.get("round_details"), list):
             state["round_details"] = []
         sessions = _normalize_sessions_map(state.get("sessions"))
@@ -9742,14 +9956,15 @@ def _run_multi_round_via_subprocess(
             round_num=start_round,
             updates={
                 "started_at": _ts(),
+                "run_id": run_id,
                 "sessions": sessions,
             },
         )
 
     _write_task_card_status(config.task_path, TASK_STATUS_IN_PROGRESS, paths=resolved_paths)
 
-    _prepare_bus_file(resolved_paths.work_report, task_id, start_round, "work_report")
-    _prepare_bus_file(resolved_paths.review_report, task_id, start_round, "review_report")
+    _prepare_bus_file(resolved_paths.work_report, task_id, start_round, "work_report", run_id=run_id)
+    _prepare_bus_file(resolved_paths.review_report, task_id, start_round, "review_report", run_id=run_id)
     for role in ("worker", "reviewer"):
         _dispatch_log_path(role, paths=resolved_paths).unlink(missing_ok=True)
 
@@ -9781,6 +9996,7 @@ def _run_multi_round_via_subprocess(
         for round_num in range(start_round, config.max_rounds + 1):
             current_round = round_num
             _set_feed_round(round_num)
+            _set_feed_run_id(run_id)
             if _interrupted_event.is_set():
                 interrupted = True
                 break
@@ -9788,7 +10004,7 @@ def _run_multi_round_via_subprocess(
             print(f"\n{'=' * 60}")
             print(f"  ROUND {round_num}/{config.max_rounds}  —  Single-Round Subprocess")
             print(f"{'=' * 60}")
-            _archive_bus_file(resolved_paths.state, task_id, round_num, "state")
+            _archive_bus_file(resolved_paths.state, task_id, round_num, "state", run_id=run_id)
 
             cmd = _single_round_subprocess_cmd(
                 config=config,
@@ -9860,14 +10076,14 @@ def _run_multi_round_via_subprocess(
             state = _load_state(paths=resolved_paths)
             normalized_state_name = _normalized_state_name_from_persisted(state)
 
-            if state.get("task_id") != task_id or state.get("base_sha") != base_sha:
+            if state.get("task_id") != task_id or state.get("base_sha") != base_sha or state.get("run_id") != run_id:
                 _fail_with_state(
                     state,
                     outcome="state_contract_mismatch",
                     message=(
                         "state.json contract mismatch after single-round subprocess: "
-                        f"expected task_id={task_id} base_sha={base_sha}, "
-                        f"got task_id={state.get('task_id')} base_sha={state.get('base_sha')}"
+                        f"expected task_id={task_id} base_sha={base_sha} run_id={run_id}, "
+                        f"got task_id={state.get('task_id')} base_sha={state.get('base_sha')} run_id={state.get('run_id')}"
                     ),
                     exit_code=EXIT_VALIDATION_ERROR,
                     task_path=config.task_path,
@@ -9885,6 +10101,7 @@ def _run_multi_round_via_subprocess(
                 if (
                     fix_list is not None
                     and fix_list.get("task_id") == task_id
+                    and fix_list.get("run_id") == run_id
                     and fix_list.get("round") == round_num + 1
                 ):
                     blocking = fix_list.get("fixes", [])
