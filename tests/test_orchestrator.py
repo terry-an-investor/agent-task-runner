@@ -18,6 +18,29 @@ import pytest
 from loop_kit import orchestrator
 
 
+@pytest.fixture(autouse=True)
+def _isolate_orchestrator_path_globals() -> None:
+    original_root = orchestrator.ROOT
+    original_paths = orchestrator._snapshot_global_paths()
+    original_global_paths = orchestrator._global_paths
+    original_feed_task_id = orchestrator._FEED_TASK_ID
+    original_feed_round = orchestrator._FEED_ROUND
+    original_feed_run_id = orchestrator._FEED_RUN_ID
+    original_feed_route_policy = orchestrator._FEED_TASK_ROUTE_POLICY
+    original_logs_ensured = orchestrator._LOGS_DIR_ENSURED
+    original_logs_ensured_path = orchestrator._LOGS_DIR_ENSURED_PATH
+    yield
+    orchestrator.ROOT = original_root
+    orchestrator._apply_loop_paths(original_paths)
+    orchestrator._global_paths = original_global_paths
+    orchestrator._set_feed_task_id(original_feed_task_id)
+    orchestrator._set_feed_round(original_feed_round)
+    orchestrator._set_feed_run_id(original_feed_run_id)
+    orchestrator._set_feed_task_route_policy(original_feed_route_policy)
+    orchestrator._LOGS_DIR_ENSURED = original_logs_ensured
+    orchestrator._LOGS_DIR_ENSURED_PATH = original_logs_ensured_path
+
+
 class _FakeStdin:
     def __init__(self) -> None:
         self.value = ""
@@ -286,7 +309,13 @@ def test_main_loop_dir_overrides_all_bus_paths(tmp_path: Path, monkeypatch) -> N
     monkeypatch.setattr(orchestrator, "ROOT", tmp_path)
     captured: dict[str, Path] = {}
 
-    def fake_status() -> None:
+    def fake_status(
+        *,
+        tree: bool = False,
+        dependency_map: bool = False,
+        paths: orchestrator.LoopPaths | None = None,
+    ) -> None:
+        _ = (tree, dependency_map, paths)
         captured["loop_dir"] = orchestrator.LOOP_DIR
         captured["logs_dir"] = orchestrator.LOGS_DIR
         captured["runtime_dir"] = orchestrator.RUNTIME_DIR
@@ -361,6 +390,23 @@ def test_main_init_creates_prompt_templates_in_loop_dir(tmp_path: Path, monkeypa
     pattern_entry = json.loads(patterns.read_text(encoding="utf-8").strip())
     assert pattern_entry["category"] == "example"
     assert pattern_entry["confidence"] == 0.0
+
+
+def test_main_status_dependency_map_flag_dispatches_to_cmd_status(monkeypatch) -> None:
+    captured: dict[str, bool] = {}
+
+    def fake_status(*, tree: bool = False, dependency_map: bool = False, paths=None) -> None:
+        _ = paths
+        captured["tree"] = tree
+        captured["dependency_map"] = dependency_map
+
+    monkeypatch.setattr(orchestrator, "cmd_status", fake_status)
+    monkeypatch.setattr(sys, "argv", ["orchestrator.py", "status", "--dependency-map"])
+
+    orchestrator.main()
+
+    assert captured["tree"] is False
+    assert captured["dependency_map"] is True
 
 
 def test_main_index_dispatches_to_cmd_index(monkeypatch) -> None:
@@ -3622,30 +3668,11 @@ def _configure_loop_paths(monkeypatch, tmp_path: Path) -> None:
     loop_dir = tmp_path / ".loop"
     logs_dir = loop_dir / "logs"
     runtime_dir = loop_dir / "runtime"
-    loop_dir.mkdir()
-    logs_dir.mkdir()
-    runtime_dir.mkdir()
     monkeypatch.setattr(orchestrator, "ROOT", tmp_path)
-    monkeypatch.setattr(orchestrator, "LOOP_DIR", loop_dir)
-    monkeypatch.setattr(orchestrator, "LOGS_DIR", logs_dir)
-    monkeypatch.setattr(orchestrator, "RUNTIME_DIR", runtime_dir)
-    monkeypatch.setattr(orchestrator, "ARCHIVE_DIR", loop_dir / "archive")
-    monkeypatch.setattr(orchestrator, "STATE_FILE", loop_dir / "state.json")
-    monkeypatch.setattr(orchestrator, "_STATE_BACKUP", loop_dir / ".state.json.bak")
-    monkeypatch.setattr(orchestrator, "TASK_CARD", loop_dir / "task_card.json")
-    monkeypatch.setattr(orchestrator, "FIX_LIST", loop_dir / "fix_list.json")
-    monkeypatch.setattr(orchestrator, "WORK_REPORT", loop_dir / "work_report.json")
-    monkeypatch.setattr(orchestrator, "REVIEW_REQ", loop_dir / "review_request.json")
-    monkeypatch.setattr(orchestrator, "REVIEW_REPORT", loop_dir / "review_report.json")
-    monkeypatch.setattr(orchestrator, "LOCK_FILE", loop_dir / "lock")
-    monkeypatch.setattr(orchestrator, "_CONFIG_FILE", loop_dir / "config.json")
-    monkeypatch.setattr(orchestrator, "TASK_PACKET", loop_dir / "task_packet.json")
-    monkeypatch.setattr(orchestrator, "_HANDOFF_DIR", loop_dir / "handoff")
-    monkeypatch.setattr(orchestrator, "_CONTEXT_DIR", loop_dir / "context")
-    monkeypatch.setattr(orchestrator, "_MODULE_MAP_FILE", loop_dir / "context" / "module_map.json")
-    monkeypatch.setattr(orchestrator, "_PROJECT_FACTS_FILE", loop_dir / "context" / "project_facts.md")
-    monkeypatch.setattr(orchestrator, "_PITFALLS_FILE", loop_dir / "context" / "pitfalls.md")
-    monkeypatch.setattr(orchestrator, "_PATTERNS_FILE", loop_dir / "context" / "patterns.jsonl")
+    orchestrator._configure_loop_paths(".loop")
+    loop_dir.mkdir(parents=True, exist_ok=True)
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    runtime_dir.mkdir(parents=True, exist_ok=True)
     orchestrator._set_feed_task_id(None)
     (tmp_path / "AGENTS.md").write_text("AGENTS_CONTENT", encoding="utf-8")
     role_dir = tmp_path / "docs" / "roles"
@@ -8433,6 +8460,19 @@ class TestCmdStatus:
         assert "blocked by T-911: status='in_progress' (expected 'done')" in out
         assert "Root blockers:" in out
 
+    def test_status_can_show_critical_dependency_map(self, tmp_path: Path, monkeypatch, capsys) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+
+        orchestrator.cmd_status(dependency_map=True)
+        out = capsys.readouterr().out
+
+        assert "Critical dependency map:" in out
+        assert "dispatch:" in out
+        assert "session:" in out
+        assert "file-bus:" in out
+        assert "state:" in out
+        assert "integrity: OK" in out
+
 
 class TestCmdHealth:
     def test_reports_both_roles(self, tmp_path: Path, monkeypatch, capsys) -> None:
@@ -11422,12 +11462,81 @@ def test_state_migration_is_idempotent(tmp_path: Path, monkeypatch) -> None:
 
 
 def test_single_file_section_ownership_map_covers_required_boundaries() -> None:
-    required = {"exceptions", "paths", "state", "lock", "dispatch", "config", "prompts"}
+    required = {"exceptions", "paths", "state", "file_bus", "lock", "dispatch", "session", "config", "prompts"}
     section_map = orchestrator._SECTION_OWNERSHIP_MAP
 
     assert required.issubset(section_map)
     for section in required:
         assert section_map[section]
+
+
+def test_critical_dependency_map_diagnostics_cover_required_sections() -> None:
+    diagnostics = orchestrator._critical_dependency_map_diagnostics()
+
+    assert tuple(diagnostics["sections"].keys()) == orchestrator._CRITICAL_DEPENDENCY_SECTION_ORDER
+    assert diagnostics["missing_symbols"] == {}
+
+
+def test_path_helpers_use_explicit_paths_instead_of_global_path_constants(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+    explicit_paths = orchestrator._build_loop_paths(tmp_path / ".loop-explicit")
+
+    monkeypatch.setattr(orchestrator, "LOGS_DIR", tmp_path / ".loop-global-logs")
+    monkeypatch.setattr(orchestrator, "_HANDOFF_DIR", tmp_path / ".loop-global-handoff")
+
+    assert orchestrator._dispatch_log_path("worker", paths=explicit_paths) == explicit_paths.logs / "worker_dispatch.log"
+    assert orchestrator._feed_log_path(paths=explicit_paths) == explicit_paths.logs / "feed.jsonl"
+    assert (
+        orchestrator._feed_quarantine_log_path(paths=explicit_paths)
+        == explicit_paths.logs / orchestrator._FEED_QUARANTINE_LOG_FILENAME
+    )
+    assert orchestrator._task_handoff_dir("T-555", paths=explicit_paths) == explicit_paths.dir / "handoff" / "T-555"
+
+
+def test_migrated_path_helpers_reject_direct_global_path_reads() -> None:
+    source = Path(orchestrator.__file__).read_text(encoding="utf-8")
+    module = ast.parse(source)
+    target_functions = {
+        "_task_archive_dir",
+        "_task_handoff_dir",
+        "_dispatch_log_path",
+        "_feed_log_path",
+        "_feed_quarantine_log_path",
+        "_load_state",
+        "_save_state",
+    }
+    forbidden_globals = {
+        "LOOP_DIR",
+        "LOGS_DIR",
+        "ARCHIVE_DIR",
+        "STATE_FILE",
+        "_STATE_BACKUP",
+        "TASK_CARD",
+        "FIX_LIST",
+        "WORK_REPORT",
+        "REVIEW_REQ",
+        "REVIEW_REPORT",
+        "_SUMMARY_FILE",
+        "_CONFIG_FILE",
+        "_TASKS_DIR",
+        "TASK_PACKET",
+        "_HANDOFF_DIR",
+        "_CONTEXT_DIR",
+    }
+    violations: dict[str, list[str]] = {}
+    for node in module.body:
+        if not isinstance(node, ast.FunctionDef) or node.name not in target_functions:
+            continue
+        loaded_names = {
+            name.id
+            for name in ast.walk(node)
+            if isinstance(name, ast.Name) and isinstance(name.ctx, ast.Load)
+        }
+        direct_globals = sorted(name for name in loaded_names if name in forbidden_globals)
+        if direct_globals:
+            violations[node.name] = direct_globals
+
+    assert violations == {}
 
 
 def test_orchestrator_error_class_names_are_unique() -> None:

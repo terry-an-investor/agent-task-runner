@@ -217,6 +217,17 @@ class TaskCard(TypedDict, total=False):
     lane_preserve_worktrees_on_failure: NotRequired[bool]
 
 
+class CriticalDependencySection(TypedDict):
+    owners: tuple[str, ...]
+    depends_on: tuple[str, ...]
+    contracts: tuple[str, ...]
+
+
+class CriticalDependencyDiagnostics(TypedDict):
+    sections: dict[str, CriticalDependencySection]
+    missing_symbols: dict[str, list[str]]
+
+
 # ── single-file architecture boundaries (T-722) ────────────────────────────
 # The orchestrator intentionally remains single-file. Keep changes within these
 # section boundaries so ownership is explicit even without a physical split.
@@ -224,10 +235,42 @@ _SECTION_OWNERSHIP_MAP: dict[str, tuple[str, ...]] = {
     "exceptions": ("LoopKitError", "StateError", "DispatchError", "ValidationError", "ConfigError"),
     "paths": ("LoopPaths", "_path", "_configure_loop_paths", "_resolve_paths"),
     "state": ("_default_state", "_load_state", "_save_state", "_apply_state_transition"),
+    "file_bus": ("_prepare_bus_file", "_archive_bus_file", "_wait_for_file", "_sync_task_card_to_bus"),
     "lock": ("_lock_file", "_unlock_file", "_LoopLock", "_acquire_run_lock"),
-    "dispatch": ("register_backend", "_agent_command", "_run_auto_dispatch", "_dispatch_with_retry"),
+    "dispatch": ("register_backend", "_agent_command", "_run_auto_dispatch", "_dispatch_with_artifact_fallback"),
+    "session": ("SessionManager", "_session_resume_id", "_resolve_session_resume_policy", "_store_session"),
     "config": ("RunConfig", "_load_config", "_load_env_config", "_validate_run_config"),
     "prompts": ("_render_task_packet_section", "_worker_prompt", "_reviewer_prompt"),
+}
+
+_CRITICAL_DEPENDENCY_SECTION_ORDER = ("dispatch", "session", "file-bus", "state")
+_CRITICAL_DEPENDENCY_MAP: dict[str, CriticalDependencySection] = {
+    "dispatch": {
+        "owners": ("_run_auto_dispatch", "_dispatch_with_artifact_fallback"),
+        "depends_on": (
+            "_agent_command",
+            "_require_registered_backend",
+            "_resolve_session_resume_policy",
+            "_store_session",
+            "_report_dispatch_result",
+        ),
+        "contracts": ("WORK_REPORT", "REVIEW_REPORT", "_feed_event"),
+    },
+    "session": {
+        "owners": ("SessionManager", "_session_resume_id", "_resolve_session_resume_policy", "_store_session"),
+        "depends_on": ("_normalize_sessions_map", "_session_contract_invalidation_reason", "_current_sha"),
+        "contracts": ("state['sessions']", "state['run_id']", "state['base_sha']"),
+    },
+    "file-bus": {
+        "owners": ("_prepare_bus_file", "_archive_bus_file", "_wait_for_file", "_sync_task_card_to_bus"),
+        "depends_on": ("_resolve_paths", "_enforce_artifact_identity", "_task_archive_dir", "_task_handoff_dir"),
+        "contracts": ("TASK_CARD", "FIX_LIST", "WORK_REPORT", "REVIEW_REQ", "REVIEW_REPORT"),
+    },
+    "state": {
+        "owners": ("_default_state", "_load_state", "_save_state", "_apply_state_transition"),
+        "depends_on": ("_migrate_state_schema", "_atomic_write_json", "_validate_state_transition_residue"),
+        "contracts": ("STATE_FILE", "_STATE_BACKUP", "state['version']"),
+    },
 }
 
 
@@ -694,8 +737,56 @@ def _task_archive_dir(task_id: str, paths: LoopPaths | None = None) -> Path:
 
 
 def _task_handoff_dir(task_id: str, paths: LoopPaths | None = None) -> Path:
-    _ = _resolve_paths(paths)
-    return _HANDOFF_DIR / task_id
+    resolved_paths = _resolve_paths(paths)
+    return resolved_paths.dir / "handoff" / task_id
+
+
+def _critical_dependency_map_diagnostics() -> CriticalDependencyDiagnostics:
+    sections: dict[str, CriticalDependencySection] = {
+        section: {
+            "owners": tuple(spec["owners"]),
+            "depends_on": tuple(spec["depends_on"]),
+            "contracts": tuple(spec["contracts"]),
+        }
+        for section, spec in _CRITICAL_DEPENDENCY_MAP.items()
+    }
+    known_symbols = globals()
+    missing_symbols: dict[str, list[str]] = {}
+    for section in _CRITICAL_DEPENDENCY_SECTION_ORDER:
+        spec = sections[section]
+        unresolved = [
+            symbol
+            for symbol in (*spec["owners"], *spec["depends_on"], *spec["contracts"])
+            if "[" not in symbol and symbol not in known_symbols
+        ]
+        if unresolved:
+            missing_symbols[section] = unresolved
+    return {
+        "sections": sections,
+        "missing_symbols": missing_symbols,
+    }
+
+
+def _render_critical_dependency_map_lines() -> list[str]:
+    diagnostics = _critical_dependency_map_diagnostics()
+    sections = diagnostics["sections"]
+    lines: list[str] = []
+    for section in _CRITICAL_DEPENDENCY_SECTION_ORDER:
+        info = sections[section]
+        lines.append(f"  {section}:")
+        lines.append(f"    owners: {', '.join(info['owners'])}")
+        lines.append(f"    depends_on: {', '.join(info['depends_on'])}")
+        lines.append(f"    contracts: {', '.join(info['contracts'])}")
+    missing_symbols = diagnostics["missing_symbols"]
+    if not missing_symbols:
+        lines.append("  integrity: OK")
+    else:
+        lines.append("  integrity: drift detected")
+        for section in _CRITICAL_DEPENDENCY_SECTION_ORDER:
+            missing = missing_symbols.get(section)
+            if missing:
+                lines.append(f"    {section}: {', '.join(missing)}")
+    return lines
 
 
 def _normalize_run_id(value: object) -> str | None:
@@ -7568,7 +7659,7 @@ def cmd_init(paths: LoopPaths | None = None) -> None:
 
 
 # ── status ──────────────────────────────────────────────────────────
-def cmd_status(*, tree: bool = False, paths: LoopPaths | None = None) -> None:
+def cmd_status(*, tree: bool = False, dependency_map: bool = False, paths: LoopPaths | None = None) -> None:
     resolved_paths = _resolve_paths(paths)
     state = _load_state(paths=resolved_paths)
     print(f"State: {state.get('state', 'unknown')}")
@@ -7622,17 +7713,22 @@ def cmd_status(*, tree: bool = False, paths: LoopPaths | None = None) -> None:
         print("Dependency tree:")
         if not resolved_paths.task_card.exists():
             print("  task_card.json missing; cannot render dependency tree.")
-            return
-        snapshot = _build_task_dependency_snapshot(str(resolved_paths.task_card), paths=resolved_paths)
-        for line in _render_dependency_tree(snapshot):
-            print(f"  {line}")
-        root_blockers = _dependency_blocked_reasons(snapshot)
-        if root_blockers:
-            print("  Root blockers:")
-            for reason in root_blockers:
-                print(f"    - {reason}")
         else:
-            print("  Root blockers: none")
+            snapshot = _build_task_dependency_snapshot(str(resolved_paths.task_card), paths=resolved_paths)
+            for line in _render_dependency_tree(snapshot):
+                print(f"  {line}")
+            root_blockers = _dependency_blocked_reasons(snapshot)
+            if root_blockers:
+                print("  Root blockers:")
+                for reason in root_blockers:
+                    print(f"    - {reason}")
+            else:
+                print("  Root blockers: none")
+    if dependency_map:
+        print()
+        print("Critical dependency map:")
+        for line in _render_critical_dependency_map_lines():
+            print(line)
 
 
 def _restore_target_name_from_archive(stem: str) -> str:
@@ -10788,6 +10884,11 @@ def main() -> None:
         action="store_true",
         help="Render task dependency tree and blocked reasons from task_card.json",
     )
+    status_p.add_argument(
+        "--dependency-map",
+        action="store_true",
+        help="Show internal dependency map diagnostics for dispatch/session/file-bus/state",
+    )
 
     health_p = sub.add_parser("health", parents=[shared], help="Show worker/reviewer heartbeat health")
     health_p.add_argument(
@@ -10975,10 +11076,7 @@ def main() -> None:
         elif args.cmd == "index":
             cmd_index()
         elif args.cmd == "status":
-            if args.tree:
-                cmd_status(tree=True)
-            else:
-                cmd_status()
+            cmd_status(tree=bool(args.tree), dependency_map=bool(args.dependency_map))
         elif args.cmd == "health":
             cmd_health(args.ttl)
         elif args.cmd == "dispatch-metrics":

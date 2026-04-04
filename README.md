@@ -157,6 +157,17 @@ If a transition tries to persist forbidden residue (for example stale `error` on
 - **Strict rotation contract**: when `--max-session-rounds > 0`, only sessions with valid `started_round` are resumable; rotated/legacy entries are cleared before dispatch and persistence
 - **Deterministic retry budget**: dispatch attempts are always bounded to `--dispatch-retries + 1` (invalid resume fallback consumes that same budget)
 
+### Internal Dependency Diagnostics
+
+`loop status --dependency-map` prints a lightweight internal dependency map for critical orchestrator sections:
+
+- `dispatch`
+- `session`
+- `file-bus`
+- `state`
+
+The diagnostic includes owner symbols, upstream dependencies, and core contracts, plus an integrity line that flags missing symbols after refactors.
+
 ### Integration Lane (Deterministic Merge V1)
 
 When `lanes` run in parallel, Loop Kit adds an explicit internal integration lane before reviewer handoff:
@@ -194,7 +205,7 @@ loop init                  Create .loop/ directory and templates
 loop index                 Build offline module map
 loop run                   Run the full review loop
 loop knowledge             Manage built-in knowledge
-loop status                Show current state (--tree for DAG view)
+loop status                Show current state (--tree for DAG view, --dependency-map for internals)
 loop health                Show worker/reviewer heartbeat
 loop dispatch-metrics      Summarize latency metrics
 loop diff                  Compare artifacts between rounds
