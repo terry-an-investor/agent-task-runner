@@ -1436,6 +1436,175 @@ def test_auto_dispatch_role_invalidates_sessions_on_base_sha_mismatch(tmp_path: 
     assert saved["sessions"] == {}
 
 
+def test_auto_dispatch_role_invalidates_sessions_on_task_switch(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+    state = {
+        "state": orchestrator.STATE_AWAITING_WORK,
+        "round": 2,
+        "task_id": "T-OLD",
+        "base_sha": "base-sha",
+        "run_id": "run-old",
+        "sessions": {
+            "worker": {"session_id": "sid-worker", "backend": "codex", "started_round": 1},
+            "reviewer": {"session_id": "sid-reviewer", "backend": "claude", "started_round": 1},
+        },
+    }
+    orchestrator._save_state(state)
+
+    captured: dict[str, object] = {}
+
+    def fake_run_auto_dispatch(*, resume_session_id: str | None = None, **kwargs) -> str | None:
+        _ = kwargs
+        captured["resume_session_id"] = resume_session_id
+        return None
+
+    def fake_dispatch_with_artifact_fallback(
+        *,
+        role: str,
+        dispatch_call,
+        artifact_path: Path,
+        task_id: str,
+        round_num: int,
+        timeout_sec: int = orchestrator.DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC,
+    ) -> dict:
+        _ = (role, artifact_path, timeout_sec)
+        dispatch_call()
+        return {"task_id": task_id, "round": round_num}
+
+    monkeypatch.setattr(orchestrator, "_run_auto_dispatch", fake_run_auto_dispatch)
+    monkeypatch.setattr(orchestrator, "_dispatch_with_artifact_fallback", fake_dispatch_with_artifact_fallback)
+    monkeypatch.setattr(orchestrator, "_current_sha", lambda: "base-sha")
+
+    orchestrator._auto_dispatch_role(
+        role="worker",
+        prompt="prompt",
+        config=orchestrator.RunConfig(auto_dispatch=True, worker_backend="codex"),
+        task_id="T-NEW",
+        round_num=2,
+        artifact_path=orchestrator.WORK_REPORT,
+        state=state,
+    )
+
+    assert captured["resume_session_id"] is None
+    saved = json.loads(orchestrator.STATE_FILE.read_text(encoding="utf-8"))
+    assert saved["sessions"] == {}
+
+
+def test_auto_dispatch_role_invalidates_reviewer_session_on_round_reset(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+    state = {
+        "state": orchestrator.STATE_AWAITING_REVIEW,
+        "round": 3,
+        "task_id": "T-627",
+        "base_sha": "base-sha",
+        "run_id": "run-1",
+        "sessions": {
+            "worker": {"session_id": "sid-worker", "backend": "codex", "started_round": 1},
+            "reviewer": {"session_id": "sid-reviewer", "backend": "claude", "started_round": 2},
+        },
+    }
+    orchestrator._save_state(state)
+
+    captured: dict[str, object] = {}
+
+    def fake_run_auto_dispatch(*, resume_session_id: str | None = None, **kwargs) -> str | None:
+        _ = kwargs
+        captured["resume_session_id"] = resume_session_id
+        return None
+
+    def fake_dispatch_with_artifact_fallback(
+        *,
+        role: str,
+        dispatch_call,
+        artifact_path: Path,
+        task_id: str,
+        round_num: int,
+        timeout_sec: int = orchestrator.DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC,
+    ) -> dict:
+        _ = (role, artifact_path, timeout_sec)
+        dispatch_call()
+        return {"task_id": task_id, "round": round_num}
+
+    monkeypatch.setattr(orchestrator, "_run_auto_dispatch", fake_run_auto_dispatch)
+    monkeypatch.setattr(orchestrator, "_dispatch_with_artifact_fallback", fake_dispatch_with_artifact_fallback)
+    monkeypatch.setattr(orchestrator, "_current_sha", lambda: "base-sha")
+
+    orchestrator._auto_dispatch_role(
+        role="reviewer",
+        prompt="prompt",
+        config=orchestrator.RunConfig(auto_dispatch=True, reviewer_backend="claude"),
+        task_id="T-627",
+        round_num=1,
+        artifact_path=orchestrator.REVIEW_REPORT,
+        state=state,
+    )
+
+    assert captured["resume_session_id"] is None
+    saved = json.loads(orchestrator.STATE_FILE.read_text(encoding="utf-8"))
+    assert saved["sessions"] == {}
+
+
+def test_auto_dispatch_role_invalidates_reviewer_session_on_history_rewrite(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+    state = {
+        "state": orchestrator.STATE_AWAITING_REVIEW,
+        "round": 2,
+        "task_id": "T-627",
+        "base_sha": "base-sha",
+        "head_sha": "worker-head-sha",
+        "run_id": "run-1",
+        "sessions": {"reviewer": {"session_id": "sid-reviewer", "backend": "claude", "started_round": 2}},
+    }
+    orchestrator._save_state(state)
+
+    captured: dict[str, object] = {}
+
+    def fake_run_auto_dispatch(*, resume_session_id: str | None = None, **kwargs) -> str | None:
+        _ = kwargs
+        captured["resume_session_id"] = resume_session_id
+        return None
+
+    def fake_dispatch_with_artifact_fallback(
+        *,
+        role: str,
+        dispatch_call,
+        artifact_path: Path,
+        task_id: str,
+        round_num: int,
+        timeout_sec: int = orchestrator.DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC,
+    ) -> dict:
+        _ = (role, artifact_path, timeout_sec)
+        dispatch_call()
+        return {"task_id": task_id, "round": round_num}
+
+    def fake_git_is_ancestor(ancestor_ref: str, descendant_ref: str, *, timeout=None) -> bool:
+        _ = timeout
+        if ancestor_ref == "worker-head-sha" and descendant_ref == "base-sha":
+            return False
+        if ancestor_ref == "base-sha" and descendant_ref == "worker-head-sha":
+            return True
+        raise AssertionError(f"unexpected ancestor check: {(ancestor_ref, descendant_ref)!r}")
+
+    monkeypatch.setattr(orchestrator, "_run_auto_dispatch", fake_run_auto_dispatch)
+    monkeypatch.setattr(orchestrator, "_dispatch_with_artifact_fallback", fake_dispatch_with_artifact_fallback)
+    monkeypatch.setattr(orchestrator, "_current_sha", lambda: "base-sha")
+    monkeypatch.setattr(orchestrator, "_git_is_ancestor", fake_git_is_ancestor)
+
+    orchestrator._auto_dispatch_role(
+        role="reviewer",
+        prompt="prompt",
+        config=orchestrator.RunConfig(auto_dispatch=True, reviewer_backend="claude"),
+        task_id="T-627",
+        round_num=2,
+        artifact_path=orchestrator.REVIEW_REPORT,
+        state=state,
+    )
+
+    assert captured["resume_session_id"] is None
+    saved = json.loads(orchestrator.STATE_FILE.read_text(encoding="utf-8"))
+    assert saved["sessions"] == {}
+
+
 def test_auto_dispatch_role_rotates_session_and_emits_artifact_metric(tmp_path: Path, monkeypatch) -> None:
     _configure_loop_paths(monkeypatch, tmp_path)
     state = {

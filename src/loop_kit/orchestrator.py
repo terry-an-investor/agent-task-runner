@@ -8486,6 +8486,137 @@ def _session_started_round(entry: dict[str, str | int]) -> int | None:
     return None
 
 
+def _session_contract_invalidation_reason(
+    state: dict,
+    *,
+    task_id: str,
+    round_num: int,
+) -> str | None:
+    state_task_id = state.get("task_id")
+    if isinstance(state_task_id, str) and state_task_id and state_task_id != task_id:
+        return f"task_id changed (state={state_task_id!r}, current={task_id!r})"
+
+    state_round = state.get("round")
+    if round_num == 1:
+        if not isinstance(state_round, int) or state_round != 1:
+            return f"round reset to 1 (state_round={state_round!r})"
+        state_round = 1
+    if isinstance(state_round, int) and state_round >= 1 and state_round != round_num:
+        return f"round changed unexpectedly (state={state_round}, current={round_num})"
+
+    expected_run_id = _current_feed_run_id()
+    state_run_id = _normalize_run_id(state.get("run_id"))
+    if expected_run_id is not None and state_run_id is not None and state_run_id != expected_run_id:
+        return f"run_id changed (state={state_run_id!r}, current={expected_run_id!r})"
+
+    state_base_sha_raw = state.get("base_sha")
+    if not isinstance(state_base_sha_raw, str) or not state_base_sha_raw.strip():
+        return f"missing base_sha in state contract (base_sha={state_base_sha_raw!r})"
+    state_base_sha = state_base_sha_raw.strip()
+
+    state_head_sha: str | None = None
+    state_head_sha_raw = state.get("head_sha")
+    if isinstance(state_head_sha_raw, str) and state_head_sha_raw.strip():
+        state_head_sha = state_head_sha_raw.strip()
+    expected_head = state_head_sha if state_head_sha is not None else state_base_sha
+
+    try:
+        current_head = _current_sha()
+    except RuntimeError as e:
+        return f"unable to compare git contract to current HEAD: {e}"
+
+    if current_head == expected_head:
+        return None
+
+    drift_kind = "diverged_or_rewritten"
+    ancestry_error: str | None = None
+    try:
+        expected_ancestor = _git_is_ancestor(expected_head, current_head)
+        current_ancestor = _git_is_ancestor(current_head, expected_head)
+        if expected_ancestor and not current_ancestor:
+            drift_kind = "advanced_outside_contract"
+        elif current_ancestor and not expected_ancestor:
+            drift_kind = "rewound_or_rewritten"
+    except RuntimeError as e:
+        ancestry_error = str(e)
+
+    detail = (
+        f"git contract drift ({drift_kind}): "
+        f"base_sha={state_base_sha} expected_head={expected_head} current_head={current_head}"
+    )
+    if ancestry_error is not None:
+        detail += f" ancestry_check_error={ancestry_error}"
+    return detail
+
+
+@dataclass(frozen=True, slots=True)
+class _SessionResumePolicyResult:
+    resume_session_id: str | None
+    candidate_session_id: str | None
+    resume_status: str
+    session_started_round: int | None
+    state_updated: bool
+
+
+def _resolve_session_resume_policy(
+    state: dict,
+    *,
+    role: str,
+    backend: str,
+    task_id: str,
+    round_num: int,
+    max_session_rounds: int,
+) -> _SessionResumePolicyResult:
+    state["sessions"] = _normalize_sessions_map(state.get("sessions"))
+    sessions = cast(dict[str, dict[str, str | int]], state.get("sessions"))
+    state_updated = False
+    if sessions:
+        invalidation_reason = _session_contract_invalidation_reason(state, task_id=task_id, round_num=round_num)
+        if invalidation_reason is not None:
+            _log(f"Clearing dispatch sessions: {invalidation_reason}")
+            if _clear_sessions(state):
+                state_updated = True
+    session_manager = _session_manager(role)
+    resume_session_id = session_manager.build_resume_context(state, backend)
+    candidate_session_id = resume_session_id
+    resume_status = "resume_miss"
+    session_started_round: int | None = None
+    if resume_session_id:
+        entry = _session_entry(state, role=role, backend=backend)
+        if isinstance(entry, dict):
+            session_started_round = _session_started_round(entry)
+        if max_session_rounds > 0:
+            if session_started_round is None:
+                resume_status = "resume_rotated_missing_started_round"
+                _log(
+                    f"{role} session rotation triggered: missing/invalid started_round, "
+                    f"round={round_num}, max_session_rounds={max_session_rounds}"
+                )
+                if session_manager.invalidate_session(state, backend):
+                    state_updated = True
+                resume_session_id = None
+            elif round_num - session_started_round >= max_session_rounds:
+                resume_status = "resume_rotated"
+                _log(
+                    f"{role} session rotation triggered: started_round={session_started_round}, "
+                    f"round={round_num}, max_session_rounds={max_session_rounds}"
+                )
+                if session_manager.invalidate_session(state, backend):
+                    state_updated = True
+                resume_session_id = None
+            else:
+                resume_status = "resume_hit"
+        else:
+            resume_status = "resume_hit"
+    return _SessionResumePolicyResult(
+        resume_session_id=resume_session_id,
+        candidate_session_id=candidate_session_id,
+        resume_status=resume_status,
+        session_started_round=session_started_round,
+        state_updated=state_updated,
+    )
+
+
 def _store_session(state: dict, *, role: str, backend: str, session_id: str | None, round_num: int) -> bool:
     normalized_session_id = SessionManager.normalize_session_id(session_id)
     if normalized_session_id is None:
@@ -8496,52 +8627,6 @@ def _store_session(state: dict, *, role: str, backend: str, session_id: str | No
         normalized_session_id,
         round_num=round_num,
     )
-
-
-def _invalidate_sessions_for_dispatch(
-    state: dict,
-    *,
-    role: str,
-    task_id: str,
-    round_num: int,
-) -> bool:
-    state["sessions"] = _normalize_sessions_map(state.get("sessions"))
-    if role != "worker":
-        return False
-    sessions = cast(dict[str, dict[str, str | int]], state.get("sessions"))
-    if not sessions:
-        return False
-
-    state_task_id = state.get("task_id")
-    if isinstance(state_task_id, str) and state_task_id and state_task_id != task_id:
-        _log(f"Clearing dispatch sessions: task_id changed (state={state_task_id!r}, current={task_id!r})")
-        _clear_sessions(state)
-        return True
-
-    if round_num == 1:
-        _log("Clearing dispatch sessions: round reset to 1")
-        _clear_sessions(state)
-        return True
-
-    state_base_sha = state.get("base_sha")
-    if not isinstance(state_base_sha, str) or not state_base_sha:
-        return False
-    try:
-        current_head = _current_sha()
-    except RuntimeError as e:
-        _log(f"Warning: unable to compare state base_sha to HEAD for session invalidation: {e}")
-        return False
-    if state_base_sha == current_head:
-        return False
-    state_head_sha = state.get("head_sha")
-    if isinstance(state_head_sha, str) and state_head_sha == current_head:
-        return False
-    _log(
-        "Clearing dispatch sessions: state base_sha differs from current HEAD "
-        f"(base_sha={state_base_sha}, head={current_head})"
-    )
-    _clear_sessions(state)
-    return True
 
 
 def _auto_dispatch_role(
@@ -8563,42 +8648,21 @@ def _auto_dispatch_role(
         else (_SERIAL_LANE_ID if role == "worker" else None)
     )
     current_state = state if isinstance(state, dict) else _load_state()
-    state_updated = _invalidate_sessions_for_dispatch(
+    session_policy = _resolve_session_resume_policy(
         current_state,
         role=role,
+        backend=backend,
         task_id=task_id,
         round_num=round_num,
+        max_session_rounds=config.max_session_rounds,
     )
-    if state_updated:
+    if session_policy.state_updated:
         _save_state(current_state)
     session_manager = _session_manager(role)
-    resume_session_id = session_manager.build_resume_context(current_state, backend)
-    candidate_session_id = resume_session_id
-    resume_status = "resume_miss"
-    session_started_round: int | None = None
-    if resume_session_id:
-        entry = _session_entry(current_state, role=role, backend=backend)
-        if isinstance(entry, dict):
-            session_started_round = _session_started_round(entry)
-        if config.max_session_rounds > 0:
-            if session_started_round is None:
-                resume_status = "resume_rotated_missing_started_round"
-                _log(
-                    f"{role} session rotation triggered: missing/invalid started_round, "
-                    f"round={round_num}, max_session_rounds={config.max_session_rounds}"
-                )
-                resume_session_id = None
-            elif round_num - session_started_round >= config.max_session_rounds:
-                resume_status = "resume_rotated"
-                _log(
-                    f"{role} session rotation triggered: started_round={session_started_round}, "
-                    f"round={round_num}, max_session_rounds={config.max_session_rounds}"
-                )
-                resume_session_id = None
-            else:
-                resume_status = "resume_hit"
-        else:
-            resume_status = "resume_hit"
+    resume_session_id = session_policy.resume_session_id
+    candidate_session_id = session_policy.candidate_session_id
+    resume_status = session_policy.resume_status
+    session_started_round = session_policy.session_started_round
     _feed_event(
         FEED_DISPATCH_RESUME,
         data=_feed_data(
