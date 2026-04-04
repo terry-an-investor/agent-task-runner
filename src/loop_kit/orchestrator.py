@@ -3292,8 +3292,7 @@ def _dispatch_with_artifact_fallback(
             except ValidationError as e:
                 _log(f"{role} ignoring direct artifact with mismatched identity: {e}")
             else:
-                _log(f"{role} dispatch produced {artifact_path.name} directly; skipping wait")
-                return data
+                _log(f"{role} dispatch produced {artifact_path.name} directly; validating via wait contract")
     return _require_dispatch_artifact(
         role=role,
         path=artifact_path,
@@ -9371,6 +9370,7 @@ def _auto_dispatch_role(
     task_id: str,
     round_num: int,
     artifact_path: Path,
+    run_id: str | None = None,
     state: dict | None = None,
     lane_id: str | None = None,
 ) -> dict | None:
@@ -9437,13 +9437,18 @@ def _auto_dispatch_role(
         )
 
     try:
+        dispatch_artifact_kwargs: dict[str, object] = {
+            "role": role,
+            "dispatch_call": _dispatch_call,
+            "artifact_path": artifact_path,
+            "task_id": task_id,
+            "round_num": round_num,
+            "timeout_sec": config.artifact_timeout,
+        }
+        if run_id is not None:
+            dispatch_artifact_kwargs["run_id"] = run_id
         artifact = _dispatch_with_artifact_fallback(
-            role=role,
-            dispatch_call=_dispatch_call,
-            artifact_path=artifact_path,
-            task_id=task_id,
-            round_num=round_num,
-            timeout_sec=config.artifact_timeout,
+            **dispatch_artifact_kwargs,
         )
         artifact_written_latency_ms = max(0, int((time.monotonic() - dispatch_started_at) * 1000))
         runtime_feed_fields: dict[str, object] = {}
@@ -10545,6 +10550,7 @@ def _run_single_round(
                 task_id=task_id,
                 round_num=round_num,
                 artifact_path=resolved_paths.work_report,
+                run_id=run_id,
                 state=state,
             )
         except RuntimeError as e:
@@ -10784,6 +10790,7 @@ def _run_single_round(
             task_id=task_id,
             round_num=round_num,
             artifact_path=resolved_paths.review_report,
+            run_id=run_id,
             state=state,
         )
     except RuntimeError as e:
@@ -10865,6 +10872,8 @@ def _run_single_round(
     ]
     round_details.append(round_detail)
     state["round_details"] = round_details
+    _atomic_write_json(resolved_paths.work_report, work)
+    _atomic_write_json(resolved_paths.review_report, review)
 
     if decision == "approve":
         try:
