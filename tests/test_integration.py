@@ -757,6 +757,70 @@ def test_parallel_lane_merge_conflict_skip_lane_policy_completes(tmp_path: Path)
 
 
 @pytest.mark.timeout(15)
+def test_parallel_lane_merge_conflict_defer_lane_persistent_conflict_fails(tmp_path: Path) -> None:
+    base_sha = _init_git_repo(tmp_path)
+    _install_fake_opencode(tmp_path / "bin")
+    loop_dir = _prepare_loop_contract(
+        tmp_path,
+        task_id="T-731d",
+        base_sha=base_sha,
+        state_name="task_ready",
+        round_num=1,
+    )
+    _write_json(
+        loop_dir / "task_card.json",
+        {
+            "task_id": "T-731d",
+            "goal": "Parallel lane merge conflict defer policy",
+            "in_scope": [],
+            "out_of_scope": [],
+            "acceptance_criteria": ["deferred conflicts must fail integration"],
+            "constraints": [],
+            "lane_merge_conflict_policy": "defer_lane",
+            "lanes": [
+                {"lane_id": "lane_core", "owner_paths": ["src/lane_core.py"]},
+                {"lane_id": "lane_tests", "owner_paths": ["tests/lane_tests.py"]},
+            ],
+        },
+    )
+
+    result = _run_loop(
+        tmp_path,
+        [
+            "run",
+            "--loop-dir",
+            ".loop",
+            "--task",
+            ".loop/task_card.json",
+            "--single-round",
+            "--round",
+            "1",
+            "--auto-dispatch",
+            "--worker-backend",
+            "opencode",
+            "--reviewer-backend",
+            "opencode",
+            "--dispatch-retries",
+            "0",
+            "--artifact-timeout",
+            "2",
+            "--max-parallel-workers",
+            "2",
+        ],
+        reviewer_decision="approve",
+        lane_conflict=True,
+    )
+
+    assert result.returncode == orchestrator.EXIT_VALIDATION_ERROR
+    state = json.loads((loop_dir / "state.json").read_text(encoding="utf-8"))
+    assert state["state"] == "done"
+    assert state["outcome"] == "lane_merge_failed"
+    assert "deferred replay conflicts" in str(state.get("error", ""))
+    assert state["lanes"]["__integration__"]["status"] == "failed"
+    assert _git(tmp_path, "status", "--porcelain", "--untracked-files=no") == ""
+
+
+@pytest.mark.timeout(15)
 def test_parallel_lane_merge_conflict_cleans_worktrees_when_preserve_disabled(tmp_path: Path) -> None:
     base_sha = _init_git_repo(tmp_path)
     _install_fake_opencode(tmp_path / "bin")

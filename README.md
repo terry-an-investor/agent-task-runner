@@ -149,7 +149,7 @@ When `lanes` run in parallel, Loop Kit adds an explicit internal integration lan
 - Configure conflict handling via task-card `lane_merge_conflict_policy`:
   - `fail_fast` (default): abort replay on first conflict, reset integration head back to base, fail the round.
   - `skip_lane`: abort the conflicting cherry-pick, mark that lane as `skipped_conflict`, continue replay for remaining lanes.
-  - `defer_lane`: defer conflicting lanes, replay remaining lanes first, then retry deferred lanes once in deterministic defer order.
+  - `defer_lane`: defer conflicting lanes, replay remaining lanes first, then retry deferred lanes once in deterministic defer order. If any deferred lane still conflicts on retry, integration fails (`lane_merge_failed`) instead of silently dropping lane commits.
 - Configure worktree retention with task-card `lane_preserve_worktrees_on_failure` (default `true`): when enabled, failed lane rounds keep worktrees for debugging; when disabled, lane worktrees are cleaned up.
 - Optional lane reviewer fan-out: set `lane_review_parallel: true` in the task card to dispatch a reviewer for each completed lane before integration.
 - Lane reviewer gate is deterministic: every enabled lane review must return `approve` before integration can proceed.

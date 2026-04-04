@@ -5781,6 +5781,59 @@ def test_cherry_pick_lane_reports_defer_lane_retries_after_primary_order(monkeyp
     assert provenance[1]["status"] == "applied"
 
 
+def test_cherry_pick_lane_reports_defer_lane_persistent_conflict_raises(monkeypatch) -> None:
+    current = {"head": "base-sha"}
+    abort_calls: list[tuple[str, ...]] = []
+    cherry_pick_attempts: list[str] = []
+
+    def fake_current_sha() -> str:
+        return current["head"]
+
+    def fake_git_is_ancestor(ancestor_ref: str, descendant_ref: str, *, timeout=None) -> bool:
+        _ = (ancestor_ref, descendant_ref, timeout)
+        return False
+
+    def fake_git(*args: str, timeout=None) -> str:
+        _ = timeout
+        if args[:2] == ("rev-list", "--reverse"):
+            if args[2] == "base-sha..lane-core-head":
+                return "c1"
+            if args[2] == "base-sha..lane-tests-head":
+                return "t1"
+            raise AssertionError(f"unexpected rev-list range: {args[2]}")
+        if args[:3] == ("show", "--pretty=format:", "--name-only"):
+            return ""
+        if args == ("cherry-pick", "c1"):
+            cherry_pick_attempts.append("c1")
+            raise RuntimeError("conflict in shared/file.txt")
+        if args == ("cherry-pick", "t1"):
+            cherry_pick_attempts.append("t1")
+            current["head"] = "picked-t1"
+            return ""
+        if args == ("cherry-pick", "--abort"):
+            abort_calls.append(args)
+            return ""
+        raise AssertionError(f"unexpected git args: {args}")
+
+    monkeypatch.setattr(orchestrator, "_current_sha", fake_current_sha)
+    monkeypatch.setattr(orchestrator, "_git_is_ancestor", fake_git_is_ancestor)
+    monkeypatch.setattr(orchestrator, "_git", fake_git)
+
+    with pytest.raises(RuntimeError, match="Lane merge failed after deferred replay conflicts"):
+        orchestrator._cherry_pick_lane_reports(
+            base_sha="base-sha",
+            lane_execution_order=["lane_core", "lane_tests"],
+            lane_reports={
+                "lane_core": {"task_id": "T-730", "round": 1, "head_sha": "lane-core-head"},
+                "lane_tests": {"task_id": "T-730", "round": 1, "head_sha": "lane-tests-head"},
+            },
+            conflict_policy="defer_lane",
+        )
+
+    assert cherry_pick_attempts == ["c1", "t1", "c1"]
+    assert abort_calls == [("cherry-pick", "--abort"), ("cherry-pick", "--abort")]
+
+
 def test_outer_loop_spawns_single_round_subprocess(tmp_path: Path, monkeypatch) -> None:
     _configure_loop_paths(monkeypatch, tmp_path)
 

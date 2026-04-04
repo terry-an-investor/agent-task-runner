@@ -5756,6 +5756,7 @@ def _cherry_pick_lane_reports(
         current_head = _current_sha()
 
     if deferred_lanes:
+        deferred_failures: list[str] = []
         for lane_id in deferred_lanes:
             lane_record = merge_record_by_lane.get(lane_id)
             if lane_record is None:
@@ -5772,6 +5773,9 @@ def _cherry_pick_lane_reports(
                     with contextlib.suppress(RuntimeError):
                         _git("cherry-pick", "--abort")
                     preflight_summary = _lane_preflight_conflict_summary(lane_id=lane_id, preflight=preflight)
+                    deferred_failures.append(
+                        f"lane '{lane_id}' commit {commit_sha} ({preflight_summary}): {e}"
+                    )
                     _log(
                         f"Lane deferred replay conflict for lane '{lane_id}' on commit {commit_sha} "
                         f"(policy={conflict_policy}; {preflight_summary}): {e}"
@@ -5783,6 +5787,10 @@ def _cherry_pick_lane_reports(
             else:
                 lane_record["status"] = "applied_after_defer" if lane_record["applied_commits"] else "already_integrated"
             current_head = _current_sha()
+        if deferred_failures:
+            raise RuntimeError(
+                "Lane merge failed after deferred replay conflicts: " + "; ".join(deferred_failures)
+            )
 
     return current_head, merge_records
 
