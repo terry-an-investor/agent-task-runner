@@ -3123,6 +3123,134 @@ def test_state_machine_worker_timeout_transition_is_declarative(tmp_path: Path, 
     assert payload["transition_kind"] == orchestrator.TRANSITION_KIND_TIMEOUT
 
 
+def test_state_machine_prepare_round_resume_clears_stale_keys(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+    state = {
+        "state": orchestrator.STATE_AWAITING_WORK,
+        "round": 2,
+        "task_id": "T-801A",
+        "base_sha": "base-sha",
+        "outcome": "approved",
+        "failed_at": "2026-01-01T00:00:00Z",
+        "error": "stale error",
+        "head_sha": "stale-head",
+        "round_details": [{"round": 1, "review_decision": "changes_required"}],
+    }
+    round_details = list(state["round_details"])
+
+    orchestrator._apply_state_transition(
+        state,
+        trigger=orchestrator.STATE_TRIGGER_PREPARE_ROUND,
+        round_num=2,
+        updates={
+            "started_at": "2026-01-01T00:00:00Z",
+            "run_id": "run-prepare",
+            "sessions": {},
+            "round_details": round_details,
+        },
+    )
+
+    assert state["state"] == orchestrator.STATE_AWAITING_WORK
+    assert state["round"] == 2
+    assert "outcome" not in state
+    assert "failed_at" not in state
+    assert "error" not in state
+    assert "head_sha" not in state
+    assert state["round_details"] == round_details
+
+
+def test_state_machine_prepare_round_from_review_clears_stale_keys(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+    state = {
+        "state": orchestrator.STATE_AWAITING_REVIEW,
+        "round": 3,
+        "task_id": "T-801B",
+        "base_sha": "base-sha",
+        "head_sha": "review-head",
+        "outcome": "approved",
+        "error": "stale reviewer error",
+        "round_details": [{"round": 2, "review_decision": "changes_required"}],
+    }
+    round_details = list(state["round_details"])
+
+    orchestrator._apply_state_transition(
+        state,
+        trigger=orchestrator.STATE_TRIGGER_PREPARE_ROUND,
+        round_num=3,
+        updates={
+            "started_at": "2026-01-01T00:00:00Z",
+            "run_id": "run-from-review",
+            "sessions": {},
+            "round_details": round_details,
+        },
+    )
+
+    assert state["state"] == orchestrator.STATE_AWAITING_WORK
+    assert state["round"] == 3
+    assert "head_sha" not in state
+    assert "outcome" not in state
+    assert "error" not in state
+    assert state["round_details"] == round_details
+
+
+def test_state_machine_retry_transition_clears_stale_keys(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+    state = {
+        "state": orchestrator.STATE_AWAITING_REVIEW,
+        "round": 2,
+        "task_id": "T-801C",
+        "base_sha": "base-sha",
+        "head_sha": "worker-head",
+        "outcome": "approved",
+        "failed_at": "2026-01-01T00:00:00Z",
+        "error": "stale retry error",
+        "round_details": [{"round": 2, "review_decision": "changes_required"}],
+    }
+    round_details = list(state["round_details"])
+
+    orchestrator._apply_state_transition(
+        state,
+        trigger=orchestrator.STATE_TRIGGER_REVIEWER_CHANGES_REQUIRED,
+        updates={"round_details": round_details},
+    )
+
+    assert state["state"] == orchestrator.STATE_AWAITING_WORK
+    assert state["round"] == 3
+    assert "head_sha" not in state
+    assert "outcome" not in state
+    assert "failed_at" not in state
+    assert "error" not in state
+    assert state["round_details"] == round_details
+
+
+def test_state_machine_prepare_round_rejects_error_residue_before_persist(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+    state = {
+        "state": orchestrator.STATE_AWAITING_WORK,
+        "round": 2,
+        "task_id": "T-801D",
+        "base_sha": "base-sha",
+        "head_sha": "old-head",
+        "round_details": [{"round": 1}],
+    }
+
+    with pytest.raises(orchestrator.StateError, match="forbidden residue key 'error' persisted"):
+        orchestrator._apply_state_transition(
+            state,
+            trigger=orchestrator.STATE_TRIGGER_PREPARE_ROUND,
+            round_num=2,
+            updates={
+                "started_at": "2026-01-01T00:00:00Z",
+                "run_id": "run-invalid-residue",
+                "sessions": {},
+                "round_details": [{"round": 1}],
+                "error": "should-not-survive",
+            },
+        )
+
+    assert not orchestrator.STATE_FILE.exists()
+
+
 def test_fail_with_state_uses_terminal_error_transition(tmp_path: Path, monkeypatch) -> None:
     _configure_loop_paths(monkeypatch, tmp_path)
     orchestrator.TASK_CARD.write_text(

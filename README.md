@@ -137,6 +137,16 @@ Worker no-change (`head_sha == base_sha` after immutable OID resolution) is expl
 - default: terminal `validation_failure` (`worker_noop_as_error=true`)
 - optional: terminal `no_change_success` and reviewer is skipped (`--worker-noop-as-success`)
 
+Transition stale-key policy is explicit and validated before `state.json` persistence:
+
+| Transition | Stale keys cleared | Required carry-forward | Forbidden residue |
+|-------|---------|---------|---------|
+| `bootstrap` | `outcome`, `failed_at`, `error`, `head_sha`, `round_details` | none | none |
+| `prepare_round` | `outcome`, `failed_at`, `error`, `head_sha`, `round_details` | `round_details` (and optional `head_sha` carry-forward when resuming an in-flight round) | `outcome`, `failed_at`, `error` |
+| `reviewer_changes_required` (retry) | `outcome`, `failed_at`, `error`, `head_sha`, `round_details` | `round_details` (and explicit `head_sha` carry-forward for next-round contract continuity) | `outcome`, `failed_at`, `error` |
+
+If a transition tries to persist forbidden residue (for example stale `error` on a retry), the transition is rejected with a state error before any write.
+
 ### Session Management
 
 - **Quickstart**: Fresh context for cold starts (round 1)

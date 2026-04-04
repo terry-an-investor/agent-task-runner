@@ -290,7 +290,15 @@ DEFAULT_WORKER_NOOP_AS_ERROR = True
 MAX_DISPATCH_RETRY_DELAY_SEC = 60
 DEFAULT_GIT_TIMEOUT_SEC = 30
 MAX_JSON_PAYLOAD_BYTES = 5 * 1024 * 1024
-_STALE_STATE_KEYS = ("outcome", "failed_at", "error", "head_sha", "round_details")
+_STALE_STATE_ERROR_KEYS = ("outcome", "failed_at", "error")
+_STALE_STATE_ROUND_CONTEXT_KEYS = ("head_sha", "round_details")
+_STALE_STATE_RESET_KEYS = _STALE_STATE_ERROR_KEYS + _STALE_STATE_ROUND_CONTEXT_KEYS
+_TRANSITION_PREPARE_ROUND_CLEAR_KEYS = _STALE_STATE_RESET_KEYS
+_TRANSITION_RETRY_TO_WORK_CLEAR_KEYS = _STALE_STATE_RESET_KEYS
+_TRANSITION_PREPARE_ROUND_REQUIRED_KEYS = ("round_details",)
+_TRANSITION_RETRY_TO_WORK_REQUIRED_KEYS = ("round_details",)
+_TRANSITION_PREPARE_ROUND_FORBIDDEN_KEYS = _STALE_STATE_ERROR_KEYS
+_TRANSITION_RETRY_TO_WORK_FORBIDDEN_KEYS = _STALE_STATE_ERROR_KEYS
 _LANE_WORKTREES_DIRNAME = "worktrees"
 _LANE_WORKTREE_BRANCH_PREFIX = "loop"
 _INTEGRATION_LANE_ID = "__integration__"
@@ -4922,6 +4930,8 @@ class _StateTransitionRule:
     round_delta: int = 0
     default_updates: tuple[tuple[str, object], ...] = ()
     clear_keys: tuple[str, ...] = ()
+    required_post_keys: tuple[str, ...] = ()
+    forbidden_post_keys: tuple[str, ...] = ()
 
 
 STATE_DESCRIPTORS: dict[str, _StateDescriptor] = {
@@ -4977,13 +4987,15 @@ STATE_TRANSITIONS: dict[str, _StateTransitionRule] = {
         trigger=STATE_TRIGGER_BOOTSTRAP,
         source_states=(STATE_IDLE, STATE_DONE, STATE_AWAITING_WORK, STATE_AWAITING_REVIEW),
         target_state=STATE_AWAITING_WORK,
-        clear_keys=tuple(_STALE_STATE_KEYS),
+        clear_keys=tuple(_STALE_STATE_RESET_KEYS),
     ),
     STATE_TRIGGER_PREPARE_ROUND: _StateTransitionRule(
         trigger=STATE_TRIGGER_PREPARE_ROUND,
         source_states=(STATE_AWAITING_WORK, STATE_AWAITING_REVIEW, STATE_DONE, STATE_IDLE),
         target_state=STATE_AWAITING_WORK,
-        clear_keys=_STALE_STATE_KEYS[:3],
+        clear_keys=_TRANSITION_PREPARE_ROUND_CLEAR_KEYS,
+        required_post_keys=_TRANSITION_PREPARE_ROUND_REQUIRED_KEYS,
+        forbidden_post_keys=_TRANSITION_PREPARE_ROUND_FORBIDDEN_KEYS,
     ),
     STATE_TRIGGER_WORKER_COMPLETED: _StateTransitionRule(
         trigger=STATE_TRIGGER_WORKER_COMPLETED,
@@ -5015,7 +5027,9 @@ STATE_TRANSITIONS: dict[str, _StateTransitionRule] = {
         target_state=STATE_AWAITING_WORK,
         transition_kind=TRANSITION_KIND_RETRY,
         round_delta=1,
-        clear_keys=_STALE_STATE_KEYS[:3],
+        clear_keys=_TRANSITION_RETRY_TO_WORK_CLEAR_KEYS,
+        required_post_keys=_TRANSITION_RETRY_TO_WORK_REQUIRED_KEYS,
+        forbidden_post_keys=_TRANSITION_RETRY_TO_WORK_FORBIDDEN_KEYS,
     ),
     STATE_TRIGGER_REVIEWER_TIMEOUT: _StateTransitionRule(
         trigger=STATE_TRIGGER_REVIEWER_TIMEOUT,
@@ -5190,6 +5204,23 @@ def _emit_state_transition_event(
     )
 
 
+def _validate_state_transition_residue(
+    *,
+    state: dict,
+    trigger: str,
+    required_post_keys: tuple[str, ...],
+    forbidden_post_keys: tuple[str, ...],
+) -> None:
+    for key in required_post_keys:
+        if key not in state:
+            raise StateError(f"State transition residue violation: trigger={trigger!r} missing required key {key!r}")
+    for key in forbidden_post_keys:
+        if key in state:
+            raise StateError(
+                f"State transition residue violation: trigger={trigger!r} forbidden residue key {key!r} persisted"
+            )
+
+
 def _apply_state_transition(
     state: dict,
     *,
@@ -5222,8 +5253,7 @@ def _apply_state_transition(
         base_round = from_round if isinstance(from_round, int) else 0
         to_round = base_round + rule.round_delta
 
-    for key in rule.clear_keys:
-        state.pop(key, None)
+    _clean_stale_state(state, *rule.clear_keys)
     if round_num is not None or rule.round_delta:
         state["round"] = to_round
 
@@ -5233,6 +5263,12 @@ def _apply_state_transition(
     if updates:
         for key, value in updates.items():
             state[key] = value
+    _validate_state_transition_residue(
+        state=state,
+        trigger=trigger,
+        required_post_keys=rule.required_post_keys,
+        forbidden_post_keys=rule.forbidden_post_keys,
+    )
 
     if archive_before_save is not None:
         archive_before_save()
@@ -9114,19 +9150,25 @@ def _run_single_round(
 
     if not isinstance(state.get("round_details"), list):
         state["round_details"] = []
+    round_details = cast(list[dict], state.get("round_details", []))
+    state_head_sha = str(state.get("head_sha", "")).strip()
     sessions = _normalize_sessions_map(state.get("sessions"))
     if round_num == 1:
         sessions = {}
+    prepare_updates: dict[str, object] = {
+        "started_at": _ts(),
+        "run_id": run_id,
+        "sessions": sessions,
+        "round_details": round_details,
+    }
+    if state_head_sha:
+        prepare_updates["head_sha"] = state_head_sha
     _apply_state_transition(
         state,
         trigger=STATE_TRIGGER_PREPARE_ROUND,
         paths=resolved_paths,
         round_num=round_num,
-        updates={
-            "started_at": _ts(),
-            "run_id": run_id,
-            "sessions": sessions,
-        },
+        updates=prepare_updates,
         archive_before_save=_archive_single_round_state,
     )
     lane_state = _initialize_lane_state(task_lanes, paths=resolved_paths)
@@ -10177,10 +10219,15 @@ def _run_single_round(
         ),
     )
 
+    retry_updates: dict[str, object] = {"round_details": cast(list[dict], state.get("round_details", []))}
+    retry_head_sha = str(state.get("head_sha", "")).strip()
+    if retry_head_sha:
+        retry_updates["head_sha"] = retry_head_sha
     _apply_state_transition(
         state,
         trigger=STATE_TRIGGER_REVIEWER_CHANGES_REQUIRED,
         paths=resolved_paths,
+        updates=retry_updates,
         archive_before_save=_archive_single_round_state,
     )
     _cleanup_lane_worktrees()
@@ -10285,19 +10332,25 @@ def _run_multi_round_via_subprocess(
         _log(f"Resume contract: base_sha={base_sha} round={start_round} run_id={run_id}")
         if not isinstance(state.get("round_details"), list):
             state["round_details"] = []
+        round_details = cast(list[dict], state.get("round_details", []))
+        state_head_sha = str(state.get("head_sha", "")).strip()
         sessions = _normalize_sessions_map(state.get("sessions"))
         if start_round == 1:
             sessions = {}
+        prepare_updates: dict[str, object] = {
+            "started_at": _ts(),
+            "run_id": run_id,
+            "sessions": sessions,
+            "round_details": round_details,
+        }
+        if state_head_sha:
+            prepare_updates["head_sha"] = state_head_sha
         _apply_state_transition(
             state,
             trigger=STATE_TRIGGER_PREPARE_ROUND,
             paths=resolved_paths,
             round_num=start_round,
-            updates={
-                "started_at": _ts(),
-                "run_id": run_id,
-                "sessions": sessions,
-            },
+            updates=prepare_updates,
         )
 
     _write_task_card_status(config.task_path, TASK_STATUS_IN_PROGRESS, paths=resolved_paths)
