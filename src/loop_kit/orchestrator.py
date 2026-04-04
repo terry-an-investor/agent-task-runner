@@ -419,6 +419,7 @@ _KNOWLEDGE_RETRIEVAL_MIN_SCORE = 1
 _KNOWLEDGE_RETRIEVAL_FALLBACK_CAP = 1
 _KNOWLEDGE_SQLITE_SCHEMA_VERSION = 1
 _KNOWLEDGE_SQLITE_QUERY_BUFFER_MULTIPLIER = 6
+_KNOWLEDGE_BENCHMARK_MS_CLASS_THRESHOLD = 10.0
 _FEED_QUARANTINE_LOG_FILENAME = "feed.quarantine.jsonl"
 _KNOWLEDGE_STOPWORDS = {
     "a",
@@ -446,6 +447,7 @@ _FEED_TASK_ID: str | None = None
 _FEED_ROUND: int | None = None
 _FEED_RUN_ID: str | None = None
 _FEED_TASK_ROUTE_POLICY = _DEFAULT_FEED_TASK_ROUTE_POLICY
+_KNOWLEDGE_FTS_AVAILABLE_BY_PATH: dict[str, bool] = {}
 _LOGS_DIR_ENSURED = False
 _LOGS_DIR_ENSURED_PATH: str | None = None
 _stream_local = threading.local()
@@ -3459,6 +3461,21 @@ def _knowledge_meta_set(conn: sqlite3.Connection, key: str, value: str) -> None:
     )
 
 
+def _knowledge_db_cache_key() -> str:
+    try:
+        return str(_KNOWLEDGE_DB_FILE.resolve())
+    except OSError:
+        return str(_KNOWLEDGE_DB_FILE)
+
+
+def _set_knowledge_fts_cache(fts_available: bool) -> None:
+    _KNOWLEDGE_FTS_AVAILABLE_BY_PATH[_knowledge_db_cache_key()] = bool(fts_available)
+
+
+def _get_knowledge_fts_cache() -> bool | None:
+    return _KNOWLEDGE_FTS_AVAILABLE_BY_PATH.get(_knowledge_db_cache_key())
+
+
 def _connect_knowledge_db() -> sqlite3.Connection:
     _KNOWLEDGE_DB_FILE.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(_KNOWLEDGE_DB_FILE)
@@ -3522,6 +3539,7 @@ def _ensure_knowledge_index_schema(conn: sqlite3.Connection) -> bool:
     fts_available = _ensure_knowledge_fts_table(conn, recreate=recreate)
     _knowledge_meta_set(conn, "schema_version", str(_KNOWLEDGE_SQLITE_SCHEMA_VERSION))
     _knowledge_meta_set(conn, "fts_available", "1" if fts_available else "0")
+    _set_knowledge_fts_cache(fts_available)
     return fts_available
 
 
@@ -3645,9 +3663,13 @@ def _query_knowledge_sqlite(
         return [], [], [], "sqlite_like"
     conn = _connect_knowledge_db()
     try:
-        fts_available = _knowledge_meta_get(conn, "fts_available") == "1" and _knowledge_table_exists(
-            conn, "knowledge_entries_fts"
-        )
+        cached_fts_available = _get_knowledge_fts_cache()
+        if cached_fts_available is None:
+            fts_available = _knowledge_meta_get(conn, "fts_available") == "1"
+        else:
+            fts_available = cached_fts_available
+        fts_available = fts_available and _knowledge_table_exists(conn, "knowledge_entries_fts")
+        _set_knowledge_fts_cache(fts_available)
         query_limit = max(total_cap, total_cap * _KNOWLEDGE_SQLITE_QUERY_BUFFER_MULTIPLIER)
         collected: list[sqlite3.Row] = []
         seen_ids: set[int] = set()
@@ -3655,34 +3677,42 @@ def _query_knowledge_sqlite(
 
         fts_query = _build_knowledge_fts_query(query_tokens) if fts_available else None
         if fts_query:
-            used_fts = True
-            for row in conn.execute(
-                """
-                SELECT
-                    ke.id,
-                    ke.entry_type,
-                    ke.text,
-                    ke.category,
-                    ke.confidence,
-                    ke.last_verified,
-                    ke.ordinal
-                FROM knowledge_entries_fts
-                JOIN knowledge_entries ke ON ke.id = knowledge_entries_fts.rowid
-                WHERE knowledge_entries_fts MATCH ?
-                ORDER BY
-                    bm25(knowledge_entries_fts),
-                    ke.confidence DESC,
-                    ke.ordinal ASC,
-                    ke.text ASC
-                LIMIT ?
-                """,
-                (fts_query, query_limit),
-            ):
-                row_id = int(row["id"])
-                if row_id in seen_ids:
-                    continue
-                seen_ids.add(row_id)
-                collected.append(row)
+            try:
+                used_fts = True
+                for row in conn.execute(
+                    """
+                    SELECT
+                        ke.id,
+                        ke.entry_type,
+                        ke.text,
+                        ke.category,
+                        ke.confidence,
+                        ke.last_verified,
+                        ke.ordinal
+                    FROM knowledge_entries_fts
+                    JOIN knowledge_entries ke ON ke.id = knowledge_entries_fts.rowid
+                    WHERE knowledge_entries_fts MATCH ?
+                    ORDER BY
+                        bm25(knowledge_entries_fts),
+                        ke.confidence DESC,
+                        ke.ordinal ASC,
+                        ke.text ASC
+                    LIMIT ?
+                    """,
+                    (fts_query, query_limit),
+                ):
+                    row_id = int(row["id"])
+                    if row_id in seen_ids:
+                        continue
+                    seen_ids.add(row_id)
+                    collected.append(row)
+            except sqlite3.OperationalError:
+                # Deterministic LIKE fallback when runtime FTS5 support is unavailable.
+                used_fts = False
+                _set_knowledge_fts_cache(False)
+                with contextlib.suppress(sqlite3.Error):
+                    _knowledge_meta_set(conn, "fts_available", "0")
+                    conn.commit()
 
         if query_text.strip():
             for row in conn.execute(
@@ -4697,16 +4727,26 @@ def cmd_knowledge_benchmark(query: str, iterations: int) -> None:
     avg_ms = (sum(timings_ms) / len(timings_ms)) if timings_ms else 0.0
     p50_ms = _nearest_rank_percentile(timings_ms, 0.50) or 0.0
     p95_ms = _nearest_rank_percentile(timings_ms, 0.95) or 0.0
+    high_confidence_pattern_count = sum(
+        1 for entry in patterns if _coerce_confidence(entry.get("confidence"), default=0.0) >= PATTERN_HIGH_CONFIDENCE
+    )
+    millisecond_class = p95_ms <= _KNOWLEDGE_BENCHMARK_MS_CLASS_THRESHOLD
     print("Knowledge benchmark:")
     print(f"  backend={backend}")
     print(f"  fts_available={fts_available}")
     print(f"  query={normalized_query}")
     print(f"  iterations={iterations}")
+    print(f"  corpus_facts={len(project_fact_entries)}")
+    print(f"  corpus_pitfalls={len(pitfall_entries)}")
+    print(f"  corpus_patterns={len(patterns)}")
+    print(f"  corpus_patterns_high_confidence={high_confidence_pattern_count}")
     print(f"  corpus_rows={row_count}")
     print(f"  max_results={result_count}")
     print(f"  avg_ms={avg_ms:.3f}")
     print(f"  p50_ms={p50_ms:.3f}")
     print(f"  p95_ms={p95_ms:.3f}")
+    print(f"  ms_class_threshold={_KNOWLEDGE_BENCHMARK_MS_CLASS_THRESHOLD:.3f}")
+    print(f"  millisecond_class={millisecond_class}")
 
 
 def _load_patterns_with_governance(*, persist: bool = False) -> tuple[list[dict], int]:

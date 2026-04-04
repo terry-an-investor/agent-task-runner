@@ -3949,8 +3949,13 @@ class TestKnowledgeCli:
         assert "Knowledge benchmark:" in out
         assert "iterations=3" in out
         assert "backend=" in out
+        assert "corpus_facts=1" in out
+        assert "corpus_pitfalls=1" in out
+        assert "corpus_patterns=1" in out
         assert "avg_ms=" in out
         assert "p95_ms=" in out
+        assert "ms_class_threshold=10.000" in out
+        assert "millisecond_class=" in out
 
 
 def test_cmd_index_generates_module_map_with_expected_shape(tmp_path: Path, monkeypatch) -> None:
@@ -11053,6 +11058,88 @@ class TestKnowledgeLayer:
         assert "keyword retrieval fallback stays deterministic" in section
         assert "keyword retrieval fallback preserves prompt safety" in section
         assert "keyword retrieval fallback pattern" in section
+
+    def test_query_knowledge_sqlite_falls_back_to_like_when_match_runtime_fails(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        context_dir = tmp_path / ".loop" / "context"
+        context_dir.mkdir(parents=True, exist_ok=True)
+        (context_dir / "project_facts.md").write_text(
+            "# facts\n- dispatch workflow fact fallback target\n",
+            encoding="utf-8",
+        )
+        (context_dir / "pitfalls.md").write_text(
+            "# pitfalls\n- dispatch workflow pitfall fallback target\n",
+            encoding="utf-8",
+        )
+        now_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        (context_dir / "patterns.jsonl").write_text(
+            json.dumps(
+                {
+                    "pattern": "dispatch workflow fallback pattern",
+                    "category": "workflow",
+                    "confidence": 0.95,
+                    "last_verified": now_iso,
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        fact_entries = orchestrator._load_project_facts()
+        pitfall_entries = orchestrator._load_pitfalls()
+        pattern_entries, _ = orchestrator._load_patterns_with_governance(persist=False)
+        orchestrator._sync_knowledge_sqlite_index(
+            project_fact_entries=fact_entries,
+            pitfall_entries=pitfall_entries,
+            pattern_entries=pattern_entries,
+        )
+        monkeypatch.setattr(orchestrator, "_KNOWLEDGE_FTS_AVAILABLE_BY_PATH", {})
+        real_table_exists = orchestrator._knowledge_table_exists
+        real_connect = orchestrator._connect_knowledge_db
+
+        def fake_table_exists(conn, table_name: str) -> bool:
+            if table_name == "knowledge_entries_fts":
+                return True
+            return real_table_exists(conn, table_name)
+
+        class MatchFailConnection:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def execute(self, sql, params=()):
+                sql_text = " ".join(str(sql).split())
+                if "knowledge_entries_fts MATCH ?" in sql_text:
+                    raise sqlite3.OperationalError("simulated MATCH runtime failure")
+                return self._inner.execute(sql, params)
+
+            def close(self):
+                return self._inner.close()
+
+            def commit(self):
+                return self._inner.commit()
+
+            def __getattr__(self, name: str):
+                return getattr(self._inner, name)
+
+        def fake_connect():
+            return MatchFailConnection(real_connect())
+
+        monkeypatch.setattr(orchestrator, "_knowledge_table_exists", fake_table_exists)
+        monkeypatch.setattr(orchestrator, "_connect_knowledge_db", fake_connect)
+        facts, pitfalls, patterns, backend = orchestrator._query_knowledge_sqlite(
+            query_tokens={"dispatch", "workflow"},
+            query_text="dispatch workflow",
+            fact_cap=1,
+            pitfall_cap=1,
+            pattern_cap=1,
+        )
+
+        assert backend == "sqlite_like"
+        assert facts == ["dispatch workflow fact fallback target"]
+        assert pitfalls == ["dispatch workflow pitfall fallback target"]
+        assert any("dispatch workflow fallback pattern" in line for line in patterns)
 
     def test_patterns_staleness_governance_sets_confidence_zero(self, tmp_path: Path, monkeypatch) -> None:
         _configure_loop_paths(monkeypatch, tmp_path)

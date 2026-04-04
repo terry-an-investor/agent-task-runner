@@ -194,6 +194,7 @@ Loop Kit retrieves **relevant context** rather than injecting raw code:
 - **Patterns** — Coding patterns | **Module Map** — Offline codebase index
 - Optional local index: `.loop/context/knowledge.sqlite3` with SQLite FTS5 (`MATCH` + `bm25`) when available.
 - Deterministic fallback stays file-based (`project_facts.md`, `pitfalls.md`, `patterns.jsonl`) when FTS5/SQLite is unavailable.
+- If runtime `MATCH` fails (for example local sqlite build/runtime mismatch), retrieval automatically degrades to SQLite `LIKE` ranking without breaking prompt rendering.
 - Latency diagnostics are built in via `loop knowledge benchmark --query "<text>"`.
 
 </details>
@@ -239,7 +240,7 @@ Full flag list: `loop run --help`
 - `add --pattern ... --category ... --confidence ... --source ...`: append a default pattern row.
 - `prune --older-than <days>`: prune default rows by `source_version`.
 - `dedupe`: deduplicate default knowledge rows.
-- `benchmark --query "<text>" [--iterations N]`: run local retrieval benchmark and print `avg_ms`/`p50_ms`/`p95_ms`.
+- `benchmark --query "<text>" [--iterations N]`: run local retrieval benchmark and print `avg_ms`/`p50_ms`/`p95_ms`, corpus composition, and millisecond-class threshold verdict.
 
 ### Configuration
 
