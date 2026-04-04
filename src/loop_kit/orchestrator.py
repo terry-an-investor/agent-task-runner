@@ -286,6 +286,7 @@ DEFAULT_DISPATCH_RETRY_BASE_SEC = 5
 DEFAULT_MAX_SESSION_ROUNDS = 0
 DEFAULT_MAX_PARALLEL_WORKERS = 2
 DEFAULT_MAX_PARALLEL_WORKERS_CAP = 4
+DEFAULT_WORKER_NOOP_AS_ERROR = True
 MAX_DISPATCH_RETRY_DELAY_SEC = 60
 DEFAULT_GIT_TIMEOUT_SEC = 30
 MAX_JSON_PAYLOAD_BYTES = 5 * 1024 * 1024
@@ -328,6 +329,7 @@ DISPATCH_BACKEND_NATIVE = "native"
 DEFAULT_WORKER_BACKEND = BACKEND_CODEX
 DEFAULT_REVIEWER_BACKEND = BACKEND_CODEX
 DEFAULT_DISPATCH_BACKEND = DISPATCH_BACKEND_NATIVE
+_TERMINAL_SUCCESS_OUTCOMES = frozenset({"approved", "no_change_success"})
 DISPATCH_STREAM_POLL_SEC = 0.1
 _WAIT_SAFETY_CAP_SEC = 86400  # 24h absolute cap in _wait_for_file
 _SESSION_ROLES = ("worker", "reviewer")
@@ -492,6 +494,7 @@ class RunConfig:
     max_parallel_workers: int = DEFAULT_MAX_PARALLEL_WORKERS
     aggressive_parallelism: bool = False
     artifact_timeout: int = DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC
+    worker_noop_as_error: bool = DEFAULT_WORKER_NOOP_AS_ERROR
     allow_dirty: bool = False
     verbose: bool = False
 
@@ -835,6 +838,41 @@ def _archive_task_summary(task_id: str, paths: LoopPaths | None = None) -> Path 
     dest = archive_dir / "summary.json"
     shutil.copy2(summary_path, dest)
     return dest
+
+
+def _write_round_summary(
+    *,
+    task_id: str,
+    run_id: str,
+    outcome: str,
+    round_num: int,
+    base_sha: str,
+    head_sha: str,
+    files_changed: list[str],
+    review_non_blocking: list[str],
+    round_details: list[dict],
+    paths: LoopPaths | None = None,
+) -> None:
+    resolved_paths = _resolve_paths(paths)
+    resolved_paths.summary.write_text(
+        json.dumps(
+            {
+                "task_id": task_id,
+                "run_id": run_id,
+                "outcome": outcome,
+                "rounds": round_num,
+                "base_sha": base_sha,
+                "head_sha": head_sha,
+                "files_changed": files_changed,
+                "review_non_blocking": review_non_blocking,
+                "round_details": round_details,
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
 
 def _archive_state_for_round(
@@ -4851,6 +4889,7 @@ TRANSITION_KIND_ERROR = "error"
 STATE_TRIGGER_BOOTSTRAP = "bootstrap"
 STATE_TRIGGER_PREPARE_ROUND = "prepare_round"
 STATE_TRIGGER_WORKER_COMPLETED = "worker_completed"
+STATE_TRIGGER_WORKER_NO_CHANGE_SUCCESS = "worker_no_change_success"
 STATE_TRIGGER_WORKER_TIMEOUT = "worker_timeout"
 STATE_TRIGGER_REVIEWER_APPROVED = "reviewer_approved"
 STATE_TRIGGER_REVIEWER_CHANGES_REQUIRED = "reviewer_changes_required"
@@ -4950,6 +4989,12 @@ STATE_TRANSITIONS: dict[str, _StateTransitionRule] = {
         trigger=STATE_TRIGGER_WORKER_COMPLETED,
         source_states=(STATE_AWAITING_WORK,),
         target_state=STATE_AWAITING_REVIEW,
+    ),
+    STATE_TRIGGER_WORKER_NO_CHANGE_SUCCESS: _StateTransitionRule(
+        trigger=STATE_TRIGGER_WORKER_NO_CHANGE_SUCCESS,
+        source_states=(STATE_AWAITING_WORK,),
+        target_state=STATE_DONE,
+        default_updates=(("outcome", "no_change_success"),),
     ),
     STATE_TRIGGER_WORKER_TIMEOUT: _StateTransitionRule(
         trigger=STATE_TRIGGER_WORKER_TIMEOUT,
@@ -6028,10 +6073,17 @@ def _run_integration_acceptance_checks(
 def _is_valid_ref(ref: str) -> bool:
     """Check that *ref* is a valid git rev (no argument injection)."""
     try:
-        _git("rev-parse", "--verify", ref)
+        _resolve_commit_oid(ref)
         return True
-    except RuntimeError:
+    except (RuntimeError, ValidationError):
         return False
+
+
+def _resolve_commit_oid(ref: str) -> str:
+    normalized_ref = ref.strip()
+    if not normalized_ref:
+        raise ValidationError("git ref must be non-empty")
+    return _git("rev-parse", "--verify", f"{normalized_ref}^{{commit}}")
 
 
 def _current_sha() -> str:
@@ -6825,6 +6877,7 @@ def _validate_run_config(config: RunConfig) -> None:
     for bool_name, value in (
         ("require_heartbeat", config.require_heartbeat),
         ("auto_dispatch", config.auto_dispatch),
+        ("worker_noop_as_error", config.worker_noop_as_error),
         ("allow_dirty", config.allow_dirty),
         ("verbose", config.verbose),
         ("aggressive_parallelism", config.aggressive_parallelism),
@@ -6878,6 +6931,10 @@ def _load_env_config() -> dict:
     aggressive_parallelism_raw = os.getenv("LOOP_AGGRESSIVE_PARALLELISM")
     if aggressive_parallelism_raw is not None and aggressive_parallelism_raw.strip():
         env_cfg["aggressive_parallelism"] = aggressive_parallelism_raw
+
+    worker_noop_as_error_raw = os.getenv("LOOP_WORKER_NOOP_AS_ERROR")
+    if worker_noop_as_error_raw is not None and worker_noop_as_error_raw.strip():
+        env_cfg["worker_noop_as_error"] = worker_noop_as_error_raw
 
     backend_pref_raw = os.getenv("LOOP_BACKEND_PREFERENCE")
     if backend_pref_raw is not None:
@@ -8265,6 +8322,8 @@ def _single_round_subprocess_cmd(
         cmd.append("--allow-dirty")
     if config.aggressive_parallelism:
         cmd.append("--aggressive-parallelism")
+    if not config.worker_noop_as_error:
+        cmd.append("--worker-noop-as-success")
     if config.verbose:
         cmd.append("--verbose")
     return cmd
@@ -9029,9 +9088,26 @@ def _run_single_round(
 
     _print_round_header(round_num, "worker")
 
+    resolve_git_refs = _is_git_repo_root(ROOT)
     work: WorkReport | None = None
     lane_dispatch_enabled = bool(task_lanes) and config.auto_dispatch and config.max_parallel_workers > 1
     if lane_dispatch_enabled:
+        if resolve_git_refs:
+            try:
+                resolved_base_sha = _resolve_commit_oid(base_sha)
+            except (RuntimeError, ValidationError) as e:
+                _fail_single_round(
+                    outcome="validation_failure",
+                    message=f"Failed to resolve base ref to immutable commit for round {round_num}: {e}",
+                    exit_code=EXIT_VALIDATION_ERROR,
+                )
+                return
+            if resolved_base_sha != base_sha:
+                _log(
+                    "Resolved base ref to commit OID for deterministic compare: "
+                    f"{base_sha} -> {resolved_base_sha}"
+                )
+                base_sha = resolved_base_sha
         lane_by_id = {str(lane["lane_id"]): lane for lane in task_lanes}
         lane_handle_by_id = {handle.lane_id: handle for handle in lane_worktrees}
         lane_reports: dict[str, WorkReport] = {}
@@ -9158,6 +9234,15 @@ def _run_single_round(
             )
             if lane_error:
                 raise ValidationError(f"lane '{lane_id}' produced invalid work_report: {lane_error}")
+            if resolve_git_refs:
+                lane_head_ref = str(lane_work["head_sha"]).strip()
+                try:
+                    lane_head_sha = _resolve_commit_oid(lane_head_ref)
+                except (RuntimeError, ValidationError) as e:
+                    raise ValidationError(
+                        f"lane '{lane_id}' produced unresolvable head_sha={lane_head_ref!r}: {e}"
+                    ) from e
+                lane_work["head_sha"] = lane_head_sha
 
             lane_report_target = _lane_report_path(lane_id, paths=resolved_paths)
             lane_report_target.parent.mkdir(parents=True, exist_ok=True)
@@ -9702,16 +9787,109 @@ def _run_single_round(
         )
         return
 
-    head_sha = str(work["head_sha"])
+    head_ref = str(work["head_sha"]).strip()
+    head_sha = head_ref
+    if resolve_git_refs:
+        try:
+            resolved_base_sha = _resolve_commit_oid(base_sha)
+        except (RuntimeError, ValidationError) as e:
+            _fail_single_round(
+                outcome="validation_failure",
+                message=f"Failed to resolve base ref to immutable commit for compare: {e}",
+                exit_code=EXIT_VALIDATION_ERROR,
+            )
+            return
+        if resolved_base_sha != base_sha:
+            _log(
+                "Resolved base ref to commit OID for deterministic compare: "
+                f"{base_sha} -> {resolved_base_sha}"
+            )
+            base_sha = resolved_base_sha
+        try:
+            head_sha = _resolve_commit_oid(head_ref)
+        except (RuntimeError, ValidationError) as e:
+            _fail_single_round(
+                outcome="validation_failure",
+                message=f"Failed to resolve worker head ref to immutable commit (head_sha={head_ref!r}): {e}",
+                exit_code=EXIT_VALIDATION_ERROR,
+            )
+            return
+        work["head_sha"] = head_sha
+        _atomic_write_json(resolved_paths.work_report, work)
     if head_sha == base_sha:
-        _fail_single_round(
-            outcome="worker_noop",
-            message=(
-                "Worker reported no code changes: head_sha equals base_sha "
-                f"({head_sha}). task_id={task_id} round={round_num}"
-            ),
-            exit_code=EXIT_VALIDATION_ERROR,
+        noop_message = (
+            "Worker reported no code changes after immutable ref resolution: "
+            f"head_sha == base_sha ({head_sha}). task_id={task_id} round={round_num}"
         )
+        round_detail = {
+            "round": round_num,
+            "started_at": state.get("started_at"),
+            "worker_notes": work.get("notes", ""),
+            "tests_summary": _tests_summary(work.get("tests", [])),
+            "review_decision": "skipped_no_change",
+            "round_outcome": "validation_failure" if config.worker_noop_as_error else "no_change_success",
+        }
+        round_details = [
+            item
+            for item in state.get("round_details", [])
+            if not (isinstance(item, dict) and item.get("round") == round_num)
+        ]
+        round_details.append(round_detail)
+        state["round_details"] = round_details
+        if config.worker_noop_as_error:
+            _write_round_summary(
+                task_id=task_id,
+                run_id=run_id,
+                outcome="validation_failure",
+                round_num=round_num,
+                base_sha=base_sha,
+                head_sha=head_sha,
+                files_changed=cast(list[str], work.get("files_changed", [])),
+                review_non_blocking=[],
+                round_details=cast(list[dict], state.get("round_details", [])),
+                paths=resolved_paths,
+            )
+            _fail_single_round(
+                outcome="validation_failure",
+                message=noop_message,
+                exit_code=EXIT_VALIDATION_ERROR,
+            )
+            return
+
+        _apply_state_transition(
+            state,
+            trigger=STATE_TRIGGER_WORKER_NO_CHANGE_SUCCESS,
+            paths=resolved_paths,
+            updates={"head_sha": head_sha},
+            archive_before_save=_archive_single_round_state,
+        )
+        _write_task_card_status(config.task_path, TASK_STATUS_DONE, paths=resolved_paths)
+        _write_round_summary(
+            task_id=task_id,
+            run_id=run_id,
+            outcome="no_change_success",
+            round_num=round_num,
+            base_sha=base_sha,
+            head_sha=head_sha,
+            files_changed=cast(list[str], work.get("files_changed", [])),
+            review_non_blocking=[],
+            round_details=cast(list[dict], state.get("round_details", [])),
+            paths=resolved_paths,
+        )
+        _archive_task_summary(task_id, paths=resolved_paths)
+        _feed_event(
+            FEED_ROUND_COMPLETE,
+            data=_feed_data(
+                task_id=task_id,
+                round_num=round_num,
+                role="orchestrator",
+                decision="skipped_no_change",
+                outcome="no_change_success",
+            ),
+        )
+        _log(f"No-change success accepted. head_sha={head_sha}")
+        print(f"  Worker no-change success: {head_sha[:8]}")
+        _cleanup_lane_worktrees()
         return
 
     try:
@@ -9872,24 +10050,17 @@ def _run_single_round(
         print(f"  base: {base_sha[:8]}  head: {head_sha[:8]}")
         print(f"{'=' * 60}")
 
-        resolved_paths.summary.write_text(
-            json.dumps(
-                {
-                    "task_id": task_id,
-                    "run_id": run_id,
-                    "outcome": "approved",
-                    "rounds": round_num,
-                    "base_sha": base_sha,
-                    "head_sha": head_sha,
-                    "files_changed": work.get("files_changed", []),
-                    "review_non_blocking": review.get("non_blocking_suggestions", []),
-                    "round_details": state.get("round_details", []),
-                },
-                indent=2,
-                ensure_ascii=False,
-            )
-            + "\n",
-            encoding="utf-8",
+        _write_round_summary(
+            task_id=task_id,
+            run_id=run_id,
+            outcome="approved",
+            round_num=round_num,
+            base_sha=base_sha,
+            head_sha=head_sha,
+            files_changed=cast(list[str], work.get("files_changed", [])),
+            review_non_blocking=cast(list[str], review.get("non_blocking_suggestions", [])),
+            round_details=cast(list[dict], state.get("round_details", [])),
+            paths=resolved_paths,
         )
         _archive_task_summary(task_id, paths=resolved_paths)
         _log("Task approved. Summary written to .loop/summary.json")
@@ -10192,10 +10363,11 @@ def _run_multi_round_via_subprocess(
                 )
                 return
 
-            if normalized_state_name == STATE_DONE and state.get("outcome") == "approved":
+            outcome = state.get("outcome")
+            if normalized_state_name == STATE_DONE and outcome in _TERMINAL_SUCCESS_OUTCOMES:
                 _write_task_card_status(config.task_path, TASK_STATUS_DONE, paths=resolved_paths)
                 _archive_task_summary(task_id, paths=resolved_paths)
-                _log(f"Task approved via state contract at round={round_num}")
+                _log(f"Task terminal success via state contract at round={round_num} outcome={outcome!r}")
                 return
 
             if normalized_state_name == STATE_AWAITING_WORK and state.get("round") == round_num + 1:
@@ -10359,14 +10531,14 @@ def cmd_run(
                 resume_state = _load_state(paths=resolved_paths)
                 outcome = resume_state.get("outcome")
                 state_name = _normalized_state_name_from_persisted(resume_state)
-                if state_name == STATE_DONE and outcome == "approved":
+                if state_name == STATE_DONE and outcome in _TERMINAL_SUCCESS_OUTCOMES:
                     _write_task_card_status(config.task_path, TASK_STATUS_DONE, paths=resolved_paths)
                     print(
-                        "Resume not needed: state.json already marked done/approved "
-                        f"for task_id={resume_state.get('task_id')!r}."
+                        "Resume not needed: state.json already marked terminal success "
+                        f"(outcome={outcome!r}) for task_id={resume_state.get('task_id')!r}."
                     )
                     return
-                if state_name == STATE_DONE and outcome != "approved":
+                if state_name == STATE_DONE and outcome not in _TERMINAL_SUCCESS_OUTCOMES:
                     _write_task_card_status(config.task_path, TASK_STATUS_BLOCKED, paths=resolved_paths)
                     error_text = resume_state.get("error") or "<no error details in state.json>"
                     print(
@@ -10587,6 +10759,18 @@ def main() -> None:
         default=None,
         help="Post-dispatch artifact timeout in seconds (default: 90)",
     )
+    run_p.add_argument(
+        "--worker-noop-as-error",
+        action="store_true",
+        default=None,
+        help="Treat worker no-change submissions (head==base) as validation failures (default)",
+    )
+    run_p.add_argument(
+        "--worker-noop-as-success",
+        action="store_true",
+        default=None,
+        help="Treat worker no-change submissions (head==base) as terminal success and skip reviewer",
+    )
     run_p.add_argument("--single-round", action="store_true", help="Run exactly one round and exit")
     run_p.add_argument("--round", type=int, help="Round number for --single-round mode")
     run_p.add_argument("--allow-dirty", action="store_true", help="Allow run to start with dirty tracked git files")
@@ -10658,6 +10842,15 @@ def main() -> None:
                 return file_value if file_value is not None else builtin_default
 
             auto_dispatch_cli = True if args.auto_dispatch else None
+            worker_noop_as_error_cli: bool | None = None
+            if args.worker_noop_as_error and args.worker_noop_as_success:
+                raise ValidationError(
+                    "--worker-noop-as-error and --worker-noop-as-success are mutually exclusive"
+                )
+            if args.worker_noop_as_error:
+                worker_noop_as_error_cli = True
+            elif args.worker_noop_as_success:
+                worker_noop_as_error_cli = False
             config = RunConfig(
                 task_path=_coerce_str_config(task_path, field_name="task_path"),
                 max_rounds=_coerce_int_config(
@@ -10725,6 +10918,14 @@ def main() -> None:
                     _cfg_val(args.artifact_timeout, "artifact_timeout", DEFAULT_DISPATCH_ARTIFACT_TIMEOUT_SEC),
                     field_name="artifact_timeout",
                     minimum=0,
+                ),
+                worker_noop_as_error=_coerce_bool_config(
+                    _cfg_val(
+                        worker_noop_as_error_cli,
+                        "worker_noop_as_error",
+                        DEFAULT_WORKER_NOOP_AS_ERROR,
+                    ),
+                    field_name="worker_noop_as_error",
                 ),
                 allow_dirty=args.allow_dirty,
                 verbose=args.verbose,

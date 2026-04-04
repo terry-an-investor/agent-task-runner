@@ -3172,6 +3172,53 @@ def test_main_run_parses_dispatch_retry_flags(monkeypatch) -> None:
     assert captured["dispatch_retry_base_sec"] == 7
 
 
+def test_main_run_parses_worker_noop_flags(monkeypatch) -> None:
+    captured: dict[str, bool] = {}
+
+    def fake_cmd_run(
+        config: orchestrator.RunConfig,
+        single_round: bool,
+        round_num: int | None,
+        resume: bool = False,
+        reset: bool = False,
+    ) -> None:
+        _ = (single_round, round_num, resume, reset)
+        captured["worker_noop_as_error"] = config.worker_noop_as_error
+
+    monkeypatch.setattr(orchestrator, "cmd_run", fake_cmd_run)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "orchestrator.py",
+            "run",
+            "--worker-noop-as-success",
+        ],
+    )
+
+    orchestrator.main()
+    assert captured["worker_noop_as_error"] is False
+
+
+def test_main_run_rejects_conflicting_worker_noop_flags(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "orchestrator.py",
+            "run",
+            "--worker-noop-as-error",
+            "--worker-noop-as-success",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        orchestrator.main()
+
+    assert exc.value.code == orchestrator.EXIT_VALIDATION_ERROR
+    assert "mutually exclusive" in capsys.readouterr().err
+
+
 def test_main_run_parses_max_session_rounds(monkeypatch) -> None:
     captured: dict[str, int] = {}
 
@@ -4018,6 +4065,271 @@ def test_single_round_invalid_work_report_sets_invalid_outcome(tmp_path: Path, m
     state = json.loads(orchestrator.STATE_FILE.read_text(encoding="utf-8"))
     assert state["outcome"] == "invalid_work_report"
     assert "round" in state["error"]
+
+
+def test_single_round_resolves_base_head_to_immutable_oids_before_compare(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+
+    task_path = tmp_path / "task_input.json"
+    task_path.write_text(
+        json.dumps({"task_id": "T-604", "goal": "ref resolve compare"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    orchestrator.STATE_FILE.write_text(
+        json.dumps(
+            {
+                "state": orchestrator.STATE_AWAITING_WORK,
+                "round": 1,
+                "task_id": "T-604",
+                "base_sha": "base-ref",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    work_report = {
+        "task_id": "T-604",
+        "round": 1,
+        "head_sha": "head-ref",
+        "files_changed": ["tools/orchestrator.py"],
+        "tests": [],
+        "notes": "ok",
+    }
+    review_report = {
+        "task_id": "T-604",
+        "round": 1,
+        "decision": "approve",
+        "blocking_issues": [],
+        "non_blocking_suggestions": [],
+    }
+
+    def fake_wait(path: Path, description: str, **kwargs) -> dict | None:
+        _ = (description, kwargs)
+        if path == orchestrator.WORK_REPORT:
+            return dict(work_report)
+        if path == orchestrator.REVIEW_REPORT:
+            return dict(review_report)
+        return None
+
+    monkeypatch.setattr(orchestrator, "_wait_for_file", fake_wait)
+    monkeypatch.setattr(orchestrator, "_is_git_repo_root", lambda _path: True)
+    monkeypatch.setattr(
+        orchestrator,
+        "_resolve_commit_oid",
+        lambda ref: {"base-ref": "base-oid", "head-ref": "head-oid", "base-oid": "base-oid", "head-oid": "head-oid"}[
+            ref
+        ],
+    )
+    captured: dict[str, tuple[str, str]] = {}
+    monkeypatch.setattr(
+        orchestrator,
+        "_diff",
+        lambda base, head: captured.setdefault("diff", (base, head)) and f"diff {base}->{head}",
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_log_oneline",
+        lambda base, head: captured.setdefault("log", (base, head)) and f"log {base}->{head}",
+    )
+    monkeypatch.setattr(orchestrator, "_update_knowledge_on_approval", lambda *args, **kwargs: None)
+
+    orchestrator.cmd_run(
+        _run_config(str(task_path), allow_dirty=True),
+        single_round=True,
+        round_num=1,
+    )
+
+    assert captured["diff"] == ("base-oid", "head-oid")
+    assert captured["log"] == ("base-oid", "head-oid")
+    work = json.loads(orchestrator.WORK_REPORT.read_text(encoding="utf-8"))
+    review_request = json.loads(orchestrator.REVIEW_REQ.read_text(encoding="utf-8"))
+    assert work["head_sha"] == "head-oid"
+    assert review_request["base_sha"] == "base-oid"
+
+
+def test_single_round_no_change_can_be_terminal_success(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+
+    task_path = tmp_path / "task_input.json"
+    task_path.write_text(
+        json.dumps({"task_id": "T-604", "goal": "no change success"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    orchestrator.STATE_FILE.write_text(
+        json.dumps(
+            {
+                "state": orchestrator.STATE_AWAITING_WORK,
+                "round": 1,
+                "task_id": "T-604",
+                "base_sha": "base-ref",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    def fake_wait(path: Path, description: str, **kwargs) -> dict | None:
+        _ = (description, kwargs)
+        if path == orchestrator.WORK_REPORT:
+            return {
+                "task_id": "T-604",
+                "round": 1,
+                "head_sha": "head-ref",
+                "files_changed": [],
+                "tests": [{"name": "pytest", "result": "pass"}],
+                "notes": "noop",
+            }
+        if path == orchestrator.REVIEW_REPORT:
+            raise AssertionError("reviewer should not run when no-change success is enabled")
+        return None
+
+    monkeypatch.setattr(orchestrator, "_wait_for_file", fake_wait)
+    monkeypatch.setattr(orchestrator, "_is_git_repo_root", lambda _path: True)
+    monkeypatch.setattr(
+        orchestrator,
+        "_resolve_commit_oid",
+        lambda ref: {"base-ref": "same-oid", "head-ref": "same-oid", "same-oid": "same-oid"}[ref],
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_diff",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("diff should not run for no-change success")),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_log_oneline",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("log should not run for no-change success")),
+    )
+
+    orchestrator.cmd_run(
+        _run_config(str(task_path), allow_dirty=True, worker_noop_as_error=False),
+        single_round=True,
+        round_num=1,
+    )
+
+    state = json.loads(orchestrator.STATE_FILE.read_text(encoding="utf-8"))
+    summary = json.loads((orchestrator.LOOP_DIR / "summary.json").read_text(encoding="utf-8"))
+    assert state["state"] == orchestrator.STATE_DONE
+    assert state["outcome"] == "no_change_success"
+    assert summary["outcome"] == "no_change_success"
+    assert (orchestrator.LOOP_DIR / "review_request.json").exists() is False
+
+
+def test_single_round_no_change_default_is_validation_failure(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+
+    task_path = tmp_path / "task_input.json"
+    task_path.write_text(
+        json.dumps({"task_id": "T-604", "goal": "no change default failure"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    orchestrator.STATE_FILE.write_text(
+        json.dumps(
+            {
+                "state": orchestrator.STATE_AWAITING_WORK,
+                "round": 1,
+                "task_id": "T-604",
+                "base_sha": "base-ref",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        orchestrator,
+        "_wait_for_file",
+        lambda path, description, **kwargs: {
+            "task_id": "T-604",
+            "round": 1,
+            "head_sha": "head-ref",
+            "files_changed": [],
+            "tests": [],
+            "notes": "noop",
+        }
+        if path == orchestrator.WORK_REPORT
+        else None,
+    )
+    monkeypatch.setattr(orchestrator, "_is_git_repo_root", lambda _path: True)
+    monkeypatch.setattr(
+        orchestrator,
+        "_resolve_commit_oid",
+        lambda ref: {"base-ref": "same-oid", "head-ref": "same-oid", "same-oid": "same-oid"}[ref],
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        orchestrator.cmd_run(
+            _run_config(str(task_path), allow_dirty=True),
+            single_round=True,
+            round_num=1,
+        )
+
+    assert exc.value.code == 3
+    state = json.loads(orchestrator.STATE_FILE.read_text(encoding="utf-8"))
+    summary = json.loads((orchestrator.LOOP_DIR / "summary.json").read_text(encoding="utf-8"))
+    assert state["outcome"] == "validation_failure"
+    assert summary["outcome"] == "validation_failure"
+    assert "no code changes" in state["error"]
+
+
+def test_single_round_invalid_head_ref_window_is_validation_failure(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+
+    task_path = tmp_path / "task_input.json"
+    task_path.write_text(
+        json.dumps({"task_id": "T-604", "goal": "invalid head ref"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    orchestrator.STATE_FILE.write_text(
+        json.dumps(
+            {
+                "state": orchestrator.STATE_AWAITING_WORK,
+                "round": 1,
+                "task_id": "T-604",
+                "base_sha": "base-ref",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        orchestrator,
+        "_wait_for_file",
+        lambda path, description, **kwargs: {
+            "task_id": "T-604",
+            "round": 1,
+            "head_sha": "missing-ref",
+            "files_changed": ["x.py"],
+            "tests": [],
+            "notes": "invalid ref",
+        }
+        if path == orchestrator.WORK_REPORT
+        else None,
+    )
+    monkeypatch.setattr(orchestrator, "_is_git_repo_root", lambda _path: True)
+
+    def fake_resolve(ref: str) -> str:
+        if ref == "base-ref":
+            return "base-oid"
+        if ref == "missing-ref":
+            raise orchestrator.ValidationError("missing commit")
+        return ref
+
+    monkeypatch.setattr(orchestrator, "_resolve_commit_oid", fake_resolve)
+
+    with pytest.raises(SystemExit) as exc:
+        orchestrator.cmd_run(
+            _run_config(str(task_path), allow_dirty=True),
+            single_round=True,
+            round_num=1,
+        )
+
+    assert exc.value.code == 3
+    state = json.loads(orchestrator.STATE_FILE.read_text(encoding="utf-8"))
+    assert state["outcome"] == "validation_failure"
+    assert "immutable commit" in state["error"]
 
 
 def test_single_round_invalid_review_report_sets_invalid_outcome(tmp_path: Path, monkeypatch) -> None:
@@ -6109,6 +6421,41 @@ def test_outer_loop_spawns_single_round_subprocess(tmp_path: Path, monkeypatch) 
     assert "--require-heartbeat" in cmd
 
 
+def test_outer_loop_propagates_worker_noop_as_success_flag(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+
+    task_path = tmp_path / "task_input.json"
+    task_path.write_text(
+        json.dumps({"task_id": "T-604", "goal": "noop flag propagation"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(orchestrator, "_current_sha", lambda: "base-sha")
+
+    calls: list[list[str]] = []
+
+    def fake_subprocess_popen(cmd, **kwargs):
+        _ = kwargs
+        calls.append(cmd)
+        state = orchestrator._load_state()
+        state["state"] = orchestrator.STATE_DONE
+        state["outcome"] = "approved"
+        state["head_sha"] = "head-sha"
+        orchestrator._save_state(state)
+        return _FakeProc(stdout_lines=[])
+
+    monkeypatch.setattr(orchestrator.subprocess, "Popen", fake_subprocess_popen)
+
+    orchestrator.cmd_run(
+        _run_config(str(task_path), worker_noop_as_error=False),
+        single_round=False,
+        round_num=None,
+    )
+
+    assert calls
+    cmd = calls[0]
+    assert "--worker-noop-as-success" in cmd
+
+
 def test_outer_loop_approved_status_is_written_back_to_source_task_card(tmp_path: Path, monkeypatch) -> None:
     _configure_loop_paths(monkeypatch, tmp_path)
 
@@ -6410,6 +6757,42 @@ def test_outer_loop_treats_legacy_review_done_as_terminal_approved(tmp_path: Pat
     assert state["outcome"] == "approved"
 
 
+def test_outer_loop_treats_no_change_success_as_terminal_success(tmp_path: Path, monkeypatch) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+
+    task_path = tmp_path / "task_input.json"
+    task_path.write_text(
+        json.dumps({"task_id": "T-604", "goal": "terminal no-change success"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(orchestrator, "_current_sha", lambda: "base-sha")
+
+    calls: list[list[str]] = []
+
+    def fake_subprocess_popen(cmd, **kwargs):
+        _ = kwargs
+        calls.append(cmd)
+        state = orchestrator._load_state()
+        state["state"] = orchestrator.STATE_DONE
+        state["outcome"] = "no_change_success"
+        state["head_sha"] = "base-sha"
+        orchestrator._save_state(state)
+        return _FakeProc(stdout_lines=[])
+
+    monkeypatch.setattr(orchestrator.subprocess, "Popen", fake_subprocess_popen)
+
+    orchestrator.cmd_run(
+        _run_config(str(task_path), max_rounds=2),
+        single_round=False,
+        round_num=None,
+    )
+
+    assert len(calls) == 1
+    state = orchestrator._load_state()
+    assert state["state"] == orchestrator.STATE_DONE
+    assert state["outcome"] == "no_change_success"
+
+
 def test_outer_loop_continues_from_state_without_fresh_review_report(tmp_path: Path, monkeypatch) -> None:
     _configure_loop_paths(monkeypatch, tmp_path)
 
@@ -6584,7 +6967,42 @@ def test_cmd_run_resume_done_approved_exits_cleanly(tmp_path: Path, monkeypatch,
 
     assert called["outer"] is False
     out = capsys.readouterr().out
-    assert "done/approved" in out
+    assert "terminal success" in out
+    assert "approved" in out
+
+
+def test_cmd_run_resume_done_no_change_success_exits_cleanly(tmp_path: Path, monkeypatch, capsys) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+    task_path = tmp_path / "task_input.json"
+    task_path.write_text(
+        json.dumps({"task_id": "T-608", "goal": "resume no-change success"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    orchestrator.STATE_FILE.write_text(
+        json.dumps(
+            {"state": orchestrator.STATE_DONE, "outcome": "no_change_success", "task_id": "T-608"},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    called = {"outer": False}
+    monkeypatch.setattr(
+        orchestrator,
+        "_run_multi_round_via_subprocess",
+        lambda **kwargs: called.update({"outer": True}),
+    )
+
+    orchestrator.cmd_run(
+        _run_config(str(task_path)),
+        single_round=False,
+        round_num=None,
+        resume=True,
+    )
+
+    assert called["outer"] is False
+    out = capsys.readouterr().out
+    assert "terminal success" in out
+    assert "no_change_success" in out
 
 
 def test_cmd_run_resume_legacy_review_done_approved_exits_cleanly(tmp_path: Path, monkeypatch, capsys) -> None:
@@ -6617,7 +7035,8 @@ def test_cmd_run_resume_legacy_review_done_approved_exits_cleanly(tmp_path: Path
 
     assert called["outer"] is False
     out = capsys.readouterr().out
-    assert "done/approved" in out
+    assert "terminal success" in out
+    assert "approved" in out
 
 
 def test_cmd_run_resume_failed_state_prints_error_and_exits_3(tmp_path: Path, monkeypatch, capsys) -> None:
@@ -8038,6 +8457,24 @@ class TestCmdReport:
             "lane_core": "approve",
             "lane_docs": "changes_required",
         }
+
+    @pytest.mark.parametrize("outcome", ["no_change_success", "validation_failure"])
+    def test_report_renders_no_change_and_validation_outcomes(
+        self, tmp_path: Path, monkeypatch, capsys, outcome: str
+    ) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        orchestrator.STATE_FILE.write_text(
+            json.dumps(
+                {"state": "done", "round": 1, "task_id": "T-744", "base_sha": "base-sha", "outcome": outcome},
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        orchestrator.cmd_report("T-744", output_format="markdown")
+        out = capsys.readouterr().out
+        assert f"- Outcome: {outcome}" in out
 
     def test_uses_state_task_id_when_argument_omitted(self, tmp_path: Path, monkeypatch, capsys) -> None:
         _configure_loop_paths(monkeypatch, tmp_path)

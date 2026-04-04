@@ -133,6 +133,10 @@ Reviewer → PM: review_report.json
 | `awaiting_review` | Reviewer phase |
 | `done` | Terminal (approved, timeout, or blocked) |
 
+Worker no-change (`head_sha == base_sha` after immutable OID resolution) is explicit:
+- default: terminal `validation_failure` (`worker_noop_as_error=true`)
+- optional: terminal `no_change_success` and reviewer is skipped (`--worker-noop-as-success`)
+
 ### Session Management
 
 - **Quickstart**: Fresh context for cold starts (round 1)
@@ -197,6 +201,7 @@ loop report                Summarize task progress
 | `--reviewer-backend` | codex | `codex`, `claude`, or `opencode` |
 | `--dispatch-timeout N` | 0 | Per-dispatch timeout (0=unlimited) |
 | `--dispatch-retries N` | 2 | Retries on non-zero exit |
+| `--worker-noop-as-success` | off | Accept worker no-change (`head==base`) as terminal success |
 | `--max-session-rounds N` | 0 | Session reuse before rotation |
 | `--resume` | off | Resume from state.json |
 | `--verbose` | off | Stream backend stdout |
@@ -207,7 +212,7 @@ Full flag list: `loop run --help`
 
 `loop run` reads from `.loop/config.yaml` (preferred) or `.loop/config.json`.
 
-Env var overrides: `LOOP_MAX_ROUNDS`, `LOOP_DISPATCH_TIMEOUT`, `LOOP_BACKEND_PREFERENCE`.
+Env var overrides: `LOOP_MAX_ROUNDS`, `LOOP_DISPATCH_TIMEOUT`, `LOOP_BACKEND_PREFERENCE`, `LOOP_WORKER_NOOP_AS_ERROR`.
 
 Resolution order: `CLI args > env vars > config file > built-in defaults`
 

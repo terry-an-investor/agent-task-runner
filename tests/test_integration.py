@@ -1284,7 +1284,17 @@ def test_auto_dispatch_ignores_stale_cross_run_work_report(tmp_path: Path) -> No
     )
 
     def _inject_stale_work_report() -> None:
-        time.sleep(0.2)
+        log_path = loop_dir / "logs" / "orchestrator.log"
+        deadline = time.time() + 4.0
+        while time.time() < deadline:
+            if log_path.exists():
+                try:
+                    log_text = log_path.read_text(encoding="utf-8")
+                except OSError:
+                    log_text = ""
+                if "Waiting for work_report.json" in log_text:
+                    break
+            time.sleep(0.05)
         _write_json(
             loop_dir / "work_report.json",
             {
@@ -1333,3 +1343,74 @@ def test_auto_dispatch_ignores_stale_cross_run_work_report(tmp_path: Path) -> No
     assert state["outcome"] == "approved"
     assert work["run_id"] == state["run_id"]
     assert work["run_id"] != "run-stale"
+
+
+@pytest.mark.timeout(15)
+def test_single_round_no_change_success_exits_without_reviewer(tmp_path: Path) -> None:
+    base_sha = _init_git_repo(tmp_path)
+    loop_dir = _prepare_loop_contract(
+        tmp_path,
+        task_id="T-744-noop",
+        base_sha=base_sha,
+        state_name="task_ready",
+        round_num=1,
+    )
+    state_payload = json.loads((loop_dir / "state.json").read_text(encoding="utf-8"))
+    state_payload["run_id"] = "run-noop-success"
+    _write_json(loop_dir / "state.json", state_payload)
+
+    def _inject_work_report() -> None:
+        log_path = loop_dir / "logs" / "orchestrator.log"
+        deadline = time.time() + 4.0
+        while time.time() < deadline:
+            if log_path.exists():
+                try:
+                    log_text = log_path.read_text(encoding="utf-8")
+                except OSError:
+                    log_text = ""
+                if "Waiting for work_report.json" in log_text:
+                    break
+            time.sleep(0.05)
+        _write_json(
+            loop_dir / "work_report.json",
+            {
+                "task_id": "T-744-noop",
+                "run_id": "run-noop-success",
+                "round": 1,
+                "head_sha": "HEAD",
+                "files_changed": [],
+                "tests": [{"name": "manual", "result": "pass", "output": "noop"}],
+                "notes": "no-op integration test",
+            },
+        )
+
+    injector = threading.Thread(target=_inject_work_report, daemon=True)
+    injector.start()
+    result = _run_loop(
+        tmp_path,
+        [
+            "run",
+            "--loop-dir",
+            ".loop",
+            "--task",
+            ".loop/task_card.json",
+            "--single-round",
+            "--round",
+            "1",
+            "--worker-noop-as-success",
+            "--timeout",
+            "5",
+        ],
+    )
+    injector.join(timeout=1)
+
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    state = json.loads((loop_dir / "state.json").read_text(encoding="utf-8"))
+    work = json.loads((loop_dir / "work_report.json").read_text(encoding="utf-8"))
+    summary = json.loads((loop_dir / "summary.json").read_text(encoding="utf-8"))
+    assert state["state"] == "done"
+    assert state["outcome"] == "no_change_success"
+    assert work["head_sha"] == base_sha
+    assert summary["outcome"] == "no_change_success"
+    assert (loop_dir / "review_request.json").exists() is False
+    assert (loop_dir / "review_report.json").exists() is False
