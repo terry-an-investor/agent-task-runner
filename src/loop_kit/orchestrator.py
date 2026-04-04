@@ -8322,7 +8322,9 @@ def _single_round_subprocess_cmd(
         cmd.append("--allow-dirty")
     if config.aggressive_parallelism:
         cmd.append("--aggressive-parallelism")
-    if not config.worker_noop_as_error:
+    if config.worker_noop_as_error:
+        cmd.append("--worker-noop-as-error")
+    else:
         cmd.append("--worker-noop-as-success")
     if config.verbose:
         cmd.append("--verbose")

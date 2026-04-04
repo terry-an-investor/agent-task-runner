@@ -6454,6 +6454,56 @@ def test_outer_loop_propagates_worker_noop_as_success_flag(tmp_path: Path, monke
     assert calls
     cmd = calls[0]
     assert "--worker-noop-as-success" in cmd
+    assert "--worker-noop-as-error" not in cmd
+
+
+def test_outer_loop_propagates_worker_noop_as_error_flag_even_with_env_override(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+
+    task_path = tmp_path / "task_input.json"
+    task_path.write_text(
+        json.dumps({"task_id": "T-604", "goal": "noop flag propagation error mode"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(orchestrator, "_current_sha", lambda: "base-sha")
+    monkeypatch.setenv("LOOP_WORKER_NOOP_AS_ERROR", "false")
+
+    calls: list[list[str]] = []
+
+    def fake_subprocess_popen(cmd, **kwargs):
+        _ = kwargs
+        calls.append(cmd)
+        state = orchestrator._load_state()
+        state["state"] = orchestrator.STATE_DONE
+        state["outcome"] = "approved"
+        state["head_sha"] = "head-sha"
+        orchestrator._save_state(state)
+        return _FakeProc(stdout_lines=[])
+
+    monkeypatch.setattr(orchestrator.subprocess, "Popen", fake_subprocess_popen)
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "orchestrator.py",
+            "run",
+            "--loop-dir",
+            str(tmp_path / ".loop"),
+            "--task",
+            str(task_path),
+            "--worker-noop-as-error",
+        ],
+    )
+
+    orchestrator.main()
+
+    assert calls
+    cmd = calls[0]
+    assert "--worker-noop-as-error" in cmd
+    assert "--worker-noop-as-success" not in cmd
 
 
 def test_outer_loop_approved_status_is_written_back_to_source_task_card(tmp_path: Path, monkeypatch) -> None:
