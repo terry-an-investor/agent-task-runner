@@ -39,6 +39,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import types
 import uuid
 from collections.abc import Callable
@@ -106,6 +107,12 @@ class ReviewIssue(TypedDict):
     required_change: NotRequired[str]
     category: NotRequired[str]
     confidence: NotRequired[int | float | str]
+
+
+class ExceptionDiagnostics(TypedDict):
+    type: str
+    message: str
+    traceback: str
 
 
 class LaneRuntimeMetrics(TypedDict, total=False):
@@ -384,6 +391,11 @@ _JSON_SECRET_RE = re.compile(
     r"(?i)(\"(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|password|passwd|pwd|secret)\"\s*:\s*\")([^\"]+)(\")"
 )
 _OPENAI_KEY_RE = re.compile(r"\bsk-[A-Za-z0-9]{10,}\b")
+_LANE_FAILURE_SUMMARY_MAX_LEN = 160
+_LANE_EXCEPTION_TYPE_MAX_LEN = 120
+_LANE_EXCEPTION_MESSAGE_MAX_LEN = 300
+_LANE_EXCEPTION_TRACEBACK_MAX_LEN = 4000
+_TRACEBACK_TRUNCATION_MARKER = "\n...[truncated]...\n"
 
 
 class DispatchTimeoutError(RuntimeError):
@@ -1248,6 +1260,44 @@ def _truncate_summary_text(text: str, max_len: int = 120) -> str:
     if len(normalized) <= max_len:
         return normalized
     return normalized[: max_len - 3].rstrip() + "..."
+
+
+def _truncate_text_tail(text: str, max_len: int, *, marker: str = _TRACEBACK_TRUNCATION_MARKER) -> str:
+    if max_len <= 0:
+        return ""
+    if len(text) <= max_len:
+        return text
+    if max_len <= len(marker):
+        return marker[-max_len:]
+    keep_len = max_len - len(marker)
+    return marker + text[-keep_len:]
+
+
+def _build_exception_diagnostics(exc: BaseException) -> ExceptionDiagnostics:
+    exception_type_raw = type(exc).__name__.strip() or "Exception"
+    exception_type = _truncate_summary_text(exception_type_raw, max_len=_LANE_EXCEPTION_TYPE_MAX_LEN)
+    raw_message = str(exc).strip()
+    if not raw_message:
+        raw_message = repr(exc)
+    redacted_message = _redact_sensitive_log_text(raw_message)
+    message = _truncate_summary_text(redacted_message, max_len=_LANE_EXCEPTION_MESSAGE_MAX_LEN)
+    traceback_text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    traceback_text = _redact_sensitive_log_text(traceback_text)
+    traceback_text = _truncate_text_tail(traceback_text, _LANE_EXCEPTION_TRACEBACK_MAX_LEN)
+    return {
+        "type": exception_type,
+        "message": message,
+        "traceback": traceback_text,
+    }
+
+
+def _exception_summary_text(
+    diagnostics: ExceptionDiagnostics, *, max_len: int = _LANE_FAILURE_SUMMARY_MAX_LEN
+) -> str:
+    exception_type = diagnostics["type"].strip() or "Exception"
+    message = diagnostics["message"].strip()
+    summary = f"{exception_type}: {message}" if message else exception_type
+    return _truncate_summary_text(summary, max_len=max_len)
 
 
 def _extract_command_summary(item: dict) -> str:
@@ -9328,9 +9378,38 @@ def _run_single_round(
                     try:
                         lane_work = future.result()
                     except Exception as e:
+                        diagnostics = _build_exception_diagnostics(e)
+                        summary = _exception_summary_text(diagnostics)
+                        lane_config = lane_by_id.get(lane_id)
+                        lane_backend = (
+                            _lane_backend_for_dispatch(lane_config, config)
+                            if lane_config is not None
+                            else config.worker_backend.strip().lower()
+                        )
                         lane_entry["status"] = "failed"
-                        lane_entry["error"] = str(e)
-                        lane_failures.append(f"{lane_id}: {e}")
+                        lane_entry["error"] = summary
+                        lane_entry["error_detail"] = diagnostics
+                        lane_failures.append(f"{lane_id}: {summary}")
+                        _feed_event(
+                            FEED_DISPATCH_FAIL,
+                            level="error",
+                            data=_feed_data(
+                                task_id=task_id,
+                                round_num=round_num,
+                                role=_lane_dispatch_role_name(lane_id),
+                                lane_id=lane_id,
+                                backend=lane_backend,
+                                phase="lane_dispatch_future",
+                                error=summary,
+                                exception=diagnostics,
+                            ),
+                            paths=resolved_paths,
+                        )
+                        _log(
+                            "Lane dispatch future failed for lane "
+                            f"'{lane_id}': {summary} diagnostics={json.dumps(diagnostics, ensure_ascii=False)}",
+                            paths=resolved_paths,
+                        )
                         continue
                     lane_reports[lane_id] = lane_work
                     lane_execution_order.append(lane_id)
@@ -9404,9 +9483,32 @@ def _run_single_round(
                     try:
                         lane_review, lane_review_duration_ms, lane_review_backend = future.result()
                     except Exception as e:
+                        diagnostics = _build_exception_diagnostics(e)
+                        summary = _exception_summary_text(diagnostics)
                         lane_entry["review_status"] = "failed"
-                        lane_entry["review_error"] = str(e)
-                        lane_review_failures.append(f"{lane_id}: {e}")
+                        lane_entry["review_error"] = summary
+                        lane_entry["review_error_detail"] = diagnostics
+                        lane_review_failures.append(f"{lane_id}: {summary}")
+                        _feed_event(
+                            FEED_DISPATCH_FAIL,
+                            level="error",
+                            data=_feed_data(
+                                task_id=task_id,
+                                round_num=round_num,
+                                role=_lane_reviewer_dispatch_role_name(lane_id),
+                                lane_id=lane_id,
+                                backend=config.reviewer_backend.strip().lower(),
+                                phase="lane_review_future",
+                                error=summary,
+                                exception=diagnostics,
+                            ),
+                            paths=resolved_paths,
+                        )
+                        _log(
+                            "Lane review future failed for lane "
+                            f"'{lane_id}': {summary} diagnostics={json.dumps(diagnostics, ensure_ascii=False)}",
+                            paths=resolved_paths,
+                        )
                         continue
                     lane_reviews[lane_id] = lane_review
                     decision = str(lane_review["decision"])

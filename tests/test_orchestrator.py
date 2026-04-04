@@ -4963,6 +4963,12 @@ def test_single_round_lane_failure_preserves_worktrees_and_marks_blocked_depende
         raise AssertionError(f"unexpected lane dispatch role: {role}")
 
     monkeypatch.setattr(orchestrator, "_dispatch_with_artifact_fallback", fake_dispatch_with_artifact_fallback)
+    feed_events: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        orchestrator,
+        "_feed_event",
+        lambda event, *, level="info", data=None, paths=None: feed_events.append((event, dict(data or {}))),
+    )
 
     with pytest.raises(SystemExit) as exc:
         orchestrator.cmd_run(
@@ -4980,8 +4986,32 @@ def test_single_round_lane_failure_preserves_worktrees_and_marks_blocked_depende
     state = json.loads(orchestrator.STATE_FILE.read_text(encoding="utf-8"))
     assert state["outcome"] == "lane_dispatch_failed"
     assert state["lanes"]["lane_core"]["status"] == "failed"
+    assert state["lanes"]["lane_core"]["error"] == "RuntimeError: lane core failed"
+    assert "Traceback" not in state["lanes"]["lane_core"]["error"]
+    error_detail = state["lanes"]["lane_core"]["error_detail"]
+    assert error_detail["type"] == "RuntimeError"
+    assert error_detail["message"] == "lane core failed"
+    assert "RuntimeError: lane core failed" in error_detail["traceback"]
+    assert "fake_dispatch_with_artifact_fallback" in error_detail["traceback"]
     assert state["lanes"]["lane_docs"]["status"] == "blocked"
     assert "lane_core:failed" in state["lanes"]["lane_docs"]["blocked_by"]
+    assert "lane_core: RuntimeError: lane core failed" in state["error"]
+    assert "Traceback" not in state["error"]
+    lane_dispatch_fail_events = [
+        payload
+        for event, payload in feed_events
+        if event == orchestrator.FEED_DISPATCH_FAIL
+        and payload.get("lane_id") == "lane_core"
+        and payload.get("phase") == "lane_dispatch_future"
+    ]
+    assert len(lane_dispatch_fail_events) == 1
+    lane_dispatch_event = lane_dispatch_fail_events[0]
+    assert lane_dispatch_event["error"] == "RuntimeError: lane core failed"
+    event_exception = lane_dispatch_event["exception"]
+    assert isinstance(event_exception, dict)
+    assert event_exception["type"] == "RuntimeError"
+    assert event_exception["message"] == "lane core failed"
+    assert "RuntimeError: lane core failed" in event_exception["traceback"]
     assert core_worktree.exists()
     assert docs_worktree.exists()
 
@@ -5347,6 +5377,123 @@ def test_single_round_lane_review_parallel_one_reject_blocks_integration(tmp_pat
     assert state["lanes"]["lane_core"]["review_decision"] == "approve"
     assert state["lanes"]["lane_tests"]["review_decision"] == "changes_required"
     assert "__integration__" not in state["lanes"]
+
+
+def test_single_round_lane_review_future_failure_retains_exception_diagnostics(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _configure_loop_paths(monkeypatch, tmp_path)
+
+    task_path = tmp_path / "task_input.json"
+    task_path.write_text(
+        json.dumps(
+            {
+                "task_id": "T-733B",
+                "goal": "lane reviewer future diagnostics",
+                "in_scope": [],
+                "out_of_scope": [],
+                "acceptance_criteria": ["lane review failures keep traceback details"],
+                "constraints": [],
+                "lane_review_parallel": True,
+                "lanes": [
+                    {"lane_id": "lane_core", "owner_paths": ["src/loop_kit/orchestrator.py"]},
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(orchestrator, "_current_sha", lambda: "base-sha")
+    core_worktree = tmp_path / ".loop" / "worktrees" / "T-733B" / "1" / "lane_core"
+    core_worktree.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(
+        orchestrator,
+        "_prepare_lane_worktrees",
+        lambda **kwargs: [
+            orchestrator.LaneWorktreeHandle(
+                task_id="T-733B",
+                round_num=1,
+                lane_id="lane_core",
+                path=core_worktree,
+                branch="loop/T-733B/r1/lane_core",
+            ),
+        ],
+    )
+    monkeypatch.setattr(orchestrator, "_run_auto_dispatch", lambda **kwargs: f"{kwargs['role']}-session")
+
+    def fake_dispatch_with_artifact_fallback(**kwargs):
+        role = kwargs["role"]
+        if role == "worker_lane_lane_core":
+            return {
+                "task_id": "T-733B",
+                "round": 1,
+                "head_sha": "lane-core-head",
+                "files_changed": ["lane_core.py"],
+                "tests": [],
+                "notes": "lane core work",
+            }
+        if role == "reviewer_lane_lane_core":
+            raise RuntimeError("review token=abc123 failed")
+        raise AssertionError(f"unexpected dispatch role: {role}")
+
+    monkeypatch.setattr(orchestrator, "_dispatch_with_artifact_fallback", fake_dispatch_with_artifact_fallback)
+    monkeypatch.setattr(orchestrator, "_diff", lambda base, head: f"diff {base}->{head}")
+    monkeypatch.setattr(orchestrator, "_log_oneline", lambda base, head: f"log {base}->{head}")
+    monkeypatch.setattr(orchestrator, "_cleanup_lane_worktrees_for_round", lambda **kwargs: None)
+    monkeypatch.setattr(
+        orchestrator,
+        "_auto_dispatch_role",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("final reviewer dispatch should not run")),
+    )
+    feed_events: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        orchestrator,
+        "_feed_event",
+        lambda event, *, level="info", data=None, paths=None: feed_events.append((event, dict(data or {}))),
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        orchestrator.cmd_run(
+            _run_config(
+                str(task_path),
+                auto_dispatch=True,
+                max_parallel_workers=2,
+                allow_dirty=True,
+            ),
+            single_round=True,
+            round_num=1,
+        )
+
+    assert exc.value.code == orchestrator.EXIT_VALIDATION_ERROR
+    state = json.loads(orchestrator.STATE_FILE.read_text(encoding="utf-8"))
+    assert state["outcome"] == "lane_review_rejected"
+    lane_core = state["lanes"]["lane_core"]
+    assert lane_core["review_status"] == "failed"
+    assert lane_core["review_error"] == "RuntimeError: review token=[REDACTED] failed"
+    assert "Traceback" not in lane_core["review_error"]
+    review_error_detail = lane_core["review_error_detail"]
+    assert review_error_detail["type"] == "RuntimeError"
+    assert review_error_detail["message"] == "review token=[REDACTED] failed"
+    assert "RuntimeError: review token=[REDACTED] failed" in review_error_detail["traceback"]
+    assert "__integration__" not in state["lanes"]
+    assert "lane_core: RuntimeError: review token=[REDACTED] failed" in state["error"]
+    assert "Traceback" not in state["error"]
+
+    lane_review_fail_events = [
+        payload
+        for event, payload in feed_events
+        if event == orchestrator.FEED_DISPATCH_FAIL
+        and payload.get("lane_id") == "lane_core"
+        and payload.get("phase") == "lane_review_future"
+    ]
+    assert len(lane_review_fail_events) == 1
+    lane_review_fail_event = lane_review_fail_events[0]
+    assert lane_review_fail_event["error"] == "RuntimeError: review token=[REDACTED] failed"
+    event_exception = lane_review_fail_event["exception"]
+    assert isinstance(event_exception, dict)
+    assert event_exception["type"] == "RuntimeError"
+    assert event_exception["message"] == "review token=[REDACTED] failed"
+    assert "RuntimeError: review token=[REDACTED] failed" in event_exception["traceback"]
 
 
 def test_lane_review_parallel_dispatch_uses_lane_local_review_request_artifact(tmp_path: Path, monkeypatch) -> None:
