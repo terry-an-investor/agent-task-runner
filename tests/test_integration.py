@@ -678,6 +678,145 @@ def test_parallel_lane_merge_conflict_fails_safe_with_integration_status(tmp_pat
     assert state["lanes"]["lane_tests"]["status"] == "completed"
     assert state["lanes"]["__integration__"]["status"] == "failed"
     assert "Lane merge failed for lane" in str(state["lanes"]["__integration__"].get("error", ""))
+    assert _git(tmp_path, "rev-parse", "HEAD") == base_sha
+    assert _git(tmp_path, "status", "--porcelain", "--untracked-files=no") == ""
+    assert (loop_dir / "worktrees" / "T-730" / "1" / "lane_core").exists()
+    assert (loop_dir / "worktrees" / "T-730" / "1" / "lane_tests").exists()
+
+
+@pytest.mark.timeout(15)
+def test_parallel_lane_merge_conflict_skip_lane_policy_completes(tmp_path: Path) -> None:
+    base_sha = _init_git_repo(tmp_path)
+    _install_fake_opencode(tmp_path / "bin")
+    loop_dir = _prepare_loop_contract(
+        tmp_path,
+        task_id="T-731",
+        base_sha=base_sha,
+        state_name="task_ready",
+        round_num=1,
+    )
+    _write_json(
+        loop_dir / "task_card.json",
+        {
+            "task_id": "T-731",
+            "goal": "Parallel lane merge conflict skip policy",
+            "in_scope": [],
+            "out_of_scope": [],
+            "acceptance_criteria": ["skip conflicting lane and continue"],
+            "constraints": [],
+            "lane_merge_conflict_policy": "skip_lane",
+            "lanes": [
+                {"lane_id": "lane_core", "owner_paths": ["src/lane_core.py"]},
+                {"lane_id": "lane_tests", "owner_paths": ["tests/lane_tests.py"]},
+            ],
+        },
+    )
+
+    result = _run_loop(
+        tmp_path,
+        [
+            "run",
+            "--loop-dir",
+            ".loop",
+            "--task",
+            ".loop/task_card.json",
+            "--single-round",
+            "--round",
+            "1",
+            "--auto-dispatch",
+            "--worker-backend",
+            "opencode",
+            "--reviewer-backend",
+            "opencode",
+            "--dispatch-retries",
+            "0",
+            "--artifact-timeout",
+            "2",
+            "--max-parallel-workers",
+            "2",
+        ],
+        reviewer_decision="approve",
+        lane_conflict=True,
+    )
+
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    merged_work = json.loads((loop_dir / "work_report.json").read_text(encoding="utf-8"))
+    merge_provenance = merged_work.get("merge_provenance", {})
+    lane_status_by_id = {lane["lane_id"]: lane["status"] for lane in merge_provenance.get("lanes", [])}
+    assert lane_status_by_id == {
+        "lane_core": "applied",
+        "lane_tests": "skipped_conflict",
+    }
+    preflight = merge_provenance.get("preflight", {})
+    assert preflight.get("policy") == "skip_lane"
+    assert preflight.get("conflicts")
+    state = json.loads((loop_dir / "state.json").read_text(encoding="utf-8"))
+    assert state["state"] == "done"
+    assert state["outcome"] == "approved"
+    assert state["lanes"]["__integration__"]["status"] == "completed"
+
+
+@pytest.mark.timeout(15)
+def test_parallel_lane_merge_conflict_cleans_worktrees_when_preserve_disabled(tmp_path: Path) -> None:
+    base_sha = _init_git_repo(tmp_path)
+    _install_fake_opencode(tmp_path / "bin")
+    loop_dir = _prepare_loop_contract(
+        tmp_path,
+        task_id="T-732",
+        base_sha=base_sha,
+        state_name="task_ready",
+        round_num=1,
+    )
+    _write_json(
+        loop_dir / "task_card.json",
+        {
+            "task_id": "T-732",
+            "goal": "Parallel lane merge conflict cleanup",
+            "in_scope": [],
+            "out_of_scope": [],
+            "acceptance_criteria": ["cleanup lane worktrees when not preserving"],
+            "constraints": [],
+            "lane_merge_conflict_policy": "fail_fast",
+            "lane_preserve_worktrees_on_failure": False,
+            "lanes": [
+                {"lane_id": "lane_core", "owner_paths": ["src/lane_core.py"]},
+                {"lane_id": "lane_tests", "owner_paths": ["tests/lane_tests.py"]},
+            ],
+        },
+    )
+
+    result = _run_loop(
+        tmp_path,
+        [
+            "run",
+            "--loop-dir",
+            ".loop",
+            "--task",
+            ".loop/task_card.json",
+            "--single-round",
+            "--round",
+            "1",
+            "--auto-dispatch",
+            "--worker-backend",
+            "opencode",
+            "--reviewer-backend",
+            "opencode",
+            "--dispatch-retries",
+            "0",
+            "--artifact-timeout",
+            "2",
+            "--max-parallel-workers",
+            "2",
+        ],
+        reviewer_decision="approve",
+        lane_conflict=True,
+    )
+
+    assert result.returncode == orchestrator.EXIT_VALIDATION_ERROR
+    assert _git(tmp_path, "rev-parse", "HEAD") == base_sha
+    assert _git(tmp_path, "status", "--porcelain", "--untracked-files=no") == ""
+    assert not (loop_dir / "worktrees" / "T-732" / "1" / "lane_core").exists()
+    assert not (loop_dir / "worktrees" / "T-732" / "1" / "lane_tests").exists()
 
 
 @pytest.mark.timeout(15)

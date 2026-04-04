@@ -145,7 +145,12 @@ When `lanes` run in parallel, Loop Kit adds an explicit internal integration lan
 
 - Lanes are merged in deterministic `lane_execution_order` (stage order, then task-card declaration order).
 - Merge policy: ordered replay of each lane commit chain (`base..lane_head`) via `git cherry-pick` onto the integration head (rebase-style replay).
-- Conflict handling is fail-safe: `cherry-pick --abort`, stop the round, and keep worktrees for debugging.
+- Deterministic preflight runs before replay and reports likely lane conflicts (overlapping commit ancestry and touched paths) in `merge_provenance.preflight`.
+- Configure conflict handling via task-card `lane_merge_conflict_policy`:
+  - `fail_fast` (default): abort replay on first conflict, reset integration head back to base, fail the round.
+  - `skip_lane`: abort the conflicting cherry-pick, mark that lane as `skipped_conflict`, continue replay for remaining lanes.
+  - `defer_lane`: defer conflicting lanes, replay remaining lanes first, then retry deferred lanes once in deterministic defer order.
+- Configure worktree retention with task-card `lane_preserve_worktrees_on_failure` (default `true`): when enabled, failed lane rounds keep worktrees for debugging; when disabled, lane worktrees are cleaned up.
 - Optional lane reviewer fan-out: set `lane_review_parallel: true` in the task card to dispatch a reviewer for each completed lane before integration.
 - Lane reviewer gate is deterministic: every enabled lane review must return `approve` before integration can proceed.
 - The merged `work_report.json` includes `merge_provenance` (`base_sha`, merged head, lane order, per-lane commit replay, and integration acceptance checks).

@@ -4095,6 +4095,8 @@ def test_load_task_card_normalizes_valid_lanes(tmp_path: Path) -> None:
             {
                 "task_id": "T-900",
                 "goal": "lane parse",
+                "lane_merge_conflict_policy": "defer_lane",
+                "lane_preserve_worktrees_on_failure": False,
                 "lanes": [
                     {
                         "lane_id": "lane_core",
@@ -4118,6 +4120,8 @@ def test_load_task_card_normalizes_valid_lanes(tmp_path: Path) -> None:
     _, task_card, task_id = orchestrator._load_task_card(str(task_path))
 
     assert task_id == "T-900"
+    assert task_card["lane_merge_conflict_policy"] == "defer_lane"
+    assert task_card["lane_preserve_worktrees_on_failure"] is False
     assert task_card["lanes"] == [
         {
             "lane_id": "lane_core",
@@ -4154,6 +4158,50 @@ def test_load_task_card_rejects_non_boolean_lane_review_parallel(tmp_path: Path,
 
     assert exc.value.code == 1
     assert "field 'lane_review_parallel' must be a boolean" in capsys.readouterr().err
+
+
+def test_load_task_card_rejects_invalid_lane_merge_conflict_policy(tmp_path: Path, capsys) -> None:
+    task_path = tmp_path / "task_input.json"
+    task_path.write_text(
+        json.dumps(
+            {
+                "task_id": "T-900",
+                "goal": "lane merge policy validation",
+                "lane_merge_conflict_policy": "fastish",
+                "lanes": [{"lane_id": "lane_core", "owner_paths": ["src/loop_kit/orchestrator.py"]}],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        orchestrator._load_task_card(str(task_path))
+
+    assert exc.value.code == 1
+    assert "field 'lane_merge_conflict_policy' must be one of" in capsys.readouterr().err
+
+
+def test_load_task_card_rejects_non_boolean_lane_preserve_worktrees_on_failure(tmp_path: Path, capsys) -> None:
+    task_path = tmp_path / "task_input.json"
+    task_path.write_text(
+        json.dumps(
+            {
+                "task_id": "T-900",
+                "goal": "lane preserve worktree validation",
+                "lane_preserve_worktrees_on_failure": "yes",
+                "lanes": [{"lane_id": "lane_core", "owner_paths": ["src/loop_kit/orchestrator.py"]}],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        orchestrator._load_task_card(str(task_path))
+
+    assert exc.value.code == 1
+    assert "field 'lane_preserve_worktrees_on_failure' must be a boolean" in capsys.readouterr().err
 
 
 def test_load_task_card_rejects_lanes_with_duplicate_lane_id(tmp_path: Path, capsys) -> None:
@@ -5516,6 +5564,7 @@ def test_cherry_pick_lane_reports_collects_provenance_in_execution_order(monkeyp
 def test_cherry_pick_lane_reports_conflict_aborts_and_raises(monkeypatch) -> None:
     current = {"head": "base-sha"}
     abort_calls: list[tuple[str, ...]] = []
+    reset_calls: list[tuple[str, ...]] = []
 
     def fake_current_sha() -> str:
         return current["head"]
@@ -5536,6 +5585,12 @@ def test_cherry_pick_lane_reports_conflict_aborts_and_raises(monkeypatch) -> Non
         if args == ("cherry-pick", "--abort"):
             abort_calls.append(args)
             return ""
+        if args == ("reset", "--hard", "base-sha"):
+            reset_calls.append(args)
+            current["head"] = "base-sha"
+            return ""
+        if args == ("status", "--porcelain", "--untracked-files=no"):
+            return ""
         raise AssertionError(f"unexpected git args: {args}")
 
     monkeypatch.setattr(orchestrator, "_current_sha", fake_current_sha)
@@ -5550,6 +5605,180 @@ def test_cherry_pick_lane_reports_conflict_aborts_and_raises(monkeypatch) -> Non
         )
 
     assert abort_calls == [("cherry-pick", "--abort")]
+    assert reset_calls == [("reset", "--hard", "base-sha")]
+    assert current["head"] == "base-sha"
+
+
+def test_preflight_lane_merge_conflicts_reports_predictable_pairs(monkeypatch) -> None:
+    commit_chain_by_head = {
+        "lane-core-head": ["c1", "c2"],
+        "lane-tests-head": ["t1"],
+        "lane-docs-head": ["d1"],
+    }
+    touched_paths_by_commit = {
+        "c1": ["src/loop_kit/orchestrator.py"],
+        "c2": ["shared/file.txt", "src/loop_kit/orchestrator.py"],
+        "t1": ["shared/file.txt", "tests/test_orchestrator.py"],
+        "d1": ["docs/README.md"],
+    }
+
+    monkeypatch.setattr(
+        orchestrator,
+        "_lane_source_commit_chain",
+        lambda base_sha, lane_head: commit_chain_by_head.get(lane_head, []),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_commit_touched_paths",
+        lambda commit_sha: touched_paths_by_commit.get(commit_sha, []),
+    )
+
+    preflight = orchestrator._preflight_lane_merge_conflicts(
+        base_sha="base-sha",
+        lane_execution_order=["lane_core", "lane_tests", "lane_docs"],
+        lane_reports={
+            "lane_core": {"task_id": "T-730", "round": 1, "head_sha": "lane-core-head"},
+            "lane_tests": {"task_id": "T-730", "round": 1, "head_sha": "lane-tests-head"},
+            "lane_docs": {"task_id": "T-730", "round": 1, "head_sha": "lane-docs-head"},
+        },
+        conflict_policy="skip_lane",
+    )
+
+    assert preflight == {
+        "policy": "skip_lane",
+        "lane_execution_order": ["lane_core", "lane_tests", "lane_docs"],
+        "conflicts": [
+            {
+                "left_lane_id": "lane_core",
+                "right_lane_id": "lane_tests",
+                "overlapping_commits": [],
+                "overlapping_paths": ["shared/file.txt"],
+            }
+        ],
+    }
+
+
+def test_cherry_pick_lane_reports_skip_lane_on_conflict(monkeypatch) -> None:
+    current = {"head": "base-sha"}
+    abort_calls: list[tuple[str, ...]] = []
+    cherry_pick_attempts: list[str] = []
+
+    def fake_current_sha() -> str:
+        return current["head"]
+
+    def fake_git_is_ancestor(ancestor_ref: str, descendant_ref: str, *, timeout=None) -> bool:
+        _ = (ancestor_ref, descendant_ref, timeout)
+        return False
+
+    def fake_git(*args: str, timeout=None) -> str:
+        _ = timeout
+        if args[:2] == ("rev-list", "--reverse"):
+            if args[2] == "base-sha..lane-core-head":
+                return "c1\nc2"
+            if args[2] == "base-sha..lane-tests-head":
+                return "t1"
+            raise AssertionError(f"unexpected rev-list range: {args[2]}")
+        if args[:3] == ("show", "--pretty=format:", "--name-only"):
+            return ""
+        if args == ("cherry-pick", "c1"):
+            cherry_pick_attempts.append("c1")
+            current["head"] = "picked-c1"
+            return ""
+        if args == ("cherry-pick", "c2"):
+            cherry_pick_attempts.append("c2")
+            raise RuntimeError("conflict in shared/file.txt")
+        if args == ("cherry-pick", "t1"):
+            cherry_pick_attempts.append("t1")
+            current["head"] = "picked-t1"
+            return ""
+        if args == ("cherry-pick", "--abort"):
+            abort_calls.append(args)
+            return ""
+        raise AssertionError(f"unexpected git args: {args}")
+
+    monkeypatch.setattr(orchestrator, "_current_sha", fake_current_sha)
+    monkeypatch.setattr(orchestrator, "_git_is_ancestor", fake_git_is_ancestor)
+    monkeypatch.setattr(orchestrator, "_git", fake_git)
+
+    merged_head, provenance = orchestrator._cherry_pick_lane_reports(
+        base_sha="base-sha",
+        lane_execution_order=["lane_core", "lane_tests"],
+        lane_reports={
+            "lane_core": {"task_id": "T-730", "round": 1, "head_sha": "lane-core-head"},
+            "lane_tests": {"task_id": "T-730", "round": 1, "head_sha": "lane-tests-head"},
+        },
+        conflict_policy="skip_lane",
+    )
+
+    assert merged_head == "picked-t1"
+    assert cherry_pick_attempts == ["c1", "c2", "t1"]
+    assert abort_calls == [("cherry-pick", "--abort")]
+    assert provenance[0]["status"] == "skipped_conflict"
+    assert provenance[0]["applied_commits"] == ["picked-c1"]
+    assert provenance[1]["status"] == "applied"
+
+
+def test_cherry_pick_lane_reports_defer_lane_retries_after_primary_order(monkeypatch) -> None:
+    current = {"head": "base-sha"}
+    abort_calls: list[tuple[str, ...]] = []
+    cherry_pick_attempts: list[str] = []
+    c1_fail_once = {"seen": False}
+
+    def fake_current_sha() -> str:
+        return current["head"]
+
+    def fake_git_is_ancestor(ancestor_ref: str, descendant_ref: str, *, timeout=None) -> bool:
+        _ = timeout
+        if ancestor_ref == "c1" and descendant_ref == "HEAD":
+            return current["head"] == "picked-c1-retry"
+        return False
+
+    def fake_git(*args: str, timeout=None) -> str:
+        _ = timeout
+        if args[:2] == ("rev-list", "--reverse"):
+            if args[2] == "base-sha..lane-core-head":
+                return "c1"
+            if args[2] == "base-sha..lane-tests-head":
+                return "t1"
+            raise AssertionError(f"unexpected rev-list range: {args[2]}")
+        if args[:3] == ("show", "--pretty=format:", "--name-only"):
+            return ""
+        if args == ("cherry-pick", "c1"):
+            cherry_pick_attempts.append("c1")
+            if not c1_fail_once["seen"]:
+                c1_fail_once["seen"] = True
+                raise RuntimeError("conflict in shared/file.txt")
+            current["head"] = "picked-c1-retry"
+            return ""
+        if args == ("cherry-pick", "t1"):
+            cherry_pick_attempts.append("t1")
+            current["head"] = "picked-t1"
+            return ""
+        if args == ("cherry-pick", "--abort"):
+            abort_calls.append(args)
+            return ""
+        raise AssertionError(f"unexpected git args: {args}")
+
+    monkeypatch.setattr(orchestrator, "_current_sha", fake_current_sha)
+    monkeypatch.setattr(orchestrator, "_git_is_ancestor", fake_git_is_ancestor)
+    monkeypatch.setattr(orchestrator, "_git", fake_git)
+
+    merged_head, provenance = orchestrator._cherry_pick_lane_reports(
+        base_sha="base-sha",
+        lane_execution_order=["lane_core", "lane_tests"],
+        lane_reports={
+            "lane_core": {"task_id": "T-730", "round": 1, "head_sha": "lane-core-head"},
+            "lane_tests": {"task_id": "T-730", "round": 1, "head_sha": "lane-tests-head"},
+        },
+        conflict_policy="defer_lane",
+    )
+
+    assert merged_head == "picked-c1-retry"
+    assert cherry_pick_attempts == ["c1", "t1", "c1"]
+    assert abort_calls == [("cherry-pick", "--abort")]
+    assert provenance[0]["status"] == "applied_after_defer"
+    assert provenance[0]["applied_commits"] == ["picked-c1-retry"]
+    assert provenance[1]["status"] == "applied"
 
 
 def test_outer_loop_spawns_single_round_subprocess(tmp_path: Path, monkeypatch) -> None:

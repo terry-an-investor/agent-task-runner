@@ -67,6 +67,19 @@ class LaneMergeRecord(TypedDict):
     applied_commits: list[str]
 
 
+class LaneMergePreflightConflict(TypedDict):
+    left_lane_id: str
+    right_lane_id: str
+    overlapping_commits: list[str]
+    overlapping_paths: list[str]
+
+
+class LaneMergePreflight(TypedDict):
+    policy: str
+    lane_execution_order: list[str]
+    conflicts: list[LaneMergePreflightConflict]
+
+
 class LaneMergeProvenance(TypedDict):
     integration_lane_id: str
     strategy: str
@@ -75,6 +88,7 @@ class LaneMergeProvenance(TypedDict):
     lane_execution_order: list[str]
     lanes: list[LaneMergeRecord]
     acceptance_checks: list[WorkReportTest]
+    preflight: NotRequired[LaneMergePreflight]
     lane_reviews: NotRequired[list["LaneReviewVerdict"]]
 
 
@@ -188,6 +202,8 @@ class TaskCard(TypedDict, total=False):
     dependencies: NotRequired[list[str]]
     lanes: NotRequired[list[TaskLane]]
     lane_review_parallel: NotRequired[bool]
+    lane_merge_conflict_policy: NotRequired[str]
+    lane_preserve_worktrees_on_failure: NotRequired[bool]
 
 
 # ── single-file architecture boundaries (T-722) ────────────────────────────
@@ -267,6 +283,9 @@ _LANE_WORKTREES_DIRNAME = "worktrees"
 _LANE_WORKTREE_BRANCH_PREFIX = "loop"
 _INTEGRATION_LANE_ID = "__integration__"
 _LANE_MERGE_STRATEGY_V1 = "deterministic_v1_ordered_cherry_pick_rebase"
+_LANE_MERGE_CONFLICT_POLICY_CHOICES = ("fail_fast", "skip_lane", "defer_lane")
+_DEFAULT_LANE_MERGE_CONFLICT_POLICY = "fail_fast"
+_DEFAULT_LANE_PRESERVE_WORKTREES_ON_FAILURE = True
 FEED_DISPATCH_START = "dispatch_start"
 FEED_DISPATCH_COMPLETE = "dispatch_complete"
 FEED_DISPATCH_FAIL = "dispatch_fail"
@@ -5502,11 +5521,147 @@ def _merge_lane_work_reports(
     return merged
 
 
+def _lane_merge_conflict_policy(task_card: TaskCard) -> str:
+    raw_policy = task_card.get("lane_merge_conflict_policy")
+    if isinstance(raw_policy, str):
+        policy = raw_policy.strip()
+        if policy in _LANE_MERGE_CONFLICT_POLICY_CHOICES:
+            return policy
+    return _DEFAULT_LANE_MERGE_CONFLICT_POLICY
+
+
+def _lane_preserve_worktrees_on_failure(task_card: TaskCard) -> bool:
+    raw_value = task_card.get("lane_preserve_worktrees_on_failure")
+    if isinstance(raw_value, bool):
+        return raw_value
+    return _DEFAULT_LANE_PRESERVE_WORKTREES_ON_FAILURE
+
+
+def _lane_source_commit_chain(base_sha: str, lane_head: str) -> list[str]:
+    commit_text = _git("rev-list", "--reverse", f"{base_sha}..{lane_head}")
+    return [item.strip() for item in commit_text.splitlines() if item.strip()]
+
+
+def _commit_touched_paths(commit_sha: str) -> list[str]:
+    output = _git("show", "--pretty=format:", "--name-only", commit_sha)
+    touched: set[str] = set()
+    for raw_line in output.splitlines():
+        path = raw_line.strip()
+        if path:
+            touched.add(path)
+    return sorted(touched)
+
+
+def _preflight_lane_merge_conflicts(
+    *,
+    base_sha: str,
+    lane_execution_order: list[str],
+    lane_reports: dict[str, WorkReport],
+    conflict_policy: str,
+) -> LaneMergePreflight:
+    lane_commits: dict[str, set[str]] = {}
+    lane_paths: dict[str, set[str]] = {}
+    for lane_id in lane_execution_order:
+        report = lane_reports.get(lane_id)
+        if report is None:
+            continue
+        lane_head = str(report.get("head_sha", "")).strip()
+        if not lane_head or lane_head == base_sha:
+            continue
+        try:
+            commit_chain = _lane_source_commit_chain(base_sha, lane_head)
+        except RuntimeError:
+            continue
+        if not commit_chain:
+            continue
+        commit_set = set(commit_chain)
+        touched_paths: set[str] = set()
+        for commit_sha in commit_chain:
+            try:
+                touched_paths.update(_commit_touched_paths(commit_sha))
+            except RuntimeError:
+                continue
+        lane_commits[lane_id] = commit_set
+        lane_paths[lane_id] = touched_paths
+
+    conflicts: list[LaneMergePreflightConflict] = []
+    for left_index, left_lane_id in enumerate(lane_execution_order):
+        for right_lane_id in lane_execution_order[left_index + 1 :]:
+            left_commits = lane_commits.get(left_lane_id, set())
+            right_commits = lane_commits.get(right_lane_id, set())
+            left_paths = lane_paths.get(left_lane_id, set())
+            right_paths = lane_paths.get(right_lane_id, set())
+            overlapping_commits = sorted(left_commits & right_commits)
+            overlapping_paths = sorted(left_paths & right_paths)
+            if not overlapping_commits and not overlapping_paths:
+                continue
+            conflicts.append(
+                {
+                    "left_lane_id": left_lane_id,
+                    "right_lane_id": right_lane_id,
+                    "overlapping_commits": overlapping_commits,
+                    "overlapping_paths": overlapping_paths,
+                }
+            )
+
+    return {
+        "policy": conflict_policy,
+        "lane_execution_order": list(lane_execution_order),
+        "conflicts": conflicts,
+    }
+
+
+def _lane_preflight_conflict_summary(*, lane_id: str, preflight: LaneMergePreflight | None) -> str:
+    if not isinstance(preflight, dict):
+        return "preflight=none"
+    raw_conflicts = preflight.get("conflicts", [])
+    if not isinstance(raw_conflicts, list):
+        return "preflight=none"
+    related_parts: list[str] = []
+    for item in raw_conflicts:
+        if not isinstance(item, dict):
+            continue
+        left_lane_id = str(item.get("left_lane_id", "")).strip()
+        right_lane_id = str(item.get("right_lane_id", "")).strip()
+        if lane_id not in {left_lane_id, right_lane_id}:
+            continue
+        other_lane_id = right_lane_id if lane_id == left_lane_id else left_lane_id
+        raw_paths = item.get("overlapping_paths", [])
+        raw_commits = item.get("overlapping_commits", [])
+        overlap_paths = [str(path).strip() for path in raw_paths if str(path).strip()] if isinstance(raw_paths, list) else []
+        overlap_commits = (
+            [str(commit).strip() for commit in raw_commits if str(commit).strip()]
+            if isinstance(raw_commits, list)
+            else []
+        )
+        details = [f"lane={other_lane_id}"]
+        if overlap_paths:
+            details.append("paths=" + ",".join(overlap_paths))
+        if overlap_commits:
+            details.append("commits=" + ",".join(overlap_commits))
+        related_parts.append("{" + " ".join(details) + "}")
+    if not related_parts:
+        return "preflight=none"
+    return "preflight=" + "; ".join(related_parts)
+
+
+def _restore_merge_head_after_failure(base_sha: str) -> None:
+    _git("reset", "--hard", base_sha)
+    status_output = _git("status", "--porcelain", "--untracked-files=no")
+    if status_output.strip():
+        raise RuntimeError(
+            "Lane merge fail-fast cleanup left tracked changes after reset: "
+            + status_output.strip().replace("\n", "; ")
+        )
+
+
 def _cherry_pick_lane_reports(
     *,
     base_sha: str,
     lane_execution_order: list[str],
     lane_reports: dict[str, WorkReport],
+    conflict_policy: str = _DEFAULT_LANE_MERGE_CONFLICT_POLICY,
+    preflight: LaneMergePreflight | None = None,
 ) -> tuple[str, list[LaneMergeRecord]]:
     current_head = _current_sha()
     if current_head != base_sha:
@@ -5514,8 +5669,16 @@ def _cherry_pick_lane_reports(
             "Lane merge requires clean base head before cherry-pick: "
             f"expected {base_sha}, got {current_head}"
         )
+    if conflict_policy not in _LANE_MERGE_CONFLICT_POLICY_CHOICES:
+        raise ValidationError(
+            "Invalid lane merge conflict policy: "
+            f"{conflict_policy!r}. Expected one of {', '.join(_LANE_MERGE_CONFLICT_POLICY_CHOICES)}."
+        )
 
     merge_records: list[LaneMergeRecord] = []
+    merge_record_by_lane: dict[str, LaneMergeRecord] = {}
+    deferred_lanes: list[str] = []
+
     for lane_id in lane_execution_order:
         lane_record: LaneMergeRecord = {
             "lane_id": lane_id,
@@ -5524,12 +5687,14 @@ def _cherry_pick_lane_reports(
             "source_commits": [],
             "applied_commits": [],
         }
+        merge_record_by_lane[lane_id] = lane_record
         report = lane_reports.get(lane_id)
         if report is None:
             lane_record["status"] = "missing_report"
             merge_records.append(lane_record)
             continue
-        lane_head = str(report["head_sha"]).strip()
+
+        lane_head = str(report.get("head_sha", "")).strip()
         lane_record["lane_head_sha"] = lane_head
         if not lane_head or lane_head == base_sha:
             lane_record["status"] = "noop"
@@ -5539,28 +5704,86 @@ def _cherry_pick_lane_reports(
             lane_record["status"] = "already_integrated"
             merge_records.append(lane_record)
             continue
-        commit_text = _git("rev-list", "--reverse", f"{base_sha}..{lane_head}")
-        commit_chain = [item.strip() for item in commit_text.splitlines() if item.strip()]
+
+        commit_chain = _lane_source_commit_chain(base_sha, lane_head)
         lane_record["source_commits"] = commit_chain
         if not commit_chain:
             lane_record["status"] = "no_commits"
             merge_records.append(lane_record)
             continue
+
+        lane_conflict = False
         for commit_sha in commit_chain:
             if _git_is_ancestor(commit_sha, "HEAD"):
                 continue
             try:
                 _git("cherry-pick", commit_sha)
             except RuntimeError as e:
+                lane_conflict = True
                 with contextlib.suppress(RuntimeError):
                     _git("cherry-pick", "--abort")
+                preflight_summary = _lane_preflight_conflict_summary(lane_id=lane_id, preflight=preflight)
+                conflict_message = (
+                    f"Lane merge conflict for lane '{lane_id}' on commit {commit_sha} "
+                    f"(policy={conflict_policy}; {preflight_summary}): {e}"
+                )
+                if conflict_policy == "skip_lane":
+                    lane_record["status"] = "skipped_conflict"
+                    _log(conflict_message)
+                    break
+                if conflict_policy == "defer_lane":
+                    lane_record["status"] = "deferred_pending_retry"
+                    deferred_lanes.append(lane_id)
+                    _log(conflict_message)
+                    break
+                try:
+                    _restore_merge_head_after_failure(base_sha)
+                except RuntimeError as restore_error:
+                    raise RuntimeError(
+                        f"{conflict_message}; fail-fast cleanup failed: {restore_error}"
+                    ) from e
                 raise RuntimeError(
-                    f"Lane merge failed for lane '{lane_id}' on commit {commit_sha}: {e}"
+                    "Lane merge failed for lane "
+                    f"'{lane_id}' on commit {commit_sha} (policy={conflict_policy}; {preflight_summary}): {e}"
                 ) from e
             lane_record["applied_commits"].append(_current_sha())
+
+        if lane_conflict:
+            merge_records.append(lane_record)
+            continue
         lane_record["status"] = "applied" if lane_record["applied_commits"] else "already_integrated"
         merge_records.append(lane_record)
         current_head = _current_sha()
+
+    if deferred_lanes:
+        for lane_id in deferred_lanes:
+            lane_record = merge_record_by_lane.get(lane_id)
+            if lane_record is None:
+                continue
+            lane_record["status"] = "deferred_retry"
+            lane_conflict = False
+            for commit_sha in lane_record["source_commits"]:
+                if _git_is_ancestor(commit_sha, "HEAD"):
+                    continue
+                try:
+                    _git("cherry-pick", commit_sha)
+                except RuntimeError as e:
+                    lane_conflict = True
+                    with contextlib.suppress(RuntimeError):
+                        _git("cherry-pick", "--abort")
+                    preflight_summary = _lane_preflight_conflict_summary(lane_id=lane_id, preflight=preflight)
+                    _log(
+                        f"Lane deferred replay conflict for lane '{lane_id}' on commit {commit_sha} "
+                        f"(policy={conflict_policy}; {preflight_summary}): {e}"
+                    )
+                    break
+                lane_record["applied_commits"].append(_current_sha())
+            if lane_conflict:
+                lane_record["status"] = "deferred_conflict"
+            else:
+                lane_record["status"] = "applied_after_defer" if lane_record["applied_commits"] else "already_integrated"
+            current_head = _current_sha()
+
     return current_head, merge_records
 
 
@@ -6125,6 +6348,25 @@ def _load_task_card_or_raise(task_path: str | Path) -> tuple[Path, TaskCard, str
         if not isinstance(lane_review_parallel_raw, bool):
             raise ConfigError(f"task card {tp}: field 'lane_review_parallel' must be a boolean")
         task_card_typed["lane_review_parallel"] = lane_review_parallel_raw
+    lane_merge_conflict_policy_raw = task_card_typed.get("lane_merge_conflict_policy")
+    if lane_merge_conflict_policy_raw is not None:
+        if not isinstance(lane_merge_conflict_policy_raw, str) or not lane_merge_conflict_policy_raw.strip():
+            raise ConfigError(
+                f"task card {tp}: field 'lane_merge_conflict_policy' must be one of "
+                f"{', '.join(_LANE_MERGE_CONFLICT_POLICY_CHOICES)}"
+            )
+        lane_merge_conflict_policy = lane_merge_conflict_policy_raw.strip()
+        if lane_merge_conflict_policy not in _LANE_MERGE_CONFLICT_POLICY_CHOICES:
+            raise ConfigError(
+                f"task card {tp}: field 'lane_merge_conflict_policy' must be one of "
+                f"{', '.join(_LANE_MERGE_CONFLICT_POLICY_CHOICES)}"
+            )
+        task_card_typed["lane_merge_conflict_policy"] = lane_merge_conflict_policy
+    lane_preserve_worktrees_raw = task_card_typed.get("lane_preserve_worktrees_on_failure")
+    if lane_preserve_worktrees_raw is not None:
+        if not isinstance(lane_preserve_worktrees_raw, bool):
+            raise ConfigError(f"task card {tp}: field 'lane_preserve_worktrees_on_failure' must be a boolean")
+        task_card_typed["lane_preserve_worktrees_on_failure"] = lane_preserve_worktrees_raw
     if dependencies:
         task_card_typed["depends_on"] = dependencies
     elif "depends_on" in task_card_typed:
@@ -8376,7 +8618,7 @@ def _run_single_round(
     lane_cleanup_task_id: str | None = None
     lane_cleanup_ids: list[str] = []
     lane_cleanup_done = False
-    preserve_lane_worktrees = False
+    preserve_lane_worktrees = _lane_preserve_worktrees_on_failure(task_card)
 
     def _cleanup_lane_worktrees() -> None:
         nonlocal lane_cleanup_done
@@ -8543,6 +8785,7 @@ def _run_single_round(
         lane_execution_order: list[str] = []
         lane_failures: list[str] = []
         lane_review_parallel_enabled = bool(task_card.get("lane_review_parallel"))
+        lane_merge_conflict_policy = _lane_merge_conflict_policy(task_card)
         lane_report_root = _lane_reports_dir(paths=resolved_paths)
         lane_report_root.mkdir(parents=True, exist_ok=True)
 
@@ -8891,13 +9134,11 @@ def _run_single_round(
             _save_lane_state_snapshot(state, lane_state, paths=resolved_paths)
 
         if lane_failures:
-            preserve_lane_worktrees = True
             _save_lane_state_snapshot(state, lane_state, paths=resolved_paths)
             _fail_single_round(
                 outcome="lane_dispatch_failed",
                 message="Lane dispatch failed: " + "; ".join(lane_failures),
                 exit_code=EXIT_VALIDATION_ERROR,
-                cleanup_lane_worktrees=False,
             )
             return
 
@@ -8971,7 +9212,6 @@ def _run_single_round(
                         lane_review_failures.append(f"{lane_id}: decision={decision}")
             _save_lane_state_snapshot(state, lane_state, paths=resolved_paths)
             if lane_review_failures:
-                preserve_lane_worktrees = True
                 _fail_single_round(
                     outcome="lane_review_rejected",
                     message=(
@@ -8979,15 +9219,22 @@ def _run_single_round(
                         + "; ".join(lane_review_failures)
                     ),
                     exit_code=EXIT_VALIDATION_ERROR,
-                    cleanup_lane_worktrees=False,
                 )
                 return
 
         integration_entry: dict[str, object] | None = None
+        lane_merge_preflight = _preflight_lane_merge_conflicts(
+            base_sha=base_sha,
+            lane_execution_order=lane_execution_order,
+            lane_reports=lane_reports,
+            conflict_policy=lane_merge_conflict_policy,
+        )
         if lane_state:
             integration_entry = _integration_lane_state_entry(lane_execution_order=lane_execution_order)
             lane_state[_INTEGRATION_LANE_ID] = integration_entry
             integration_entry["status"] = "running"
+            integration_entry["conflict_policy"] = lane_merge_conflict_policy
+            integration_entry["preflight"] = lane_merge_preflight
             _save_lane_state_snapshot(state, lane_state, paths=resolved_paths)
 
         try:
@@ -8995,18 +9242,18 @@ def _run_single_round(
                 base_sha=base_sha,
                 lane_execution_order=lane_execution_order,
                 lane_reports=lane_reports,
+                conflict_policy=lane_merge_conflict_policy,
+                preflight=lane_merge_preflight,
             )
         except (RuntimeError, ValidationError) as e:
             if integration_entry is not None:
                 integration_entry["status"] = "failed"
                 integration_entry["error"] = str(e)
                 _save_lane_state_snapshot(state, lane_state, paths=resolved_paths)
-            preserve_lane_worktrees = True
             _fail_single_round(
                 outcome="lane_merge_failed",
                 message=str(e),
                 exit_code=EXIT_VALIDATION_ERROR,
-                cleanup_lane_worktrees=False,
             )
             return
 
@@ -9023,12 +9270,10 @@ def _run_single_round(
                 integration_entry["head_sha"] = merged_head_sha
                 integration_entry["error"] = str(e)
                 _save_lane_state_snapshot(state, lane_state, paths=resolved_paths)
-            preserve_lane_worktrees = True
             _fail_single_round(
                 outcome="integration_checks_failed",
                 message=str(e),
                 exit_code=EXIT_VALIDATION_ERROR,
-                cleanup_lane_worktrees=False,
             )
             return
 
@@ -9046,6 +9291,7 @@ def _run_single_round(
             "lane_execution_order": list(lane_execution_order),
             "lanes": lane_merge_records,
             "acceptance_checks": integration_tests,
+            "preflight": lane_merge_preflight,
         }
 
         work = _merge_lane_work_reports(
