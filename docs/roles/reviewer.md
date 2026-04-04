@@ -19,6 +19,7 @@ You are the code reviewer.
 ```json
 {
   "task_id": "T-001",
+  "run_id": "run-abc123",
   "decision": "approve|changes_required",
   "blocking_issues": [
     {
@@ -36,6 +37,7 @@ You are the code reviewer.
 
 Rules:
 - `task_id` must match request.
+- `run_id` is required — must exactly echo the `run_id` provided in the prompt (`Current task_id: ..., round: ..., run_id: ...`).
 - If `decision=approve`, `blocking_issues` must be empty.
 - If `decision=changes_required`, every blocking issue must be actionable.
 

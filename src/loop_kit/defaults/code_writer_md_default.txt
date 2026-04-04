@@ -41,6 +41,7 @@ Write `.loop/work_report.json` with this structure:
 ```json
 {
   "task_id": "T-001",
+  "run_id": "run-abc123",
   "head_sha": "<commit SHA>",
   "files_changed": ["src/loop_kit/orchestrator.py"],
   "tests": [
@@ -53,5 +54,6 @@ Write `.loop/work_report.json` with this structure:
 
 Notes:
 - `task_id` must match PM input.
+- `run_id` must match the prompt `run_id` exactly.
 - `head_sha` must be a local commit SHA.
 - Keep `notes` concise and factual.

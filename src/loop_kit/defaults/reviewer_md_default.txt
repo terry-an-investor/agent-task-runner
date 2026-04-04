@@ -31,6 +31,7 @@ Write `.loop/review_report.json`:
 ```json
 {
   "task_id": "T-001",
+  "run_id": "run-abc123",
   "round": 1,
   "decision": "approve",
   "summary": "short factual summary",
@@ -40,6 +41,7 @@ Write `.loop/review_report.json`:
 ```
 
 When returning `changes_required`, include at least one blocking issue with clear fix guidance.
+`run_id` must match the prompt `run_id` exactly.
 
 ## Quality Bar
 

@@ -21,6 +21,7 @@ You are the implementation worker.
 ```json
 {
   "task_id": "T-001",
+  "run_id": "run-abc123",
   "head_sha": "<commit SHA>",
   "files_changed": ["path/a.py"],
   "tests": [
@@ -34,6 +35,7 @@ You are the implementation worker.
 Rules:
 - `head_sha` is required — must be a valid local commit.
 - `task_id` must match PM request.
+- `run_id` is required — must exactly echo the `run_id` provided in the prompt (`Current task_id: ..., round: ..., run_id: ...`).
 - `round` is recommended.
 - `notes` must be factual and short.
 

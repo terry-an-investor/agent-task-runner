@@ -2437,8 +2437,8 @@ def test_default_prompt_context_files_are_non_empty_and_practical() -> None:
     defaults_dir = Path(orchestrator.__file__).resolve().parent / "defaults"
     expectations = {
         "agents_md_default.txt": ["Python", "_", "pytest"],
-        "code_writer_md_default.txt": ["task_card", "commit", "work_report.json"],
-        "reviewer_md_default.txt": ["review_request", "acceptance", "review_report.json"],
+        "code_writer_md_default.txt": ["task_card", "commit", "work_report.json", "run_id"],
+        "reviewer_md_default.txt": ["review_request", "acceptance", "review_report.json", "run_id"],
     }
 
     for filename, keywords in expectations.items():
@@ -2446,6 +2446,14 @@ def test_default_prompt_context_files_are_non_empty_and_practical() -> None:
         assert len(text.strip()) >= 200
         for keyword in keywords:
             assert keyword in text
+
+
+def test_project_role_contract_docs_require_run_id() -> None:
+    code_writer_text = (orchestrator.ROOT / "docs" / "roles" / "code-writer.md").read_text(encoding="utf-8")
+    reviewer_text = (orchestrator.ROOT / "docs" / "roles" / "reviewer.md").read_text(encoding="utf-8")
+
+    assert '"run_id"' in code_writer_text
+    assert '"run_id"' in reviewer_text
 
 
 def test_read_text_with_default_prefers_project_file(tmp_path: Path) -> None:

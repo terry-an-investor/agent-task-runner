@@ -1223,6 +1223,55 @@ def test_auto_dispatch_worker_timeout_race_accepts_matching_artifact(tmp_path: P
 
 
 @pytest.mark.timeout(15)
+def test_auto_dispatch_reviewer_timeout_race_accepts_matching_artifact(tmp_path: Path) -> None:
+    base_sha = _init_git_repo(tmp_path)
+    _install_fake_opencode(tmp_path / "bin")
+    loop_dir = _prepare_loop_contract(
+        tmp_path,
+        task_id="T-737-race-reviewer",
+        base_sha=base_sha,
+        state_name="task_ready",
+        round_num=1,
+    )
+
+    result = _run_loop(
+        tmp_path,
+        [
+            "run",
+            "--loop-dir",
+            ".loop",
+            "--task",
+            ".loop/task_card.json",
+            "--single-round",
+            "--round",
+            "1",
+            "--auto-dispatch",
+            "--worker-backend",
+            "opencode",
+            "--reviewer-backend",
+            "opencode",
+            "--dispatch-timeout",
+            "1",
+            "--dispatch-retries",
+            "0",
+            "--artifact-timeout",
+            "4",
+        ],
+        reviewer_decision="approve",
+        timeout_race_role="reviewer",
+        timeout_race_delay_sec=1.1,
+        timeout_race_hold_sec=3.0,
+    )
+
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    review = json.loads((loop_dir / "review_report.json").read_text(encoding="utf-8"))
+    state = json.loads((loop_dir / "state.json").read_text(encoding="utf-8"))
+    assert state["state"] == "done"
+    assert state["outcome"] == "approved"
+    assert review["run_id"] == state["run_id"]
+
+
+@pytest.mark.timeout(15)
 def test_auto_dispatch_ignores_stale_cross_run_work_report(tmp_path: Path) -> None:
     base_sha = _init_git_repo(tmp_path)
     _install_fake_opencode(tmp_path / "bin")
