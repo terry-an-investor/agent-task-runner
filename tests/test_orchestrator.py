@@ -3320,24 +3320,96 @@ def test_configure_loop_paths_resets_log_dir_ensure_flag(tmp_path: Path, monkeyp
     orchestrator._configure_loop_paths(".loop")
 
 
-def test_feed_event_filters_by_task_id(tmp_path: Path, monkeypatch) -> None:
+def test_feed_event_routes_task_mismatch_with_tag_policy(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(orchestrator, "LOGS_DIR", tmp_path)
     orchestrator._set_feed_task_id("T-777")
+    orchestrator._set_feed_task_route_policy(orchestrator.FEED_TASK_ROUTE_POLICY_TAG)
 
     orchestrator._feed_event("same_task", data={"task_id": "T-777", "x": 1})
-    orchestrator._feed_event("other_task", data={"task_id": "T-888", "x": 2})
+    orchestrator._feed_event("other_task", data={"task_id": "T-888", "x": 2, "lane_id": "lane-b", "role": "worker"})
     orchestrator._feed_event("missing_task", data={"x": 3})
 
     entries = [
         json.loads(line) for line in (tmp_path / "feed.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()
     ]
-    assert len(entries) == 2
+    assert len(entries) == 3
     assert entries[0]["event"] == "same_task"
     assert entries[0]["data"]["task_id"] == "T-777"
-    assert entries[1]["event"] == "missing_task"
-    assert entries[1]["data"]["task_id"] == "T-777"
+    assert entries[1]["event"] == "other_task"
+    assert entries[1]["data"]["task_id"] == "T-888"
+    assert entries[1]["data"]["_feed_route"] == "task_mismatch"
+    assert entries[1]["data"]["_feed_route_policy"] == "tag"
+    assert entries[1]["data"]["_feed_expected_task_id"] == "T-777"
+    assert entries[1]["data"]["_feed_observed_task_id"] == "T-888"
+    assert entries[1]["data"]["_feed_route_target"] == "main"
+    assert entries[1]["data"]["_feed_route_action"] == "tagged"
+    assert entries[1]["data"]["lane_id"] == "lane-b"
+    assert entries[1]["data"]["role"] == "worker"
+    assert entries[2]["event"] == "missing_task"
+    assert entries[2]["data"]["task_id"] == "T-777"
 
     orchestrator._set_feed_task_id(None)
+    orchestrator._set_feed_task_route_policy(None)
+
+
+def test_feed_event_quarantines_task_mismatch_when_policy_requests_it(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(orchestrator, "LOGS_DIR", tmp_path)
+    orchestrator._set_feed_task_id("T-777")
+    orchestrator._set_feed_task_route_policy(orchestrator.FEED_TASK_ROUTE_POLICY_QUARANTINE)
+
+    orchestrator._feed_event("same_task", data={"task_id": "T-777", "x": 1})
+    orchestrator._feed_event("other_task", data={"task_id": "T-888", "x": 2, "lane_id": "lane-q", "role": "reviewer"})
+
+    main_entries = [
+        json.loads(line) for line in (tmp_path / "feed.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()
+    ]
+    quarantine_entries = [
+        json.loads(line)
+        for line in (tmp_path / "feed.quarantine.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(main_entries) == 1
+    assert main_entries[0]["event"] == "same_task"
+    assert len(quarantine_entries) == 1
+    routed = quarantine_entries[0]["data"]
+    assert quarantine_entries[0]["event"] == "other_task"
+    assert routed["task_id"] == "T-888"
+    assert routed["_feed_route"] == "task_mismatch"
+    assert routed["_feed_route_policy"] == "quarantine"
+    assert routed["_feed_route_target"] == "quarantine"
+    assert routed["_feed_expected_task_id"] == "T-777"
+    assert routed["_feed_observed_task_id"] == "T-888"
+    assert routed["lane_id"] == "lane-q"
+    assert routed["role"] == "reviewer"
+
+    orchestrator._set_feed_task_id(None)
+    orchestrator._set_feed_task_route_policy(None)
+
+
+def test_feed_event_preserves_lane_attribution_across_cross_task_streams(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(orchestrator, "LOGS_DIR", tmp_path)
+    orchestrator._set_feed_task_id("T-main")
+    orchestrator._set_feed_task_route_policy(orchestrator.FEED_TASK_ROUTE_POLICY_TAG)
+
+    orchestrator._feed_event("lane_worker", data={"task_id": "T-main", "lane_id": "lane-a", "role": "worker"})
+    orchestrator._feed_event("lane_reviewer", data={"task_id": "T-other", "lane_id": "lane-b", "role": "reviewer"})
+    orchestrator._feed_event("lane_worker_other", data={"task_id": "T-other", "lane_id": "lane-c", "role": "worker"})
+
+    entries = [
+        json.loads(line) for line in (tmp_path / "feed.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()
+    ]
+    assert [entry["event"] for entry in entries] == ["lane_worker", "lane_reviewer", "lane_worker_other"]
+    assert entries[0]["data"]["lane_id"] == "lane-a"
+    assert entries[0]["data"]["role"] == "worker"
+    assert entries[1]["data"]["lane_id"] == "lane-b"
+    assert entries[1]["data"]["role"] == "reviewer"
+    assert entries[1]["data"]["_feed_observed_task_id"] == "T-other"
+    assert entries[2]["data"]["lane_id"] == "lane-c"
+    assert entries[2]["data"]["role"] == "worker"
+    assert entries[2]["data"]["_feed_observed_task_id"] == "T-other"
+
+    orchestrator._set_feed_task_id(None)
+    orchestrator._set_feed_task_route_policy(None)
 
 
 def test_main_run_parses_artifact_timeout(monkeypatch) -> None:

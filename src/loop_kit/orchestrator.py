@@ -322,6 +322,15 @@ FEED_HEARTBEAT = "heartbeat"
 FEED_STATE_TRANSITION = "state_transition"
 FEED_LANE_PLAN_STAGE = "lane_plan_stage"
 FEED_LOG = "log"
+FEED_TASK_ROUTE_POLICY_RETAIN = "retain"
+FEED_TASK_ROUTE_POLICY_TAG = "tag"
+FEED_TASK_ROUTE_POLICY_QUARANTINE = "quarantine"
+_FEED_TASK_ROUTE_POLICY_CHOICES = (
+    FEED_TASK_ROUTE_POLICY_RETAIN,
+    FEED_TASK_ROUTE_POLICY_TAG,
+    FEED_TASK_ROUTE_POLICY_QUARANTINE,
+)
+_DEFAULT_FEED_TASK_ROUTE_POLICY = FEED_TASK_ROUTE_POLICY_TAG
 BACKEND_CODEX = "codex"
 BACKEND_CLAUDE = "claude"
 BACKEND_OPENCODE = "opencode"
@@ -362,6 +371,7 @@ _KNOWLEDGE_RETRIEVAL_PITFALL_CAP = 4
 _KNOWLEDGE_RETRIEVAL_PATTERN_CAP = 4
 _KNOWLEDGE_RETRIEVAL_MIN_SCORE = 1
 _KNOWLEDGE_RETRIEVAL_FALLBACK_CAP = 1
+_FEED_QUARANTINE_LOG_FILENAME = "feed.quarantine.jsonl"
 _KNOWLEDGE_STOPWORDS = {
     "a",
     "an",
@@ -387,6 +397,7 @@ _KNOWLEDGE_STOPWORDS = {
 _FEED_TASK_ID: str | None = None
 _FEED_ROUND: int | None = None
 _FEED_RUN_ID: str | None = None
+_FEED_TASK_ROUTE_POLICY = _DEFAULT_FEED_TASK_ROUTE_POLICY
 _LOGS_DIR_ENSURED = False
 _LOGS_DIR_ENSURED_PATH: str | None = None
 _stream_local = threading.local()
@@ -617,6 +628,7 @@ def _apply_loop_paths(paths: LoopPaths) -> None:
     global _PATTERNS_FILE
     global _FEED_ROUND
     global _FEED_RUN_ID
+    global _FEED_TASK_ROUTE_POLICY
 
     LOOP_DIR = paths.dir
     LOGS_DIR = paths.logs
@@ -644,6 +656,7 @@ def _apply_loop_paths(paths: LoopPaths) -> None:
     _LOGS_DIR_ENSURED_PATH = None
     _FEED_ROUND = None
     _FEED_RUN_ID = None
+    _FEED_TASK_ROUTE_POLICY = _DEFAULT_FEED_TASK_ROUTE_POLICY
 
 
 def _configure_loop_paths(loop_dir: str | Path = ".loop") -> LoopPaths:
@@ -1020,6 +1033,22 @@ def _set_feed_task_id(task_id: str | None) -> None:
         _set_feed_run_id(None)
 
 
+def _normalize_feed_task_route_policy(policy: object) -> str:
+    if isinstance(policy, str):
+        normalized = policy.strip().lower()
+        if normalized in _FEED_TASK_ROUTE_POLICY_CHOICES:
+            return normalized
+    return _DEFAULT_FEED_TASK_ROUTE_POLICY
+
+
+def _set_feed_task_route_policy(policy: str | None) -> None:
+    global _FEED_TASK_ROUTE_POLICY
+    if policy is None:
+        _FEED_TASK_ROUTE_POLICY = _DEFAULT_FEED_TASK_ROUTE_POLICY
+        return
+    _FEED_TASK_ROUTE_POLICY = _normalize_feed_task_route_policy(policy)
+
+
 def _set_feed_round(round_num: int | None) -> None:
     global _FEED_ROUND
     _FEED_ROUND = round_num
@@ -1051,6 +1080,48 @@ def _feed_data(
     return payload
 
 
+def _feed_quarantine_log_path(paths: LoopPaths | None = None) -> Path:
+    resolved_paths = _resolve_paths(paths)
+    return resolved_paths.logs / _FEED_QUARANTINE_LOG_FILENAME
+
+
+def _normalize_payload_task_id(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+def _route_feed_event(
+    payload_data: dict[str, object],
+    *,
+    paths: LoopPaths | None = None,
+) -> tuple[Path, dict[str, object]]:
+    resolved_task_id = _FEED_TASK_ID
+    main_path = _feed_log_path(paths=paths)
+    if resolved_task_id is None:
+        return main_path, payload_data
+
+    observed_task_id = _normalize_payload_task_id(payload_data.get("task_id"))
+    if observed_task_id is None:
+        payload_data["task_id"] = resolved_task_id
+        return main_path, payload_data
+    if observed_task_id == resolved_task_id:
+        return main_path, payload_data
+
+    route_policy = _normalize_feed_task_route_policy(_FEED_TASK_ROUTE_POLICY)
+    payload_data["_feed_route"] = "task_mismatch"
+    payload_data["_feed_route_policy"] = route_policy
+    payload_data["_feed_expected_task_id"] = resolved_task_id
+    payload_data["_feed_observed_task_id"] = observed_task_id
+    if route_policy == FEED_TASK_ROUTE_POLICY_QUARANTINE:
+        payload_data["_feed_route_target"] = "quarantine"
+        return _feed_quarantine_log_path(paths=paths), payload_data
+    payload_data["_feed_route_target"] = "main"
+    payload_data["_feed_route_action"] = "retained" if route_policy == FEED_TASK_ROUTE_POLICY_RETAIN else "tagged"
+    return main_path, payload_data
+
+
 def _ensure_logs_dir(paths: LoopPaths | None = None) -> None:
     global _LOGS_DIR_ENSURED
     global _LOGS_DIR_ENSURED_PATH
@@ -1071,13 +1142,9 @@ def _feed_event(
     data: dict[str, object] | None = None,
     paths: LoopPaths | None = None,
 ) -> None:
-    if _FEED_TASK_ID and data and data.get("task_id") not in (None, _FEED_TASK_ID):
-        return
     payload_data: dict[str, object] = dict(data or {})
-    if _FEED_TASK_ID and "task_id" not in payload_data:
-        payload_data["task_id"] = _FEED_TASK_ID
+    feed_path, payload_data = _route_feed_event(payload_data, paths=paths)
     _ensure_logs_dir(paths=paths)
-    feed_path = _feed_log_path(paths=paths)
     _rotate_log_file(feed_path)
     payload = FeedEvent(ts=_ts(), level=level, event=event, data=payload_data)
     with open(feed_path, "a", encoding="utf-8") as f:
