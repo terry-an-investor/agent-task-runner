@@ -35,6 +35,7 @@ import os
 import re
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -416,6 +417,8 @@ _KNOWLEDGE_RETRIEVAL_PITFALL_CAP = 4
 _KNOWLEDGE_RETRIEVAL_PATTERN_CAP = 4
 _KNOWLEDGE_RETRIEVAL_MIN_SCORE = 1
 _KNOWLEDGE_RETRIEVAL_FALLBACK_CAP = 1
+_KNOWLEDGE_SQLITE_SCHEMA_VERSION = 1
+_KNOWLEDGE_SQLITE_QUERY_BUFFER_MULTIPLIER = 6
 _FEED_QUARANTINE_LOG_FILENAME = "feed.quarantine.jsonl"
 _KNOWLEDGE_STOPWORDS = {
     "a",
@@ -521,6 +524,7 @@ _MODULE_MAP_FILE = _CONTEXT_DIR / "module_map.json"
 _PROJECT_FACTS_FILE = _CONTEXT_DIR / "project_facts.md"
 _PITFALLS_FILE = _CONTEXT_DIR / "pitfalls.md"
 _PATTERNS_FILE = _CONTEXT_DIR / "patterns.jsonl"
+_KNOWLEDGE_DB_FILE = _CONTEXT_DIR / "knowledge.sqlite3"
 _KNOWLEDGE_WRITE_LOCK_FILE = _CONTEXT_DIR / "knowledge.lock"
 _DEFAULTS_DIR = Path(__file__).resolve().parent / "defaults"
 _DEFAULT_FACTS_JSONL = _DEFAULTS_DIR / "facts.jsonl"
@@ -672,6 +676,7 @@ def _apply_loop_paths(paths: LoopPaths) -> None:
     global _PROJECT_FACTS_FILE
     global _PITFALLS_FILE
     global _PATTERNS_FILE
+    global _KNOWLEDGE_DB_FILE
     global _KNOWLEDGE_WRITE_LOCK_FILE
     global _FEED_ROUND
     global _FEED_RUN_ID
@@ -699,6 +704,7 @@ def _apply_loop_paths(paths: LoopPaths) -> None:
     _PROJECT_FACTS_FILE = _CONTEXT_DIR / "project_facts.md"
     _PITFALLS_FILE = _CONTEXT_DIR / "pitfalls.md"
     _PATTERNS_FILE = _CONTEXT_DIR / "patterns.jsonl"
+    _KNOWLEDGE_DB_FILE = _CONTEXT_DIR / "knowledge.sqlite3"
     _KNOWLEDGE_WRITE_LOCK_FILE = _CONTEXT_DIR / "knowledge.lock"
     _LOGS_DIR_ENSURED = False
     _LOGS_DIR_ENSURED_PATH = None
@@ -3361,6 +3367,495 @@ def _read_markdown_knowledge_lines(path: Path) -> list[str]:
     return [entry["text"] for entry in entries]
 
 
+def _knowledge_index_rows(
+    *,
+    project_fact_entries: list[dict[str, str]],
+    pitfall_entries: list[dict[str, str]],
+    pattern_entries: list[dict],
+) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    entry_id = 1
+    for ordinal, entry in enumerate(project_fact_entries, start=1):
+        text = str(entry.get("fact", "")).strip()
+        if not text:
+            continue
+        rows.append(
+            {
+                "id": entry_id,
+                "entry_type": "fact",
+                "text": text,
+                "category": "facts",
+                "confidence": 0.0,
+                "last_verified": "",
+                "source_version": str(entry.get("source_version", "")).strip(),
+                "ordinal": ordinal,
+            }
+        )
+        entry_id += 1
+    for ordinal, entry in enumerate(pitfall_entries, start=1):
+        text = str(entry.get("pitfall", "")).strip()
+        if not text:
+            continue
+        rows.append(
+            {
+                "id": entry_id,
+                "entry_type": "pitfall",
+                "text": text,
+                "category": "pitfalls",
+                "confidence": 0.0,
+                "last_verified": "",
+                "source_version": str(entry.get("source_version", "")).strip(),
+                "ordinal": ordinal,
+            }
+        )
+        entry_id += 1
+    for ordinal, entry in enumerate(pattern_entries, start=1):
+        text = str(entry.get("pattern", "")).strip()
+        if not text:
+            continue
+        rows.append(
+            {
+                "id": entry_id,
+                "entry_type": "pattern",
+                "text": text,
+                "category": str(entry.get("category", "")).strip(),
+                "confidence": _coerce_confidence(entry.get("confidence"), default=0.0),
+                "last_verified": str(entry.get("last_verified", "")).strip(),
+                "source_version": str(entry.get("source_version", "")).strip(),
+                "ordinal": ordinal,
+            }
+        )
+        entry_id += 1
+    return rows
+
+
+def _knowledge_rows_version(rows: list[dict[str, object]]) -> str:
+    payload = json.dumps(rows, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
+def _knowledge_table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type IN ('table', 'view') AND name = ?",
+        (table_name,),
+    ).fetchone()
+    return row is not None
+
+
+def _knowledge_meta_get(conn: sqlite3.Connection, key: str) -> str | None:
+    row = conn.execute("SELECT value FROM knowledge_meta WHERE key = ?", (key,)).fetchone()
+    if row is None:
+        return None
+    return str(row["value"])
+
+
+def _knowledge_meta_set(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO knowledge_meta (key, value)
+        VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        (key, value),
+    )
+
+
+def _connect_knowledge_db() -> sqlite3.Connection:
+    _KNOWLEDGE_DB_FILE.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(_KNOWLEDGE_DB_FILE)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA temp_store=MEMORY")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def _ensure_knowledge_fts_table(conn: sqlite3.Connection, *, recreate: bool) -> bool:
+    if recreate:
+        conn.execute("DROP TABLE IF EXISTS knowledge_entries_fts")
+    try:
+        conn.execute(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_entries_fts
+            USING fts5(text, category, tokenize='unicode61')
+            """
+        )
+        return True
+    except sqlite3.OperationalError:
+        conn.execute("DROP TABLE IF EXISTS knowledge_entries_fts")
+        return False
+
+
+def _ensure_knowledge_index_schema(conn: sqlite3.Connection) -> bool:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS knowledge_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """
+    )
+    recreate = _knowledge_meta_get(conn, "schema_version") != str(_KNOWLEDGE_SQLITE_SCHEMA_VERSION)
+    if recreate:
+        conn.execute("DROP TABLE IF EXISTS knowledge_entries")
+        conn.execute("DROP TABLE IF EXISTS knowledge_entries_fts")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS knowledge_entries (
+            id INTEGER PRIMARY KEY,
+            entry_type TEXT NOT NULL,
+            text TEXT NOT NULL,
+            category TEXT NOT NULL,
+            confidence REAL NOT NULL DEFAULT 0,
+            last_verified TEXT NOT NULL DEFAULT '',
+            source_version TEXT NOT NULL DEFAULT '',
+            ordinal INTEGER NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_knowledge_entries_type_ordinal
+        ON knowledge_entries(entry_type, ordinal)
+        """
+    )
+    fts_available = _ensure_knowledge_fts_table(conn, recreate=recreate)
+    _knowledge_meta_set(conn, "schema_version", str(_KNOWLEDGE_SQLITE_SCHEMA_VERSION))
+    _knowledge_meta_set(conn, "fts_available", "1" if fts_available else "0")
+    return fts_available
+
+
+def _sync_knowledge_sqlite_index(
+    *,
+    project_fact_entries: list[dict[str, str]],
+    pitfall_entries: list[dict[str, str]],
+    pattern_entries: list[dict],
+) -> dict[str, object]:
+    rows = _knowledge_index_rows(
+        project_fact_entries=project_fact_entries,
+        pitfall_entries=pitfall_entries,
+        pattern_entries=pattern_entries,
+    )
+    rows_version = _knowledge_rows_version(rows)
+    conn = _connect_knowledge_db()
+    try:
+        with conn:
+            fts_available = _ensure_knowledge_index_schema(conn)
+            current_version = _knowledge_meta_get(conn, "dataset_version")
+            current_count_raw = _knowledge_meta_get(conn, "row_count")
+            current_count = int(current_count_raw) if isinstance(current_count_raw, str) and current_count_raw else -1
+            if current_version == rows_version and current_count == len(rows):
+                return {
+                    "ready": True,
+                    "fts_available": fts_available,
+                    "row_count": len(rows),
+                    "updated": False,
+                }
+
+            conn.execute("DELETE FROM knowledge_entries")
+            if _knowledge_table_exists(conn, "knowledge_entries_fts"):
+                conn.execute("DELETE FROM knowledge_entries_fts")
+            if rows:
+                conn.executemany(
+                    """
+                    INSERT INTO knowledge_entries (
+                        id,
+                        entry_type,
+                        text,
+                        category,
+                        confidence,
+                        last_verified,
+                        source_version,
+                        ordinal
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            int(row["id"]),
+                            str(row["entry_type"]),
+                            str(row["text"]),
+                            str(row["category"]),
+                            float(row["confidence"]),
+                            str(row["last_verified"]),
+                            str(row["source_version"]),
+                            int(row["ordinal"]),
+                        )
+                        for row in rows
+                    ],
+                )
+                if fts_available:
+                    conn.executemany(
+                        """
+                        INSERT INTO knowledge_entries_fts (rowid, text, category)
+                        VALUES (?, ?, ?)
+                        """,
+                        [(int(row["id"]), str(row["text"]), str(row["category"])) for row in rows],
+                    )
+            _knowledge_meta_set(conn, "dataset_version", rows_version)
+            _knowledge_meta_set(conn, "row_count", str(len(rows)))
+            _knowledge_meta_set(conn, "updated_at", _ts())
+        return {
+            "ready": True,
+            "fts_available": fts_available,
+            "row_count": len(rows),
+            "updated": True,
+        }
+    finally:
+        conn.close()
+
+
+def _build_knowledge_fts_query(query_tokens: set[str]) -> str | None:
+    if not query_tokens:
+        return None
+    terms: list[str] = []
+    for token in sorted(query_tokens):
+        escaped = token.replace('"', '""')
+        if token.isascii():
+            terms.append(f'"{escaped}"*')
+        else:
+            terms.append(f'"{escaped}"')
+    if not terms:
+        return None
+    return " AND ".join(terms)
+
+
+def _escape_sql_like(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _build_knowledge_like_params(query_text: str, limit: int) -> tuple[object, ...]:
+    normalized = query_text.strip().lower()
+    escaped = _escape_sql_like(normalized)
+    contains = f"%{escaped}%"
+    prefix = f"{escaped}%"
+    return (contains, contains, normalized, prefix, prefix, limit)
+
+
+def _query_knowledge_sqlite(
+    *,
+    query_tokens: set[str],
+    query_text: str,
+    fact_cap: int,
+    pitfall_cap: int,
+    pattern_cap: int,
+) -> tuple[list[str], list[str], list[str], str]:
+    total_cap = max(0, fact_cap) + max(0, pitfall_cap) + max(0, pattern_cap)
+    if total_cap < 1:
+        return [], [], [], "sqlite_like"
+    conn = _connect_knowledge_db()
+    try:
+        fts_available = _knowledge_meta_get(conn, "fts_available") == "1" and _knowledge_table_exists(
+            conn, "knowledge_entries_fts"
+        )
+        query_limit = max(total_cap, total_cap * _KNOWLEDGE_SQLITE_QUERY_BUFFER_MULTIPLIER)
+        collected: list[sqlite3.Row] = []
+        seen_ids: set[int] = set()
+        used_fts = False
+
+        fts_query = _build_knowledge_fts_query(query_tokens) if fts_available else None
+        if fts_query:
+            used_fts = True
+            for row in conn.execute(
+                """
+                SELECT
+                    ke.id,
+                    ke.entry_type,
+                    ke.text,
+                    ke.category,
+                    ke.confidence,
+                    ke.last_verified,
+                    ke.ordinal
+                FROM knowledge_entries_fts
+                JOIN knowledge_entries ke ON ke.id = knowledge_entries_fts.rowid
+                WHERE knowledge_entries_fts MATCH ?
+                ORDER BY
+                    bm25(knowledge_entries_fts),
+                    ke.confidence DESC,
+                    ke.ordinal ASC,
+                    ke.text ASC
+                LIMIT ?
+                """,
+                (fts_query, query_limit),
+            ):
+                row_id = int(row["id"])
+                if row_id in seen_ids:
+                    continue
+                seen_ids.add(row_id)
+                collected.append(row)
+
+        if query_text.strip():
+            for row in conn.execute(
+                """
+                SELECT
+                    id,
+                    entry_type,
+                    text,
+                    category,
+                    confidence,
+                    last_verified,
+                    ordinal
+                FROM knowledge_entries
+                WHERE lower(text) LIKE ? ESCAPE '\\'
+                   OR lower(category) LIKE ? ESCAPE '\\'
+                ORDER BY
+                    CASE
+                        WHEN lower(text) = ? THEN 0
+                        WHEN lower(text) LIKE ? ESCAPE '\\' THEN 1
+                        WHEN lower(category) LIKE ? ESCAPE '\\' THEN 2
+                        ELSE 3
+                    END,
+                    confidence DESC,
+                    ordinal ASC,
+                    text ASC
+                LIMIT ?
+                """,
+                _build_knowledge_like_params(query_text, query_limit),
+            ):
+                row_id = int(row["id"])
+                if row_id in seen_ids:
+                    continue
+                seen_ids.add(row_id)
+                collected.append(row)
+
+        selected_facts: list[str] = []
+        selected_pitfalls: list[str] = []
+        selected_patterns: list[str] = []
+        seen_facts: set[str] = set()
+        seen_pitfalls: set[str] = set()
+        seen_patterns: set[str] = set()
+
+        for row in collected:
+            entry_type = str(row["entry_type"])
+            text = str(row["text"]).strip()
+            if not text:
+                continue
+            if entry_type == "fact":
+                if len(selected_facts) >= fact_cap or text in seen_facts:
+                    continue
+                seen_facts.add(text)
+                selected_facts.append(text)
+            elif entry_type == "pitfall":
+                if len(selected_pitfalls) >= pitfall_cap or text in seen_pitfalls:
+                    continue
+                seen_pitfalls.add(text)
+                selected_pitfalls.append(text)
+            elif entry_type == "pattern":
+                if len(selected_patterns) >= pattern_cap:
+                    continue
+                confidence = _coerce_confidence(row["confidence"], default=0.0)
+                if confidence < PATTERN_HIGH_CONFIDENCE:
+                    continue
+                line = _format_pattern_prompt_line(
+                    {
+                        "pattern": text,
+                        "category": str(row["category"]),
+                        "confidence": confidence,
+                        "last_verified": str(row["last_verified"]),
+                    }
+                )
+                if line in seen_patterns:
+                    continue
+                seen_patterns.add(line)
+                selected_patterns.append(line)
+            if (
+                len(selected_facts) >= fact_cap
+                and len(selected_pitfalls) >= pitfall_cap
+                and len(selected_patterns) >= pattern_cap
+            ):
+                break
+        return (
+            selected_facts,
+            selected_pitfalls,
+            selected_patterns,
+            "sqlite_fts5" if used_fts else "sqlite_like",
+        )
+    finally:
+        conn.close()
+
+
+def _fallback_ranked_knowledge(
+    *,
+    query_tokens: set[str],
+    project_facts: list[str],
+    active_pitfalls: list[str],
+    patterns: list[dict],
+) -> tuple[list[str], list[str], list[str]]:
+    selected_facts = _select_ranked_text_knowledge(
+        project_facts,
+        query_tokens=query_tokens,
+        cap=_KNOWLEDGE_RETRIEVAL_FACT_CAP,
+    )
+    selected_pitfalls = _select_ranked_text_knowledge(
+        active_pitfalls,
+        query_tokens=query_tokens,
+        cap=_KNOWLEDGE_RETRIEVAL_PITFALL_CAP,
+    )
+    selected_patterns = _select_ranked_patterns(
+        patterns,
+        query_tokens=query_tokens,
+        cap=_KNOWLEDGE_RETRIEVAL_PATTERN_CAP,
+    )
+    return selected_facts, selected_pitfalls, selected_patterns
+
+
+def _retrieve_ranked_knowledge(
+    *,
+    query_tokens: set[str],
+    query_text: str,
+    project_fact_entries: list[dict[str, str]],
+    pitfall_entries: list[dict[str, str]],
+    patterns: list[dict],
+    sync_index: bool = True,
+) -> tuple[list[str], list[str], list[str], dict[str, object]]:
+    project_facts = [entry["fact"] for entry in project_fact_entries]
+    active_pitfalls = [entry["pitfall"] for entry in pitfall_entries]
+    fallback_facts, fallback_pitfalls, fallback_patterns = _fallback_ranked_knowledge(
+        query_tokens=query_tokens,
+        project_facts=project_facts,
+        active_pitfalls=active_pitfalls,
+        patterns=patterns,
+    )
+    selected_facts = fallback_facts
+    selected_pitfalls = fallback_pitfalls
+    selected_patterns = fallback_patterns
+    diagnostics: dict[str, object] = {
+        "backend": "file_keyword",
+        "row_count": 0,
+        "fts_available": False,
+    }
+    if not query_tokens:
+        return selected_facts, selected_pitfalls, selected_patterns, diagnostics
+    try:
+        if sync_index:
+            sync_result = _sync_knowledge_sqlite_index(
+                project_fact_entries=project_fact_entries,
+                pitfall_entries=pitfall_entries,
+                pattern_entries=patterns,
+            )
+            diagnostics["row_count"] = int(sync_result.get("row_count", 0))
+            diagnostics["fts_available"] = bool(sync_result.get("fts_available"))
+        indexed_facts, indexed_pitfalls, indexed_patterns, sqlite_backend = _query_knowledge_sqlite(
+            query_tokens=query_tokens,
+            query_text=query_text,
+            fact_cap=_KNOWLEDGE_RETRIEVAL_FACT_CAP,
+            pitfall_cap=_KNOWLEDGE_RETRIEVAL_PITFALL_CAP,
+            pattern_cap=_KNOWLEDGE_RETRIEVAL_PATTERN_CAP,
+        )
+        if indexed_facts:
+            selected_facts = indexed_facts
+        if indexed_pitfalls:
+            selected_pitfalls = indexed_pitfalls
+        if indexed_patterns:
+            selected_patterns = indexed_patterns
+        if indexed_facts or indexed_pitfalls or indexed_patterns:
+            diagnostics["backend"] = sqlite_backend
+    except (OSError, RuntimeError, sqlite3.Error, ValueError):
+        diagnostics["backend"] = "file_keyword"
+    return selected_facts, selected_pitfalls, selected_patterns, diagnostics
+
+
 def _knowledge_tokens(text: object) -> set[str]:
     if not isinstance(text, str):
         return set()
@@ -3417,12 +3912,16 @@ def _iter_fix_list_query_fragments(round_num: int) -> list[str]:
     return fragments
 
 
-def _knowledge_query_tokens(task_id: str, round_num: int, task_card: TaskCard | None) -> set[str]:
+def _knowledge_query_fragments(task_id: str, round_num: int, task_card: TaskCard | None) -> list[str]:
     query_fragments = [task_id]
     query_fragments.extend(_iter_task_card_query_fragments(task_card))
     query_fragments.extend(_iter_fix_list_query_fragments(round_num))
+    return query_fragments
+
+
+def _knowledge_query_tokens(task_id: str, round_num: int, task_card: TaskCard | None) -> set[str]:
     query_tokens: set[str] = set()
-    for fragment in query_fragments:
+    for fragment in _knowledge_query_fragments(task_id, round_num, task_card):
         query_tokens.update(_knowledge_tokens(fragment))
     return query_tokens
 
@@ -4158,6 +4657,59 @@ def cmd_knowledge_dedupe() -> None:
     )
 
 
+def cmd_knowledge_benchmark(query: str, iterations: int) -> None:
+    normalized_query = query.strip()
+    if not normalized_query:
+        raise ValidationError("query must be non-empty")
+    query_tokens = _knowledge_tokens(normalized_query)
+    project_fact_entries = _load_project_facts()
+    pitfall_entries = _load_pitfalls()
+    patterns, _ = _load_patterns_with_governance(persist=False)
+
+    _, _, _, warmup = _retrieve_ranked_knowledge(
+        query_tokens=query_tokens,
+        query_text=normalized_query,
+        project_fact_entries=project_fact_entries,
+        pitfall_entries=pitfall_entries,
+        patterns=patterns,
+        sync_index=True,
+    )
+    timings_ms: list[float] = []
+    result_count = 0
+    backend = str(warmup.get("backend", "file_keyword"))
+    row_count = int(warmup.get("row_count", 0))
+    fts_available = bool(warmup.get("fts_available"))
+    for _ in range(iterations):
+        start = time.perf_counter()
+        facts, pitfalls, selected_patterns, diag = _retrieve_ranked_knowledge(
+            query_tokens=query_tokens,
+            query_text=normalized_query,
+            project_fact_entries=project_fact_entries,
+            pitfall_entries=pitfall_entries,
+            patterns=patterns,
+            sync_index=False,
+        )
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        timings_ms.append(elapsed_ms)
+        result_count = max(result_count, len(facts) + len(pitfalls) + len(selected_patterns))
+        backend = str(diag.get("backend", backend))
+        row_count = max(row_count, int(diag.get("row_count", 0)))
+        fts_available = fts_available or bool(diag.get("fts_available"))
+    avg_ms = (sum(timings_ms) / len(timings_ms)) if timings_ms else 0.0
+    p50_ms = _nearest_rank_percentile(timings_ms, 0.50) or 0.0
+    p95_ms = _nearest_rank_percentile(timings_ms, 0.95) or 0.0
+    print("Knowledge benchmark:")
+    print(f"  backend={backend}")
+    print(f"  fts_available={fts_available}")
+    print(f"  query={normalized_query}")
+    print(f"  iterations={iterations}")
+    print(f"  corpus_rows={row_count}")
+    print(f"  max_results={result_count}")
+    print(f"  avg_ms={avg_ms:.3f}")
+    print(f"  p50_ms={p50_ms:.3f}")
+    print(f"  p95_ms={p95_ms:.3f}")
+
+
 def _load_patterns_with_governance(*, persist: bool = False) -> tuple[list[dict], int]:
     text = _read_text_optional(_PATTERNS_FILE)
     if not text:
@@ -4229,24 +4781,15 @@ def _format_pattern_prompt_line(entry: dict) -> str:
 def _render_knowledge_section(task_id: str, round_num: int, task_card: TaskCard | None) -> str:
     project_fact_entries = _load_project_facts()
     pitfall_entries = _load_pitfalls()
-    project_facts = [entry["fact"] for entry in project_fact_entries]
-    active_pitfalls = [entry["pitfall"] for entry in pitfall_entries]
     patterns, _ = _load_patterns_with_governance(persist=False)
+    query_fragments = _knowledge_query_fragments(task_id, round_num, task_card)
     query_tokens = _knowledge_query_tokens(task_id, round_num, task_card)
-    selected_facts = _select_ranked_text_knowledge(
-        project_facts,
+    selected_facts, selected_pitfalls, selected_patterns, _ = _retrieve_ranked_knowledge(
         query_tokens=query_tokens,
-        cap=_KNOWLEDGE_RETRIEVAL_FACT_CAP,
-    )
-    selected_pitfalls = _select_ranked_text_knowledge(
-        active_pitfalls,
-        query_tokens=query_tokens,
-        cap=_KNOWLEDGE_RETRIEVAL_PITFALL_CAP,
-    )
-    selected_patterns = _select_ranked_patterns(
-        patterns,
-        query_tokens=query_tokens,
-        cap=_KNOWLEDGE_RETRIEVAL_PATTERN_CAP,
+        query_text=" ".join(fragment for fragment in query_fragments if fragment).strip(),
+        project_fact_entries=project_fact_entries,
+        pitfall_entries=pitfall_entries,
+        patterns=patterns,
     )
     if not selected_facts and not selected_pitfalls and not selected_patterns:
         return "- <none>"
@@ -9123,6 +9666,12 @@ def _update_knowledge_on_approval(task_id: str, round_num: int, *, run_id: str |
         elif len(existing_patterns) > _KNOWLEDGE_MAX_PATTERNS:
             existing_patterns = existing_patterns[-_KNOWLEDGE_MAX_PATTERNS:]
         _write_patterns_jsonl(existing_patterns)
+        refreshed_patterns, _ = _load_patterns_with_governance(persist=False)
+        _sync_knowledge_sqlite_index(
+            project_fact_entries=_load_project_facts(),
+            pitfall_entries=_load_pitfalls(),
+            pattern_entries=refreshed_patterns,
+        )
     _log(
         "Knowledge updated on approval: "
         f"pitfalls+={appended_pitfalls}, patterns+={appended_patterns}, source=review_report.blocking_issues"
@@ -10986,6 +11535,17 @@ def main() -> None:
         help="Remove entries older than this many days",
     )
     knowledge_sub.add_parser("dedupe", help="Deduplicate defaults knowledge files and report removals")
+    knowledge_benchmark_p = knowledge_sub.add_parser(
+        "benchmark",
+        help="Run local retrieval latency benchmark for knowledge lookup",
+    )
+    knowledge_benchmark_p.add_argument("--query", required=True, help="Benchmark query text")
+    knowledge_benchmark_p.add_argument(
+        "--iterations",
+        type=_parse_positive_int_arg,
+        default=30,
+        help="Number of measured retrieval iterations (default: 30)",
+    )
 
     run_p = sub.add_parser("run", parents=[shared], help="Run the full PM-controlled review loop")
     run_p.add_argument("task_ref", nargs="?", default=None, help="Task ID (e.g. T-601) or path to task card JSON")
@@ -11118,6 +11678,8 @@ def main() -> None:
                 cmd_knowledge_prune(args.older_than)
             elif args.knowledge_cmd == "dedupe":
                 cmd_knowledge_dedupe()
+            elif args.knowledge_cmd == "benchmark":
+                cmd_knowledge_benchmark(args.query, args.iterations)
             else:
                 knowledge_p.print_help()
                 raise ValidationError("knowledge subcommand required")

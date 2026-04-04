@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -3902,6 +3903,54 @@ class TestKnowledgeCli:
         assert len(patterns_entries) == 2
         by_pattern = {(entry["category"], entry["pattern"]): entry for entry in patterns_entries}
         assert by_pattern[("workflow", "run tests")]["confidence"] == 0.9
+
+    def test_knowledge_benchmark_reports_latency_metrics(self, tmp_path: Path, monkeypatch, capsys) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        context_dir = tmp_path / ".loop" / "context"
+        context_dir.mkdir(parents=True, exist_ok=True)
+        (context_dir / "project_facts.md").write_text(
+            "# facts\n- dispatch workflow facts are searchable\n",
+            encoding="utf-8",
+        )
+        (context_dir / "pitfalls.md").write_text(
+            "# pitfalls\n- dispatch workflow prompts can bloat\n",
+            encoding="utf-8",
+        )
+        now_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        (context_dir / "patterns.jsonl").write_text(
+            json.dumps(
+                {
+                    "pattern": "dispatch workflow index warmup",
+                    "category": "workflow",
+                    "confidence": 0.95,
+                    "last_verified": now_iso,
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "orchestrator.py",
+                "knowledge",
+                "benchmark",
+                "--query",
+                "dispatch workflow",
+                "--iterations",
+                "3",
+            ],
+        )
+
+        orchestrator.main()
+        out = capsys.readouterr().out
+        assert "Knowledge benchmark:" in out
+        assert "iterations=3" in out
+        assert "backend=" in out
+        assert "avg_ms=" in out
+        assert "p95_ms=" in out
 
 
 def test_cmd_index_generates_module_map_with_expected_shape(tmp_path: Path, monkeypatch) -> None:
@@ -10962,6 +11011,49 @@ class TestKnowledgeLayer:
         assert "dispatch workflow pitfall 5" not in section
         assert "dispatch workflow pattern 5" not in section
 
+    def test_render_knowledge_section_falls_back_to_file_ranking_when_sqlite_unavailable(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        context_dir = tmp_path / ".loop" / "context"
+        context_dir.mkdir(parents=True, exist_ok=True)
+        (context_dir / "project_facts.md").write_text(
+            "# facts\n- keyword retrieval fallback stays deterministic\n",
+            encoding="utf-8",
+        )
+        (context_dir / "pitfalls.md").write_text(
+            "# pitfalls\n- keyword retrieval fallback preserves prompt safety\n",
+            encoding="utf-8",
+        )
+        now_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        (context_dir / "patterns.jsonl").write_text(
+            json.dumps(
+                {
+                    "pattern": "keyword retrieval fallback pattern",
+                    "category": "prompt",
+                    "confidence": 0.9,
+                    "last_verified": now_iso,
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        def _raise_sync(**_kwargs):
+            raise sqlite3.OperationalError("simulated sqlite unavailable")
+
+        monkeypatch.setattr(orchestrator, "_sync_knowledge_sqlite_index", _raise_sync)
+        section = orchestrator._render_knowledge_section(
+            "T-742",
+            1,
+            {"goal": "keyword retrieval fallback"},
+        )
+
+        assert "keyword retrieval fallback stays deterministic" in section
+        assert "keyword retrieval fallback preserves prompt safety" in section
+        assert "keyword retrieval fallback pattern" in section
+
     def test_patterns_staleness_governance_sets_confidence_zero(self, tmp_path: Path, monkeypatch) -> None:
         _configure_loop_paths(monkeypatch, tmp_path)
         context_dir = tmp_path / ".loop" / "context"
@@ -11316,6 +11408,57 @@ class TestKnowledgeLayer:
         assert len(pattern_entries) == 4
         assert all(entry["pattern"] in {"reason-a", "reason-b"} for entry in pattern_entries)
         assert (context_dir / "knowledge.lock").exists()
+
+    def test_update_knowledge_on_approval_keeps_sqlite_index_consistent(self, tmp_path: Path, monkeypatch) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        context_dir = tmp_path / ".loop" / "context"
+        context_dir.mkdir(parents=True, exist_ok=True)
+        (context_dir / "project_facts.md").write_text("# facts\n- base fact\n", encoding="utf-8")
+        (context_dir / "pitfalls.md").write_text("# pitfalls\n- base pitfall\n", encoding="utf-8")
+        orchestrator.REVIEW_REPORT.write_text(
+            json.dumps(
+                {
+                    "task_id": "T-742",
+                    "round": 2,
+                    "decision": "approve",
+                    "blocking_issues": [],
+                    "non_blocking_suggestions": [],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        archive_dir = tmp_path / ".loop" / "archive" / "T-742"
+        archive_dir.mkdir(parents=True)
+        (archive_dir / "r2_review_report.json").write_text(
+            json.dumps(
+                {
+                    "task_id": "T-742",
+                    "round": 1,
+                    "decision": "changes_required",
+                    "blocking_issues": [
+                        {"severity": "high", "file": "src/loop_kit/orchestrator.py", "reason": "new-indexed-reason"}
+                    ],
+                    "non_blocking_suggestions": [],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        orchestrator._update_knowledge_on_approval("T-742", 2)
+
+        assert orchestrator._KNOWLEDGE_DB_FILE.exists()
+        conn = sqlite3.connect(orchestrator._KNOWLEDGE_DB_FILE)
+        try:
+            match_count = conn.execute(
+                "SELECT COUNT(*) FROM knowledge_entries WHERE entry_type = 'pattern' AND text = ?",
+                ("new-indexed-reason",),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert isinstance(match_count, tuple)
+        assert match_count[0] >= 1
 
     def test_update_knowledge_on_approval_interrupted_pitfalls_write_keeps_markdown_intact(
         self, tmp_path: Path, monkeypatch
