@@ -11263,6 +11263,182 @@ class TestKnowledgeLayer:
             if entry["pattern"] in reasons:
                 assert entry["category"] == "review_blocking_issue"
 
+    def test_update_knowledge_on_approval_repeated_runs_keep_payloads_parseable(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        context_dir = tmp_path / ".loop" / "context"
+        context_dir.mkdir(parents=True, exist_ok=True)
+        (context_dir / "pitfalls.md").write_text("# Known pitfalls\n", encoding="utf-8")
+        orchestrator.REVIEW_REPORT.write_text(
+            json.dumps(
+                {
+                    "task_id": "T-741",
+                    "round": 2,
+                    "decision": "approve",
+                    "blocking_issues": [],
+                    "non_blocking_suggestions": [],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        archive_dir = tmp_path / ".loop" / "archive" / "T-741"
+        archive_dir.mkdir(parents=True)
+        (archive_dir / "r2_review_report.json").write_text(
+            json.dumps(
+                {
+                    "task_id": "T-741",
+                    "round": 1,
+                    "decision": "changes_required",
+                    "blocking_issues": [
+                        {"severity": "high", "file": "a.py", "reason": "reason-a"},
+                        {"severity": "medium", "file": "b.py", "reason": "reason-b"},
+                    ],
+                    "non_blocking_suggestions": [],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        orchestrator._update_knowledge_on_approval("T-741", 2)
+        orchestrator._update_knowledge_on_approval("T-741", 2)
+
+        pitfalls_text = (context_dir / "pitfalls.md").read_text(encoding="utf-8")
+        assert pitfalls_text.count("reason-a") == 1
+        assert pitfalls_text.count("reason-b") == 1
+        pattern_entries = [
+            json.loads(line)
+            for line in (context_dir / "patterns.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        assert len(pattern_entries) == 4
+        assert all(entry["pattern"] in {"reason-a", "reason-b"} for entry in pattern_entries)
+        assert (context_dir / "knowledge.lock").exists()
+
+    def test_update_knowledge_on_approval_interrupted_pitfalls_write_keeps_markdown_intact(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        context_dir = tmp_path / ".loop" / "context"
+        context_dir.mkdir(parents=True, exist_ok=True)
+        original_pitfalls = "# Known pitfalls\n- existing\n"
+        (context_dir / "pitfalls.md").write_text(original_pitfalls, encoding="utf-8")
+        orchestrator.REVIEW_REPORT.write_text(
+            json.dumps(
+                {
+                    "task_id": "T-741",
+                    "round": 2,
+                    "decision": "approve",
+                    "blocking_issues": [],
+                    "non_blocking_suggestions": [],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        archive_dir = tmp_path / ".loop" / "archive" / "T-741"
+        archive_dir.mkdir(parents=True)
+        (archive_dir / "r2_review_report.json").write_text(
+            json.dumps(
+                {
+                    "task_id": "T-741",
+                    "round": 1,
+                    "decision": "changes_required",
+                    "blocking_issues": [{"severity": "high", "file": "a.py", "reason": "reason-a"}],
+                    "non_blocking_suggestions": [],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        original_write_text = orchestrator.Path.write_text
+
+        def _failing_write_text(self_path, *args, **kwargs):
+            if self_path.name == "pitfalls.tmp":
+                raise OSError("simulated interrupted pitfalls write")
+            return original_write_text(self_path, *args, **kwargs)
+
+        monkeypatch.setattr(orchestrator.Path, "write_text", _failing_write_text)
+
+        with pytest.raises(OSError, match="simulated interrupted pitfalls write"):
+            orchestrator._update_knowledge_on_approval("T-741", 2)
+
+        assert (context_dir / "pitfalls.md").read_text(encoding="utf-8") == original_pitfalls
+        assert not (context_dir / "pitfalls.tmp").exists()
+        assert not (context_dir / "patterns.jsonl").exists()
+
+    def test_update_knowledge_on_approval_interrupted_patterns_write_keeps_jsonl_intact(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        _configure_loop_paths(monkeypatch, tmp_path)
+        context_dir = tmp_path / ".loop" / "context"
+        context_dir.mkdir(parents=True, exist_ok=True)
+        now_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        original_patterns = (
+            json.dumps(
+                {
+                    "pattern": "old-pattern",
+                    "category": "workflow",
+                    "confidence": 0.9,
+                    "last_verified": now_iso,
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
+        (context_dir / "patterns.jsonl").write_text(original_patterns, encoding="utf-8")
+        orchestrator.REVIEW_REPORT.write_text(
+            json.dumps(
+                {
+                    "task_id": "T-741",
+                    "round": 2,
+                    "decision": "approve",
+                    "blocking_issues": [],
+                    "non_blocking_suggestions": [],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        archive_dir = tmp_path / ".loop" / "archive" / "T-741"
+        archive_dir.mkdir(parents=True)
+        (archive_dir / "r2_review_report.json").write_text(
+            json.dumps(
+                {
+                    "task_id": "T-741",
+                    "round": 1,
+                    "decision": "changes_required",
+                    "blocking_issues": [{"severity": "high", "file": "a.py", "reason": "reason-a"}],
+                    "non_blocking_suggestions": [],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        original_replace = orchestrator.Path.replace
+
+        def _failing_replace(self_path, other_path):
+            other = other_path if isinstance(other_path, Path) else Path(other_path)
+            if self_path.name == "patterns.tmp" and other.name == "patterns.jsonl":
+                raise OSError("simulated interrupted patterns replace")
+            return original_replace(self_path, other_path)
+
+        monkeypatch.setattr(orchestrator.Path, "replace", _failing_replace)
+
+        with pytest.raises(OSError, match="simulated interrupted patterns replace"):
+            orchestrator._update_knowledge_on_approval("T-741", 2)
+
+        assert (context_dir / "patterns.jsonl").read_text(encoding="utf-8") == original_patterns
+        assert not (context_dir / "patterns.tmp").exists()
+        parsed = [
+            json.loads(line)
+            for line in (context_dir / "patterns.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        assert [entry["pattern"] for entry in parsed] == ["old-pattern"]
+
     def test_single_round_updates_knowledge_only_on_approve(self, tmp_path: Path, monkeypatch) -> None:
         _configure_loop_paths(monkeypatch, tmp_path)
         task_path = tmp_path / "task_input.json"

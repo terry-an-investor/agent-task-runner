@@ -409,6 +409,8 @@ PATTERN_STALE_DAYS = 30
 PATTERN_HIGH_CONFIDENCE = 0.7
 _KNOWLEDGE_MAX_PATTERNS = 200
 _KNOWLEDGE_MAX_PITFALL_LINES = 50
+_KNOWLEDGE_WRITE_LOCK_TIMEOUT_SEC = 5.0
+_KNOWLEDGE_WRITE_LOCK_RETRY_SEC = 0.05
 _KNOWLEDGE_RETRIEVAL_FACT_CAP = 4
 _KNOWLEDGE_RETRIEVAL_PITFALL_CAP = 4
 _KNOWLEDGE_RETRIEVAL_PATTERN_CAP = 4
@@ -519,6 +521,7 @@ _MODULE_MAP_FILE = _CONTEXT_DIR / "module_map.json"
 _PROJECT_FACTS_FILE = _CONTEXT_DIR / "project_facts.md"
 _PITFALLS_FILE = _CONTEXT_DIR / "pitfalls.md"
 _PATTERNS_FILE = _CONTEXT_DIR / "patterns.jsonl"
+_KNOWLEDGE_WRITE_LOCK_FILE = _CONTEXT_DIR / "knowledge.lock"
 _DEFAULTS_DIR = Path(__file__).resolve().parent / "defaults"
 _DEFAULT_FACTS_JSONL = _DEFAULTS_DIR / "facts.jsonl"
 _DEFAULT_PITFALLS_JSONL = _DEFAULTS_DIR / "pitfalls.jsonl"
@@ -669,6 +672,7 @@ def _apply_loop_paths(paths: LoopPaths) -> None:
     global _PROJECT_FACTS_FILE
     global _PITFALLS_FILE
     global _PATTERNS_FILE
+    global _KNOWLEDGE_WRITE_LOCK_FILE
     global _FEED_ROUND
     global _FEED_RUN_ID
     global _FEED_TASK_ROUTE_POLICY
@@ -695,6 +699,7 @@ def _apply_loop_paths(paths: LoopPaths) -> None:
     _PROJECT_FACTS_FILE = _CONTEXT_DIR / "project_facts.md"
     _PITFALLS_FILE = _CONTEXT_DIR / "pitfalls.md"
     _PATTERNS_FILE = _CONTEXT_DIR / "patterns.jsonl"
+    _KNOWLEDGE_WRITE_LOCK_FILE = _CONTEXT_DIR / "knowledge.lock"
     _LOGS_DIR_ENSURED = False
     _LOGS_DIR_ENSURED_PATH = None
     _FEED_ROUND = None
@@ -3870,9 +3875,8 @@ def _format_metric_ms(value: float | None) -> str:
     return f"{value:.1f}"
 
 
-def _atomic_write_jsonl(path: Path, entries: list[dict]) -> None:
+def _atomic_write_text(path: Path, payload: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in entries)
     tmp = path.with_suffix(".tmp")
     try:
         tmp.write_text(payload, encoding="utf-8")
@@ -3887,6 +3891,11 @@ def _atomic_write_jsonl(path: Path, entries: list[dict]) -> None:
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
+
+
+def _atomic_write_jsonl(path: Path, entries: list[dict]) -> None:
+    payload = "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in entries)
+    _atomic_write_text(path, payload)
 
 
 def _knowledge_default_specs() -> list[tuple[str, Path, str]]:
@@ -5297,23 +5306,7 @@ def _load_state(paths: LoopPaths | None = None) -> dict:
 
 def _atomic_write_json(path: Path, data: object) -> None:
     """Write *data* as JSON to *path* atomically (write-then-rename)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    try:
-        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-        try:
-            tmp.replace(path)
-        except PermissionError:
-            if os.name == "nt":
-                import time
-
-                time.sleep(0.05)
-                tmp.replace(path)
-            else:
-                raise
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
+    _atomic_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
 
 
 def _save_state(state: dict, paths: LoopPaths | None = None) -> None:
@@ -9045,9 +9038,28 @@ def _append_pitfalls(lines: list[str]) -> int:
     current = "\n".join(non_pitfall_lines + pitfall_lines)
     if current:
         current += "\n"
-    _PITFALLS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    _PITFALLS_FILE.write_text(current, encoding="utf-8")
+    _atomic_write_text(_PITFALLS_FILE, current)
     return len(to_append)
+
+
+@contextlib.contextmanager
+def _knowledge_write_lock():
+    lock = _LoopLock(_KNOWLEDGE_WRITE_LOCK_FILE)
+    deadline = time.monotonic() + max(0.0, _KNOWLEDGE_WRITE_LOCK_TIMEOUT_SEC)
+    while True:
+        try:
+            lock.acquire()
+            break
+        except RuntimeError as e:
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"knowledge context lock is unavailable ({_KNOWLEDGE_WRITE_LOCK_FILE})"
+                ) from e
+            time.sleep(max(0.01, _KNOWLEDGE_WRITE_LOCK_RETRY_SEC))
+    try:
+        yield
+    finally:
+        lock.release()
 
 
 def _update_knowledge_on_approval(task_id: str, round_num: int, *, run_id: str | None = None) -> None:
@@ -9084,32 +9096,33 @@ def _update_knowledge_on_approval(task_id: str, round_num: int, *, run_id: str |
     if not blocking_issues:
         return
 
-    pitfall_lines = [line for issue in blocking_issues if (line := _issue_to_pitfall_line(issue))]
-    appended_pitfalls = _append_pitfalls(pitfall_lines)
+    with _knowledge_write_lock():
+        pitfall_lines = [line for issue in blocking_issues if (line := _issue_to_pitfall_line(issue))]
+        appended_pitfalls = _append_pitfalls(pitfall_lines)
 
-    existing_patterns, _ = _load_patterns_with_governance(persist=False)
-    now_iso = _to_utc_iso8601(datetime.now(UTC))
-    appended_patterns = 0
-    for issue in blocking_issues:
-        pattern_text = str(issue.get("reason", "")).strip()
-        if not pattern_text:
-            continue
-        category = str(issue.get("category", "review_blocking_issue")).strip() or "review_blocking_issue"
-        confidence = _coerce_confidence(issue.get("confidence"), default=1.0)
-        existing_patterns.append(
-            {
-                "pattern": pattern_text,
-                "category": category,
-                "confidence": confidence,
-                "last_verified": now_iso,
-            }
-        )
-        appended_patterns += 1
-    if _KNOWLEDGE_MAX_PATTERNS <= 0:
-        existing_patterns = []
-    elif len(existing_patterns) > _KNOWLEDGE_MAX_PATTERNS:
-        existing_patterns = existing_patterns[-_KNOWLEDGE_MAX_PATTERNS:]
-    _write_patterns_jsonl(existing_patterns)
+        existing_patterns, _ = _load_patterns_with_governance(persist=False)
+        now_iso = _to_utc_iso8601(datetime.now(UTC))
+        appended_patterns = 0
+        for issue in blocking_issues:
+            pattern_text = str(issue.get("reason", "")).strip()
+            if not pattern_text:
+                continue
+            category = str(issue.get("category", "review_blocking_issue")).strip() or "review_blocking_issue"
+            confidence = _coerce_confidence(issue.get("confidence"), default=1.0)
+            existing_patterns.append(
+                {
+                    "pattern": pattern_text,
+                    "category": category,
+                    "confidence": confidence,
+                    "last_verified": now_iso,
+                }
+            )
+            appended_patterns += 1
+        if _KNOWLEDGE_MAX_PATTERNS <= 0:
+            existing_patterns = []
+        elif len(existing_patterns) > _KNOWLEDGE_MAX_PATTERNS:
+            existing_patterns = existing_patterns[-_KNOWLEDGE_MAX_PATTERNS:]
+        _write_patterns_jsonl(existing_patterns)
     _log(
         "Knowledge updated on approval: "
         f"pitfalls+={appended_pitfalls}, patterns+={appended_patterns}, source=review_report.blocking_issues"
